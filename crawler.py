@@ -80,7 +80,7 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def main():
-    suppliers = load_suppliers()
+    suppliers = load_suppliers_from_sheet()
     state = load_state()
     changes = []
 
@@ -114,3 +114,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
