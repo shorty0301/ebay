@@ -39,7 +39,7 @@ def main(urls):
         t0 = time.time()
         try:
             html = fetch_html(url)
-            info = extract_supplier_info(url, html, debug=True)
+            info = extract_supplier_info(url, html)
             ms = int((time.time()-t0)*1000)
             print(json.dumps({
                 "host": host_from(url),
