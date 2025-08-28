@@ -15,20 +15,36 @@ SCOPES     = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 STATE_DIR  = Path("state"); STATE_DIR.mkdir(exist_ok=True)
 STATE_FILE = STATE_DIR / "inventory_state.json"
 
+# ===== 通知ポリシー =====
+MIN_PRICE_DIFF = 100                 # 価格が100円以上動いたら通知
+NOTIFY_ON_STOCK = {"OUT_OF_STOCK"}   # 在庫ありは無視。品切れになった時だけ通知
+SKIP_FIRST_TIME = True               # 初回（前回値がないSKU）は通知しない
+
 # =====================================================
 # SLACK通知
 # =====================================================
 def slack_notify(message: str):
-    import requests, os
-    url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    """
+    Slack Incoming Webhook に通知する。
+    - Webhook URL は環境変数 SLACK_WEBHOOK_URL から読む
+    - Blocks形式で見やすく送信（フォールバックとしてtextも付与）
+    """
+    import os, requests
+    url = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
     if not url:
         print("⚠️ SLACK_WEBHOOK_URL が未設定です")
         return
-    payload = {"text": message}
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "在庫巡回レポート"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": message[:2800]}},
+    ]
+    payload = {"text": message[:2000], "blocks": blocks}
+
     try:
         r = requests.post(url, json=payload, timeout=15)
         if r.status_code != 200:
-            print(f"⚠️ Slack通知失敗: {r.status_code} {r.text}")
+            print(f"⚠️ Slack通知失敗: {r.status_code} {r.text[:200]}")
     except Exception as e:
         print(f"⚠️ Slack通知エラー: {e}")
 
@@ -131,34 +147,60 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def main():
-    suppliers = load_suppliers_from_sheet()
+    # どちらか片方だけ使う想定。シートがマスターならこれでOK
+    suppliers = load_suppliers_from_sheet()   # ← スプレッドシートからSKU/URL取得
+    # suppliers = load_suppliers("suppliers.csv")  # CSVを使う場合
+
     state = load_state()
     changes = []
 
     for row in suppliers:
         sku, url = row["sku"], row["url"]
+
         try:
             html = fetch_html(url)
             stock, price = parse_stock_and_price(html)
         except Exception as e:
+            # 通知はしないが、エラーメモは残す
             changes.append(f"⚠️ 取得失敗 {sku}\n{url}\n{e}")
             continue
 
         prev = state.get(sku, {})
-        prev_stock, prev_price = prev.get("stock"), prev.get("price")
+        prev_stock = prev.get("stock")
+        prev_price = prev.get("price")
 
-        if prev:
-            if stock and stock != prev_stock:
-                changes.append(f"【在庫変化】{sku}\n{prev_stock} → {stock}\n{url}")
-            if price is not None and prev_price is not None and price != prev_price:
-                diff = price - prev_price
-                changes.append(f"【価格変動】{sku}\n{prev_price:,} → {price:,}（差分 {diff:+,}）\n{url}")
+        # ===== 通知条件 =====
+        # 初回は通知しない
+        if not prev and SKIP_FIRST_TIME:
+            pass
+        else:
+            # 1) 在庫：在庫ありは無視。OUT_OF_STOCK になったら通知
+            if stock and stock != prev_stock and stock in NOTIFY_ON_STOCK:
+                changes.append(f"*{sku}* 在庫: {prev_stock} → *{stock}*\n{url}")
 
-        state[sku] = {"stock": stock, "price": price, "url": url, "checked_at": int(time.time())}
-        time.sleep(0.3)
+            # 2) 価格：100円以上変動したら通知
+            if (price is not None) and (prev_price is not None):
+                if abs(price - prev_price) >= MIN_PRICE_DIFF:
+                    diff = price - prev_price
+                    changes.append(
+                        f"*{sku}* 価格: {prev_price:,} → *{price:,}*（{diff:+,}）\n{url}"
+                    )
+
+        # 状態を更新（通知有無に関わらず）
+        import time
+        state[sku] = {
+            "stock": stock,
+            "price": price,
+            "url": url,
+            "checked_at": int(time.time()),
+        }
+
+        time.sleep(0.3)  # サイトに優しく
+
 
     save_state(state)
     if changes:
        slack_notify("在庫巡回レポート\n\n" + "\n\n".join(changes))
+
 
 
