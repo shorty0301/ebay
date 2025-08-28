@@ -8,13 +8,13 @@ import os, sys, json, time
 from datetime import datetime
 from urllib.parse import urlparse
 
-# ログを詳細出力
+# 詳細ログON
 os.environ["EXTRACTOR_DEBUG"] = os.environ.get("EXTRACTOR_DEBUG", "1")
 
 from supplier_extractors import fetch_html, extract_supplier_info  # ← host_from_url は使わない
 
 TEST_URLS = [
-    # ここに任意のURLを追加（Actionsの手動実行でinputs指定も可）
+    # ここに任意のURLを入れてもOK。Actions の inputs で渡せば空でも可。
 ]
 
 def host_from(url: str) -> str:
@@ -39,7 +39,7 @@ def main(urls):
         t0 = time.time()
         try:
             html = fetch_html(url)
-            info = extract_supplier_info(url, html, debug=True)  # debug=True で詳細ログ
+            info = extract_supplier_info(url, html, debug=True)
             ms = int((time.time()-t0)*1000)
             print(json.dumps({
                 "host": host_from(url),
