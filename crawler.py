@@ -1,81 +1,59 @@
-# crawler.py
 # -*- coding: utf-8 -*-
 """
-在庫巡回 → 解析 → Slack通知 → Inventoryシート更新 までを一括で実行します。
-
-【必要な環境変数（GitHub Secrets想定）】
-- GOOGLE_SERVICE_ACCOUNT_JSON : サービスアカウントJSONの中身（文字列）
-- SHEET_ID                    : GoogleスプレッドシートID
-- SHEET_NAME                  : 読み取り元のタブ名（既定: Listings_Input）
-- INV_SHEET                   : 書き込み先のタブ名（既定: Inventory）
-- SLACK_WEBHOOK_URL           : Slack Incoming Webhook（任意）
-
-【シート列】
-Inventory のヘッダは足りなければ自動追加します。
-SKU / Listing URL / SupplierStock / SupplierPrice / LastSupplierPrice / SourceURL / LastCheckedAt / Note
-C列=在庫、D列=現在価格、E列=前回価格、G列=取得時刻、H列=NOTE
-
-【通知ポリシー】
-- 価格が MIN_PRICE_DIFF（既定100円）以上動いたら通知
-- 在庫は OUT_OF_STOCK になったとき通知（初回は通知スキップ可能）
+在庫巡回クローラ(完全版)
+- Listings_Input から SKU / 仕入れ元URL（SourceURL）等を読み込み
+- 各URLの在庫/価格を抽出（supplier_extractors.py を使用）
+- 在庫管理シート（既定: 在庫管理）へ反映：
+    C列: 在庫ラベル（日本語）
+    D列: 価格（最新）
+    E列: 前回価格
+    G列: 取得日時（JST, yyyy-mm-dd HH:MM）
+    H列: NOTE（通知方針/エラー等）
+- 前回値との比較で Slack 通知（価格変動／在庫切れなど）
+環境変数:
+  SHEET_ID, SHEET_INPUT(=Listings_Input), SHEET_INV(=在庫管理), GOOGLE_SERVICE_ACCOUNT_JSON, SLACK_WEBHOOK_URL
+  MIN_PRICE_DIFF (default 100), NOTIFY_ON_STOCK (csv: OUT_OF_STOCK,LAST_ONE など), SKIP_FIRST_TIME (1/0)
 """
-
-import os, re, json, time, requests
+import os, json, time, math, re
 from pathlib import Path
-from bs4 import BeautifulSoup
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, List, Tuple
+
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+import requests
 
-# =====================================================
-# 設定値
-# =====================================================
-SHEET_ID   = os.environ.get("SHEET_ID", "")                  # スプレッドシートID
-SHEET_NAME = os.environ.get("SHEET_NAME", "Listings_Input")  # 読み取り元
-INV_SHEET  = os.environ.get("INV_SHEET",  "Inventory")       # 書き込み先
-SCOPES     = ["https://www.googleapis.com/auth/spreadsheets"]# 書き込み可
-JST_FMT    = "%Y/%m/%d %H:%M:%S"
+from supplier_extractors import fetch_and_extract, extract_supplier_info
 
+# ================= 設定 =================
+SHEET_ID    = os.environ.get("SHEET_ID", "").strip()
+SHEET_INPUT = os.environ.get("SHEET_INPUT", "Listings_Input")
+SHEET_INV   = os.environ.get("SHEET_INV", "在庫管理")
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 STATE_DIR  = Path("state"); STATE_DIR.mkdir(exist_ok=True)
 STATE_FILE = STATE_DIR / "inventory_state.json"
 
-# ===== 通知ポリシー =====
-MIN_PRICE_DIFF   = int(os.environ.get("MIN_PRICE_DIFF", "100"))  # 価格差しきい値
-NOTIFY_ON_STOCK  = {"OUT_OF_STOCK"}                              # 在庫ありは通知対象外
-SKIP_FIRST_TIME  = os.environ.get("SKIP_FIRST_TIME", "true").lower() == "true"
+MIN_PRICE_DIFF    = int(os.environ.get("MIN_PRICE_DIFF", "100"))
+NOTIFY_ON_STOCK   = set([s.strip().upper() for s in os.environ.get("NOTIFY_ON_STOCK", "OUT_OF_STOCK").split(",") if s.strip()])
+SKIP_FIRST_TIME   = os.environ.get("SKIP_FIRST_TIME", "1") not in ("0","false","False")
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL","").strip()
 
-# ===== 2表記（在庫あり/在庫切れ）サイト =====
-TWO_STATE_HOST_KEYS = [
-    "offmall",                        # オフモール
-    "auctions.yahoo",                 # ヤフオク
-    "paypayfleamarket", "paypayfleamarket.yahoo",  # PayPayフリマ
-    "rakuma", "fril",                 # ラクマ
-    "geo-online", "geo-online.co", "geo-online.jp",# GEO
-    "mercari",                        # メルカリ
-    "suruga-ya", "surugaya",          # 駿河屋
-    "treasure-f", "trefac"            # トレファク
-]
+JST = timezone(timedelta(hours=9))
 
-INV_HEADERS = [
-    "SKU","Listing URL","SupplierStock","SupplierPrice",
-    "LastSupplierPrice","SourceURL","LastCheckedAt","Note"
-]
-
-# =====================================================
-# Slack通知
-# =====================================================
+# ================ Slack =================
 def slack_notify(message: str):
-    url = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+    url = SLACK_WEBHOOK_URL
     if not url:
-        print("⚠️ SLACK_WEBHOOK_URL が未設定です（通知はスキップ）")
+        print("⚠️ SLACK_WEBHOOK_URL 未設定のため通知スキップ")
         return
-
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": "在庫巡回レポート"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": message[:2800]}},
-    ]
-    payload = {"text": message[:2000], "blocks": blocks}
-
+    payload = {
+        "text": message[:2000],
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": "在庫巡回レポート"}},
+            {"type": "section","text":{"type":"mrkdwn","text":message[:2800]}}
+        ]
+    }
     try:
         r = requests.post(url, json=payload, timeout=15)
         if r.status_code != 200:
@@ -83,290 +61,239 @@ def slack_notify(message: str):
     except Exception as e:
         print(f"⚠️ Slack通知エラー: {e}")
 
-# =====================================================
-# Google Sheets クライアント
-# =====================================================
+# ============== Google Sheets ==============
 def _gspread_client():
-    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if not raw:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON が未設定です。")
     info = json.loads(raw)
     cred = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(cred)
 
-def _open_ws(sheet_id: str, tab: str):
+def _open_ws(sheet_id: str, name: str):
     gc = _gspread_client()
-    return gc.open_by_key(sheet_id).worksheet(tab)
+    sh = gc.open_by_key(sheet_id).worksheet(name)
+    return sh
 
-def _header_map(ws):
-    headers = ws.row_values(1)
-    return { (h or "").strip().lower(): i+1 for i,h in enumerate(headers) if (h or "").strip() }
-
-def ensure_inventory_headers(ws):
-    m = _header_map(ws)
-    to_add = [h for h in INV_HEADERS if h.lower() not in m]
-    if to_add:
-        start = len(m) + 1
-        ws.update(f"R1C{start}:R1C{start+len(to_add)-1}", [to_add])
-        m = _header_map(ws)
+def _headers_map(ws) -> Dict[str, int]:
+    """ヘッダ名(小文字) -> 1-based col index"""
+    row = ws.row_values(1)
+    m = {}
+    for i, h in enumerate(row, start=1):
+        k = (h or "").strip().lower()
+        if k: m[k]=i
     return m
 
-def load_inventory_existing(ws, hmap):
-    values = ws.get_all_values()
-    out = {}
-    for r in range(2, len(values)+1):
-        row = values[r-1]
-        def gv(name):
-            c = hmap.get(name.lower())
-            return row[c-1] if (c and c-1 < len(row)) else ""
-        sku = (gv("sku") or "").strip()
-        if not sku: 
-            continue
-        out[sku] = {
-            "row": r,
-            "SupplierStock": (gv("supplierstock") or "").strip(),
-            "SupplierPrice": (gv("supplierprice") or "").replace(",",""),
-            "LastSupplierPrice": (gv("lastsupplierprice") or "").replace(",",""),
-        }
-    return out
+def _col_letter(n: int) -> str:
+    s = ""
+    while n>0:
+        n, r = divmod(n-1, 26)
+        s = chr(65+r) + s
+    return s
 
-# =====================================================
-# 読み取り元（Listings_Input）から SKU/URL を取得
-# =====================================================
-def load_suppliers_from_sheet(sheet_id=SHEET_ID, worksheet_name=SHEET_NAME):
-    if not sheet_id:
-        raise RuntimeError("SHEET_ID が未設定です。")
-    ws = _open_ws(sheet_id, worksheet_name)
+# ============== データ取得 ==============
+def load_input_rows() -> List[Dict[str,str]]:
+    ws = _open_ws(SHEET_ID, SHEET_INPUT)
     rows = ws.get_all_values()
-    if not rows:
-        return []
-
+    if not rows: return []
     headers = [h.strip().lower() for h in rows[0]]
-
-    def col_idx(cands):
+    def idx(*cands):
         for c in cands:
-            if c in headers:
-                return headers.index(c)
-        return None
-
-    idx_sku = col_idx(["sku"])
-    idx_url = col_idx(["sourceurl", "srcurl", "url", "商品url", "仕入れ元url"])
-
-    if idx_sku is None or idx_url is None:
-        raise RuntimeError(f"必要な列が見つかりません。headers={headers}")
-
-    out = []
+            if c in headers: return headers.index(c)
+        return -1
+    i_sku    = idx("sku")
+    i_srcurl = idx("sourceurl","srcurl","url","商品url","仕入れ元url")
+    i_ebay   = idx("ebayid","ebay_id")
+    out=[]
     for r in rows[1:]:
-        try:
-            sku = (r[idx_sku] or "").strip()
-            url = (r[idx_url] or "").strip()
-        except IndexError:
-            continue
-        if sku and url:
-            out.append({"sku": sku, "url": url})
+        sku = (r[i_sku] if i_sku>=0 and i_sku<len(r) else "").strip()
+        url = (r[i_srcurl] if i_srcurl>=0 and i_srcurl<len(r) else "").strip()
+        ebay= (r[i_ebay] if i_ebay>=0 and i_ebay<len(r) else "").strip()
+        if not sku: continue
+        listing = f"https://www.ebay.com/itm/{ebay}" if ebay else ""
+        out.append({"sku":sku, "url":url, "listing":listing})
     return out
 
-# =====================================================
-# HTML取得 & 価格・在庫解析
-# =====================================================
-def fetch_html(url: str) -> str:
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
-    r = requests.get(url, headers={"User-Agent": ua}, timeout=30)
-    r.raise_for_status()
-    r.encoding = r.apparent_encoding
-    return r.text
+# ============== 在庫ラベル決定（サイト別ポリシー） ==============
+def host_of(url: str) -> str:
+    m = re.match(r"^[a-z]+://([^/?#]+)", str(url or ""), re.I)
+    return m.group(1).lower() if m else ""
 
-def yen_to_int(text: str):
-    t = text.replace("，", ",").replace("．", ".")
-    t = re.sub(r"[^\d,]", "", t).replace(",", "")
-    return int(t) if t.isdigit() else None
+TWO_LABEL_HOSTS = re.compile(
+    r"(netmall\.hardoff\.co\.jp|auctions\.yahoo\.co\.jp|paypayfleamarket\.yahoo\.co\.jp|"
+    r"(?:fril\.jp|rakuma\.rakuten\.co\.jp)|geo-online\.co\.jp|mercari|suruga-ya\.jp|treasure-f\.com)"
+)
 
-def parse_stock_and_price(html: str):
-    """
-    stock: IN_STOCK / OUT_OF_STOCK / LAST_ONE / UNKNOWN
-    price: int or None
-    """
-    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
-
-    stock = "UNKNOWN"
-    if re.search(r"(売り切れ|在庫切れ|SOLD\s*OUT|販売終了|取扱い終了)", text, re.I):
-        stock = "OUT_OF_STOCK"
-    elif re.search(r"(在庫あり|即日|カートに入れる|購入手続き|今すぐ購入|ご注文手続き)", text, re.I):
-        stock = "IN_STOCK"
-    if re.search(r"残り\s*1\s*(点|個|枚|本)", text):
-        stock = "LAST_ONE"
-
-    stop = re.compile(r"(ポイント|付与|獲得|送料|手数料|実質|クーポン|割引|値引|上限)", re.I)
-    hits = re.findall(r"[¥￥]?\s?\d{1,3}(?:[,，]\d{3})+|\b\d{3,7}\b", text)
-    prices = []
-    for h in hits:
-        i = text.find(h)
-        ctx = text[max(0, i-15): i+len(h)+15]
-        if stop.search(ctx):
-            continue
-        n = yen_to_int(h)
-        if n and 0 < n < 10_000_000:
-            prices.append(n)
-    price = min(prices) if prices else None
-
-    return stock, price
-
-# =====================================================
-# 在庫ラベル判定（2表記/4表記）
-# =====================================================
-def _host_from_url(url: str) -> str:
-    m = re.search(r"https?://([^/]+)/?", url or "", re.I)
-    return (m.group(1).lower() if m else "").strip()
-
-def decide_stock_label(url: str, stock_code: str, qty: int|None = None) -> str:
-    """
-    2表記サイト：IN_STOCK/LAST_ONE→在庫あり、OUT_OF_STOCK→在庫切れ
-    4表記サイト：OUT_OF_STOCK→在庫切れ、LAST_ONE→残り1点、qty>=2→残りn点、その他→在庫あり
-    """
-    host = _host_from_url(url)
-    two  = any(k in host for k in TWO_STATE_HOST_KEYS)
-
-    if two:
-        return "在庫あり" if stock_code != "OUT_OF_STOCK" else "在庫切れ"
-
-    if stock_code == "OUT_OF_STOCK":
+def stock_label_for_site(url: str, stock: str, qty: str) -> str:
+    stock = (stock or "UNKNOWN").upper()
+    h = host_of(url)
+    is_two = bool(TWO_LABEL_HOSTS.search(h))
+    if is_two:
+        return "在庫あり" if stock != "OUT_OF_STOCK" else "在庫なし"
+    # 4表記（デフォルト）
+    if stock == "OUT_OF_STOCK":
         return "在庫切れ"
-    if stock_code == "LAST_ONE":
+    if stock == "LAST_ONE":
         return "残り1点"
-    if qty and qty >= 2:
-        return f"残り{qty}点"
-    return "在庫あり"
+    if stock == "IN_STOCK":
+        try:
+            n = int(qty) if qty and str(qty).isdigit() else None
+            if n is not None and n>1:
+                return f"残り{n}点"
+        except: pass
+        return "在庫あり"
+    return "不明"
 
-# =====================================================
-# 状態保存
-# =====================================================
-def load_state():
+# ============== 状態保存 ==============
+STATE_DIR = Path("state"); STATE_DIR.mkdir(exist_ok=True)
+STATE_FILE = STATE_FILE
+
+def load_state() -> Dict[str, Any]:
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except: return {}
     return {}
 
-def save_state(state):
+def save_state(state: Dict[str,Any]):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
-# =====================================================
-# メイン
-# =====================================================
+# ============== 在庫管理シートの列位置 ==============
+def resolve_inventory_columns(ws) -> Dict[str,int]:
+    """
+    既定: C=Stock, D=Price, E=LastPrice, G=CheckedAt, H=Note
+    可能ならヘッダ名でも解決（優先）: supplierstock, supplierprice, lastsupplierprice, lastcheckedat, note, sourceurl, listingurl, sku
+    """
+    hm = _headers_map(ws)
+    def get_by_header(*names):
+        for n in names:
+            i = hm.get(n)
+            if i: return i
+        return None
+    col = {}
+    col["sku"]          = get_by_header("sku") or 1
+    col["sourceurl"]    = get_by_header("sourceurl","srcurl","url","仕入れ元url") or 2
+    col["listingurl"]   = get_by_header("listingurl") or 0
+    col["stock"]        = get_by_header("supplierstock","stock") or 3
+    col["price"]        = get_by_header("supplierprice","price") or 4
+    col["last_price"]   = get_by_header("lastsupplierprice","lastprice") or 5
+    col["checked_at"]   = get_by_header("lastcheckedat","checked_at") or 7
+    col["note"]         = get_by_header("note") or 8
+    return col
+
+# ============== Inventory 行の索引（SKU->row） ==============
+def build_row_index(ws, col_sku: int) -> Dict[str,int]:
+    vals = ws.col_values(col_sku)[1:]  # 2行目以降
+    return { (v or "").strip(): i+2 for i,v in enumerate(vals) if (v or "").strip() }
+
+# ============== メイン処理 ==============
 def main():
-    # 読み取り元
-    suppliers = load_suppliers_from_sheet()
+    if not SHEET_ID: raise RuntimeError("SHEET_ID が未設定です。")
+    ws_inv = _open_ws(SHEET_ID, SHEET_INV)
 
-    # 書き込み先（Inventory）準備
-    inv_ws   = _open_ws(SHEET_ID, INV_SHEET)
-    inv_map  = ensure_inventory_headers(inv_ws)
-    inv_exist = load_inventory_existing(inv_ws, inv_map)
+    input_rows = load_input_rows()
+    if not input_rows:
+        print("入力行が空です。終了")
+        return
 
-    # A1ユーティリティ
-    def a1(r, c): 
-        return gspread.utils.rowcol_to_a1(r, c)
+    inv_cols = resolve_inventory_columns(ws_inv)
+    row_map = build_row_index(ws_inv, inv_cols["sku"])
 
-    batch_cells = []   # 既存行の更新
-    append_rows = []   # 新規行の追記
+    # 既存行がないSKUは追記
+    append_batch = []
+    for r in input_rows:
+        sku = r["sku"]
+        if sku not in row_map:
+            row = [""] * max(ws_inv.col_count, 10)
+            row[inv_cols["sku"]-1]       = sku
+            if inv_cols.get("sourceurl"):  row[inv_cols["sourceurl"]-1] = r.get("url","" )
+            if inv_cols.get("listingurl") and inv_cols["listingurl"]>0:
+                row[inv_cols["listingurl"]-1] = r.get("listing","" )
+            append_batch.append(row)
+    if append_batch:
+        start_row = ws_inv.row_count + 1
+        ws_inv.add_rows(len(append_batch))
+        ws_inv.update(f"A{start_row}:{_col_letter(len(append_batch[0]))}{start_row+len(append_batch)-1}", append_batch)
+        row_map = build_row_index(ws_inv, inv_cols["sku"])
 
-    # 変更通知まとめ
-    state  = load_state()
+    state = load_state()
     changes = []
 
-    for row in suppliers:
-        sku, url = row["sku"], row["url"]
+    for r in input_rows:
+        sku = r["sku"]; url = r.get("url","" ); listing = r.get("listing","" )
+        if not sku: continue
+        row_no = row_map.get(sku)
+        if not row_no: continue
 
+        note_msgs = []
         try:
-            html = fetch_html(url)
-            stock_code, price = parse_stock_and_price(html)
+            info = fetch_and_extract(url) if url else {"stock":"UNKNOWN","qty":"","price":None}
+            stock = info.get("stock","UNKNOWN")
+            qty   = info.get("qty","") or ""
+            price = info.get("price", None)
         except Exception as e:
-            changes.append(f"⚠️ 取得失敗 {sku}\n{url}\n{e}")
-            continue
+            stock, qty, price = "UNKNOWN", "", None
+            note_msgs.append(f"取得失敗: {e}")
 
-        # 通知判定
+        label = stock_label_for_site(url, stock, qty)
+
         prev = state.get(sku, {})
         prev_stock = prev.get("stock")
         prev_price = prev.get("price")
 
+        # シートE(前回価格)が数字ならそれを prev に採用
+        try:
+            if inv_cols.get("last_price"):
+                last_p_cell = ws_inv.cell(row_no, inv_cols["last_price"]).value
+                if last_p_cell and last_p_cell.strip().isdigit():
+                    prev_price = int(last_p_cell.strip())
+        except: pass
+
         if not prev and SKIP_FIRST_TIME:
             pass
         else:
-            if stock_code and stock_code != prev_stock and stock_code in NOTIFY_ON_STOCK:
-                changes.append(f"*{sku}* 在庫: {prev_stock} → *{stock_code}*\n{url}")
-
+            if stock and prev_stock and stock != prev_stock and stock.upper() in NOTIFY_ON_STOCK:
+                changes.append(f"*{sku}* 在庫: {prev_stock} → *{stock}*\n{url or listing}")
             if (price is not None) and (prev_price is not None):
-                if abs(price - prev_price) >= MIN_PRICE_DIFF:
-                    diff = price - prev_price
-                    changes.append(
-                        f"*{sku}* 価格: {prev_price:,} → *{price:,}*（{diff:+,}）\n{url}"
-                    )
+                if abs(int(price) - int(prev_price)) >= MIN_PRICE_DIFF:
+                    diff = int(price) - int(prev_price)
+                    changes.append(f"*{sku}* 価格: {int(prev_price):,} → *{int(price):,}*（{diff:+,}）\n{url or listing}")
 
-        # state更新
-        state[sku] = {
-            "stock": stock_code,
-            "price": price,
-            "url": url,
-            "checked_at": int(time.time()),
-        }
-
-        # ===== Inventory書き込み =====
-        label = decide_stock_label(url, stock_code)    # C列表示
-        now   = datetime.now().strftime(JST_FMT)
-
-        prev_inv = inv_exist.get(sku)
-        price_now = price
-
-        # 既存価格の数値化
+        # シート更新
         try:
-            prev_price_num = int(prev_inv["SupplierPrice"]) if (prev_inv and prev_inv["SupplierPrice"]) else None
-        except:
-            prev_price_num = None
+            nowj = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
+            # E(前回価格) ← D(最新) をコピー
+            if inv_cols.get("last_price") and inv_cols.get("price"):
+                cur_d = ws_inv.cell(row_no, inv_cols["price"]).value
+                if cur_d and cur_d.strip().isdigit():
+                    ws_inv.update_cell(row_no, inv_cols["last_price"], int(cur_d))
 
-        if prev_inv:
-            r = prev_inv["row"]
+            updates = []
+            if inv_cols.get("stock"):
+                updates.append({"range": gspread.utils.rowcol_to_a1(row_no, inv_cols["stock"]), "values":[[label]]})
+            if inv_cols.get("price"):
+                updates.append({"range": gspread.utils.rowcol_to_a1(row_no, inv_cols["price"]), "values":[[("" if price is None else int(price))]]})
+            if inv_cols.get("checked_at"):
+                updates.append({"range": gspread.utils.rowcol_to_a1(row_no, inv_cols["checked_at"]), "values":[[nowj]]})
+            if inv_cols.get("note"):
+                if not note_msgs:
+                    note_msgs.append("在庫切れ/LAST1をSlackで通知。価格は±{}円以上で通知。".format(MIN_PRICE_DIFF))
+                updates.append({"range": gspread.utils.rowcol_to_a1(row_no, inv_cols["note"]), "values":[[" / ".join(note_msgs)]]})
+            if updates:
+                ws_inv.batch_update([{"range": u["range"], "values": u["values"]} for u in updates])
+        except Exception as e:
+            print(f"⚠️ シート更新エラー {sku}: {e}")
 
-            # 価格が変わったら D→E に退避
-            if (prev_price_num is not None) and (price_now is not None) and (prev_price_num != price_now):
-                batch_cells.append({"range": a1(r, inv_map["lastsupplierprice"]), "values": [[prev_price_num]]})
-
-            note = "残り1点" if label == "残り1点" else ("在庫切れ" if label == "在庫切れ" else "")
-
-            batch_cells += [
-                {"range": a1(r, inv_map["supplierstock"]), "values": [[label]]},                    # C
-                {"range": a1(r, inv_map["supplierprice"]), "values": [[("" if price_now is None else price_now)]]},  # D
-                {"range": a1(r, inv_map["listing url"]),   "values": [[url]]},                      # B
-                {"range": a1(r, inv_map["sourceurl"]),     "values": [[url]]},                      # F
-                {"range": a1(r, inv_map["lastcheckedat"]), "values": [[now]]},                      # G
-                {"range": a1(r, inv_map["note"]),          "values": [[note]]},                     # H
-            ]
-        else:
-            # 追加行
-            rowvals = [""] * len(INV_HEADERS)
-            def setv(col_name, val):
-                idx = INV_HEADERS.index(col_name)
-                rowvals[idx] = val
-            setv("SKU", sku)
-            setv("Listing URL", url)
-            setv("SupplierStock", label)
-            setv("SupplierPrice", "" if price_now is None else price_now)
-            setv("LastSupplierPrice", "")
-            setv("SourceURL", url)
-            setv("LastCheckedAt", now)
-            setv("Note", "残り1点" if label == "残り1点" else ("在庫切れ" if label == "在庫切れ" else ""))
-            append_rows.append(rowvals)
-
-        time.sleep(0.3)  # サイト負荷配慮
-
-    # ===== Inventory反映 =====
-    if batch_cells:
-        inv_ws.batch_update(batch_cells)
-    if append_rows:
-        inv_ws.append_rows(append_rows, value_input_option="USER_ENTERED")
+        state[sku] = {
+            "stock": stock,
+            "price": (None if price is None else int(price)),
+            "url": url,
+            "checked_at": int(time.time())
+        }
+        time.sleep(0.2)
 
     save_state(state)
-
-    # ===== Slack通知 =====
     if changes:
         slack_notify("在庫巡回レポート\n\n" + "\n\n".join(changes))
 
-# -----------------------------------------------------
 if __name__ == "__main__":
     main()
