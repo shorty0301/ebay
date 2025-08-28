@@ -31,7 +31,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
+      # どこか run の前後に一時追加してね
+      - name: Slack webhook quick test
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import os, requests, json
+          url = os.environ.get("SLACK_WEBHOOK_URL", "")
+          print("Has SLACK_WEBHOOK_URL:", bool(url))
+          if not url:
+              raise SystemExit("❌ Secret SLACK_WEBHOOK_URL が空です")
+          r = requests.post(url, json={"text":"✅ Webhook 単独テスト from GitHub Actions"}, timeout=15)
+          print("Slack status:", r.status_code)
+          print("Slack body:", r.text[:300])
+          if r.status_code != 200 or r.text.strip().lower() not in ("ok", ""):
+              raise SystemExit("❌ Slack に弾かれてます")
+          PY
       - name: Run crawler
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
