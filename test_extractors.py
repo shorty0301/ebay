@@ -14,7 +14,7 @@ os.environ["EXTRACTOR_DEBUG"] = os.environ.get("EXTRACTOR_DEBUG", "1")
 from supplier_extractors import fetch_html, extract_supplier_info  # ← host_from_url は使わない
 
 TEST_URLS = [
-    # ここに任意のURLを入れてもOK。Actions の inputs で渡せば空でも可。
+    # ここに任意のURLを入れてもOK。
 ]
 
 def host_from(url: str) -> str:
