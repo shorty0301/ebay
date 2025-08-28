@@ -1,30 +1,54 @@
-name: Extractor Test
-on:
-  workflow_dispatch:
-    inputs:
-      urls:
-        description: "改行区切りのテストURL（空なら TEST_URLS を使用）"
-        required: false
-        default: ""
+  - name: Run extractor smoke test (force log + artifact)
+    env:
+      EXTRACTOR_DEBUG: "1"
+      PYTHONUNBUFFERED: "1"
+    run: |
+      set -euo pipefail
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - name: Run extractor smoke test
-        env:
-          EXTRACTOR_DEBUG: "1"
-        run: |
-          if [ -n "${{ github.event.inputs.urls }}" ]; then
-            printf '%s\n' "${{ github.event.inputs.urls }}" | xargs -n1 python test_extractors.py
-          else
-            python test_extractors.py
-          fi
+      echo "----- Incoming URLs (raw) -----"
+      echo "${{ github.event.inputs.urls }}"
+
+      echo "----- Show test_extractors.py head -----"
+      sed -n '1,80p' test_extractors.py || true
+
+      echo "----- Start Python test -----"
+      python - <<'PY'
+import os, sys, json, textwrap
+from supplier_extractors import fetch_html, extract_supplier_info
+
+# 入力URL（改行区切り）。空ならデフォルト1件で動かす
+raw = """${{ github.event.inputs.urls }}""".strip()
+urls = [u.strip() for u in raw.splitlines() if u.strip()]
+if not urls:
+    urls = ["https://netmall.hardoff.co.jp/product/5372313/"]  # ←任意に差し替えOK
+
+print("URLS:", urls)
+
+results = []
+for i, u in enumerate(urls, 1):
+    print(f"\n[{i}/{len(urls)}] GET {u}", flush=True)
+    try:
+        html = fetch_html(u)
+        info = extract_supplier_info(u, html, debug=True)
+        rec = {"url": u, "stock": info.get("stock"),
+               "qty": info.get("qty"), "price": info.get("price"),
+               "debug": info.get("_debug", {})}
+        print(json.dumps(rec, ensure_ascii=False, indent=2), flush=True)
+        results.append(rec)
+    except Exception as e:
+        rec = {"url": u, "error": str(e)}
+        print("ERROR:", rec, flush=True)
+        results.append(rec)
+
+# JSONファイルにも保存（後でArtifactsでDL）
+with open("extractor_results.json", "w", encoding="utf-8") as f:
+    json.dump(results, f, ensure_ascii=False, indent=2)
+
+print("\nWROTE extractor_results.json", flush=True)
+PY
+
+  - name: Upload extractor results
+    uses: actions/upload-artifact@v4
+    with:
+      name: extractor_results
+      path: extractor_results.json
