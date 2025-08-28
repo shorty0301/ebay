@@ -51,4 +51,11 @@ def load_suppliers_from_sheet(sheet_id=SHEET_ID, worksheet_name=SHEET_NAME):
         if sku and url:
             out.append({"sku": sku, "url": url})
     return out
-# ===== 追記ここまで =====
+
+if __name__ == "__main__":
+    from datetime import datetime
+    # LINE 通知テスト（時間付き）
+    from crawler import line_push if False else None  # 同一ファイルなら不要
+    line_push(f"✅ テスト通知：GitHub Actions から送信 {datetime.now():%Y-%m-%d %H:%M:%S}")
+
+
