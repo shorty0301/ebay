@@ -8,9 +8,6 @@ from datetime import datetime
 # =====================================================
 # 設定値（GitHub Secrets で設定）
 # =====================================================
-LINE_TOKEN = os.environ.get("LINE_CHANNEL_TOKEN", "")
-LINE_TO = [s for s in (os.environ.get("LINE_TO", "")).replace(" ", "").split(",") if s]
-
 SHEET_ID   = os.environ.get("SHEET_ID", "")              # GoogleスプレッドシートのID
 SHEET_NAME = os.environ.get("SHEET_NAME", "Listings_Input")
 SCOPES     = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -19,38 +16,21 @@ STATE_DIR  = Path("state"); STATE_DIR.mkdir(exist_ok=True)
 STATE_FILE = STATE_DIR / "inventory_state.json"
 
 # =====================================================
-# LINE通知
+# SLACK通知
 # =====================================================
-def line_push(msg: str):
-    """LINE Push。失敗したらジョブを失敗させて原因をログに出す。"""
-    if not LINE_TOKEN:
-        print("LINE_CHANNEL_TOKEN が未設定です")
-        raise RuntimeError("LINE token missing")
-    if not LINE_TO:
-        print("LINE_TO が未設定です")
-        raise RuntimeError("LINE to missing")
-
-    all_ok = True
-    for to in LINE_TO:
-        try:
-            r = requests.post(
-                "https://api.line.me/v2/bot/message/push",
-                headers={
-                    "Authorization": f"Bearer {LINE_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json={"to": to, "messages": [{"type": "text", "text": msg[:1000]}]},
-                timeout=15,
-            )
-            if r.status_code >= 300:
-                all_ok = False
-                print(f"[LINE ERROR] to={to} status={r.status_code} body={r.text}")
-        except Exception as e:
-            all_ok = False
-            print(f"[LINE EXCEPTION] to={to} err={e}")
-
-    if not all_ok:
-        raise RuntimeError("LINE push failed (see logs)")
+def slack_notify(message: str):
+    import requests, os
+    url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    if not url:
+        print("⚠️ SLACK_WEBHOOK_URL が未設定です")
+        return
+    payload = {"text": message}
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"⚠️ Slack通知失敗: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"⚠️ Slack通知エラー: {e}")
 
 # =====================================================
 # Google Sheets から SKU / URL を取得
@@ -179,14 +159,11 @@ def main():
 
     save_state(state)
     if changes:
-        line_push("在庫巡回レポート\n\n" + "\n\n".join(changes))
+       slack_notify("在庫巡回レポート\n\n" + "\n\n".join(changes))
 
 # =====================================================
 # テスト実行（GitHub Actionsから通知が来るかチェック用）
 # =====================================================
 if __name__ == "__main__":
-    line_push(f"✅ テスト通知: GitHub Actions から送信 {datetime.now():%Y-%m-%d %H:%M:%S}")
-    # 本番巡回を実行したいときは下を有効化
-    # main()
-
+   main()
 
