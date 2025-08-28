@@ -23,54 +23,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run extractor smoke test (force log + artifact)
+      - name: Run extractor smoke test
         env:
+          INPUT_URLS: ${{ github.event.inputs.urls }}
           EXTRACTOR_DEBUG: "1"
           PYTHONUNBUFFERED: "1"
-          INPUT_URLS: ${{ github.event.inputs.urls }}
         run: |
-          set -euo pipefail
-
-          echo "----- Incoming URLs (raw) -----"
-          printf '%s\n' "${INPUT_URLS}"
-
-          # Python スクリプトを書き出して実行
-          cat > run_extract_test.py <<'PY'
-import os, json
-from supplier_extractors import fetch_html, extract_supplier_info
-
-raw = os.environ.get("INPUT_URLS", "").strip()
-urls = [u.strip() for u in raw.splitlines() if u.strip()]
-if not urls:
-    urls = ["https://netmall.hardoff.co.jp/product/5372313/"]  # デフォルト
-
-print("URLS:", urls, flush=True)
-
-results = []
-for i, u in enumerate(urls, 1):
-    print(f"\n[{i}/{len(urls)}] GET {u}", flush=True)
-    try:
-        html = fetch_html(u)
-        info = extract_supplier_info(u, html, debug=True)
-        rec = {
-            "url": u,
-            "stock": info.get("stock"),
-            "qty": info.get("qty"),
-            "price": info.get("price"),
-            "debug": info.get("_debug", {})
-        }
-        print(json.dumps(rec, ensure_ascii=False, indent=2), flush=True)
-        results.append(rec)
-    except Exception as e:
-        rec = {"url": u, "error": str(e)}
-        print("ERROR:", rec, flush=True)
-        results.append(rec)
-
-with open("extractor_results.json", "w", encoding="utf-8") as f:
-    json.dump(results, f, ensure_ascii=False, indent=2)
-
-print("\nWROTE extractor_results.json", flush=True)
-PY
+          echo "import os, json" > run_extract_test.py
+          echo "from supplier_extractors import fetch_html, extract_supplier_info" >> run_extract_test.py
+          echo "raw = os.environ.get('INPUT_URLS','').strip()" >> run_extract_test.py
+          echo "urls = [u.strip() for u in raw.splitlines() if u.strip()]" >> run_extract_test.py
+          echo "if not urls: urls = ['https://netmall.hardoff.co.jp/product/5372313/']" >> run_extract_test.py
+          echo "print('URLS:', urls, flush=True)" >> run_extract_test.py
+          echo "results = []" >> run_extract_test.py
+          echo "for i,u in enumerate(urls,1):" >> run_extract_test.py
+          echo "    print(f'[{i}/{len(urls)}] GET {u}', flush=True)" >> run_extract_test.py
+          echo "    try:" >> run_extract_test.py
+          echo "        html = fetch_html(u)" >> run_extract_test.py
+          echo "        info = extract_supplier_info(u, html, debug=True)" >> run_extract_test.py
+          echo "        rec = {'url':u,'stock':info.get('stock'),'qty':info.get('qty'),'price':info.get('price'),'debug':info.get('_debug',{})}" >> run_extract_test.py
+          echo "        print(json.dumps(rec,ensure_ascii=False,indent=2), flush=True)" >> run_extract_test.py
+          echo "        results.append(rec)" >> run_extract_test.py
+          echo "    except Exception as e:" >> run_extract_test.py
+          echo "        rec = {'url':u,'error':str(e)}" >> run_extract_test.py
+          echo "        print('ERROR:', rec, flush=True)" >> run_extract_test.py
+          echo "        results.append(rec)" >> run_extract_test.py
+          echo "with open('extractor_results.json','w',encoding='utf-8') as f: json.dump(results,f,ensure_ascii=False,indent=2)" >> run_extract_test.py
+          echo "print('WROTE extractor_results.json', flush=True)" >> run_extract_test.py
 
           python run_extract_test.py
 
