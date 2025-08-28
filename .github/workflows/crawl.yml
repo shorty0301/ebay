@@ -53,6 +53,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SHEET_NAME: Listings_Input          # シート名（必要なら変更）
+          SHEET_INV: Inventory   
           LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
           LINE_TO: ${{ secrets.LINE_TO }}
         run: |
