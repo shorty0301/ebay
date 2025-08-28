@@ -22,22 +22,35 @@ STATE_FILE = STATE_DIR / "inventory_state.json"
 # LINE通知
 # =====================================================
 def line_push(msg: str):
-    if not (LINE_TOKEN and LINE_TO):
-        print("LINE設定なし。通知スキップ:", msg)
-        return
+    """LINE Push。失敗したらジョブを失敗させて原因をログに出す。"""
+    if not LINE_TOKEN:
+        print("LINE_CHANNEL_TOKEN が未設定です")
+        raise RuntimeError("LINE token missing")
+    if not LINE_TO:
+        print("LINE_TO が未設定です")
+        raise RuntimeError("LINE to missing")
+
+    all_ok = True
     for to in LINE_TO:
         try:
-            requests.post(
+            r = requests.post(
                 "https://api.line.me/v2/bot/message/push",
                 headers={
                     "Authorization": f"Bearer {LINE_TOKEN}",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
                 },
                 json={"to": to, "messages": [{"type": "text", "text": msg[:1000]}]},
                 timeout=15,
             )
+            if r.status_code >= 300:
+                all_ok = False
+                print(f"[LINE ERROR] to={to} status={r.status_code} body={r.text}")
         except Exception as e:
-            print("通知失敗:", e)
+            all_ok = False
+            print(f"[LINE EXCEPTION] to={to} err={e}")
+
+    if not all_ok:
+        raise RuntimeError("LINE push failed (see logs)")
 
 # =====================================================
 # Google Sheets から SKU / URL を取得
@@ -175,3 +188,4 @@ if __name__ == "__main__":
     line_push(f"✅ テスト通知: GitHub Actions から送信 {datetime.now():%Y-%m-%d %H:%M:%S}")
     # 本番巡回を実行したいときは下を有効化
     # main()
+
