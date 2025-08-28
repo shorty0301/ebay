@@ -99,7 +99,7 @@ def load_suppliers_from_sheet(sheet_id=SHEET_ID, worksheet_name=SHEET_NAME):
     return out
 
 # =====================================================
-# HTML取得 & 価格・在庫解析（簡易版）
+# HTML取得 & 価格・在庫解析
 # =====================================================
 def fetch_html(url: str) -> str:
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
@@ -188,4 +188,5 @@ if __name__ == "__main__":
     line_push(f"✅ テスト通知: GitHub Actions から送信 {datetime.now():%Y-%m-%d %H:%M:%S}")
     # 本番巡回を実行したいときは下を有効化
     # main()
+
 
