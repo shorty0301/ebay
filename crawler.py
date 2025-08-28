@@ -52,9 +52,29 @@ def load_suppliers_from_sheet(sheet_id=SHEET_ID, worksheet_name=SHEET_NAME):
             out.append({"sku": sku, "url": url})
     return out
 
+def line_push(msg: str):
+    """LINE通知"""
+    if not (LINE_TOKEN and LINE_TO):
+        print("LINE設定なし。通知スキップ:", msg)
+        return
+    for to in LINE_TO:
+        try:
+            requests.post(
+                "https://api.line.me/v2/bot/message/push",
+                headers={
+                    "Authorization": f"Bearer {LINE_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={"to": to, "messages": [{"type": "text", "text": msg[:1000]}]},
+                timeout=15,
+            )
+        except Exception as e:
+            print("通知失敗:", e)
+
 if __name__ == "__main__":
     from datetime import datetime
     line_push(f"✅ テスト通知：GitHub Actions から送信 {datetime.now():%Y-%m-%d %H:%M:%S}")
+
 
 
 
