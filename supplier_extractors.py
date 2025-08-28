@@ -61,11 +61,16 @@ def price_from_offmall(html, text): return pick_best_price(re.findall(r"[¥￥]?
 def price_from_surugaya(html, text): return pick_best_price(re.findall(r"[¥￥]?\s?\d{1,3}(?:[,，]\d{3})+", text))
 
 # ========== 在庫判定 ==========
-def extract_supplier_info(url: str, html: str) -> Dict[str, Any]:
+def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str, Any]:
     host = re.sub(r"^www\.", "", re.findall(r"https?://([^/]+)/?", url)[0].lower())
     text = strip_tags(html)
     stock="UNKNOWN"; qty=""; price=float("nan")
 
+    if debug:
+        print(f"[DEBUG] host={host}")
+        print(f"[DEBUG] snippet={text[:200]} ...")
+
+    # 残り1点/数量チェック
     m = re.search(r"残り\s*([0-9０-９]+)\s*(点|個|枚|本)", text)
     if m:
         n=int(z2h_digits(m.group(1))); qty=str(n)
@@ -90,3 +95,9 @@ def extract_supplier_info(url: str, html: str) -> Dict[str, Any]:
 @functools.lru_cache(maxsize=256)
 def fetch_and_extract(url: str) -> Dict[str, Any]:
     return extract_supplier_info(url, fetch_html(url))
+
+def extract_supplier_info(url: str, html: str, debug: bool = False):
+    # …既存処理…
+    if debug:
+        print(f"[DEBUG] Extracting {url} ...")
+
