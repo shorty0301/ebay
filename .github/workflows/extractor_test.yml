@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -31,17 +32,17 @@ jobs:
           set -euo pipefail
 
           echo "----- Incoming URLs (raw) -----"
-          echo "${INPUT_URLS}"
+          printf '%s\n' "${INPUT_URLS}"
 
-          echo "----- Start Python test -----"
-          python - <<'PY'
-import os, sys, json
+          # Python スクリプトを書き出して実行
+          cat > run_extract_test.py <<'PY'
+import os, json
 from supplier_extractors import fetch_html, extract_supplier_info
 
 raw = os.environ.get("INPUT_URLS", "").strip()
 urls = [u.strip() for u in raw.splitlines() if u.strip()]
 if not urls:
-    urls = ["https://netmall.hardoff.co.jp/product/5372313/"]
+    urls = ["https://netmall.hardoff.co.jp/product/5372313/"]  # デフォルト
 
 print("URLS:", urls, flush=True)
 
@@ -70,6 +71,8 @@ with open("extractor_results.json", "w", encoding="utf-8") as f:
 
 print("\nWROTE extractor_results.json", flush=True)
 PY
+
+          python run_extract_test.py
 
       - name: Upload extractor results
         uses: actions/upload-artifact@v4
