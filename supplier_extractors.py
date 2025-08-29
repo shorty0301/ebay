@@ -571,100 +571,109 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """
-    Amazon.co.jp 現行価格を最優先で取得
-    - apex_desktop / corePriceDisplay_desktop_feature_div / corePrice_feature_div のブロック内だけを見る
-    - そこで見える a-offscreen / a-price-whole を収集
-    - 打消し系近傍は除外、/袋 等の「単価」は小さい値(<=999)の時だけ除外
-    - 残った候補の最安を返す（= 1,728 を選び 1,996 は落ちる想定）
-    """
     H = str(html or "")
     T = str(text or "")
+
+    # ===== 追加：トレース用 =====
+    trace = {"hits": [], "picked": None}   # hits: 各候補の履歴、picked: 最終採用
+    def log_hit(kind: str, val: int | None, ctx: str, action: str, reason: str = "", extra: dict | None = None):
+        item = {
+            "kind": kind,               # 例: offscreen / whole / priceToPay / struct
+            "val": val,
+            "action": action,           # kept / dropped
+            "reason": reason,           # dropped理由やkeptの根拠
+            "ctx": re.sub(r"\s+", " ", ctx)[:220],  # 近傍テキストの一部
+        }
+        if extra:
+            item.update(extra)
+        trace["hits"].append(item)
+    # ==========================
 
     def to_v(s: str) -> int | None:
         return to_int_yen(s)
 
-    # 価格箱のブロックを拾う（優先順）
+    # 単価・打消しなどの判定（いま使っているロジックそのまま）
+    BAD_NEAR = re.compile(r'(a-text-price|a-text-strike|priceBlockStrikePriceString|basisPrice|listPrice|希望小売価格|定価|旧価格)', re.I)
+    STOP     = re.compile(r'(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券)', re.I)
+
+    def is_unit_price(ctx: str, val: int | None) -> bool:
+        return (val is not None and val <= 999 and
+                re.search(r'[\/／]\s*(袋|個|枚|本|set|セット|ml|mL|L|g|kg|mm|cm|GB|MB|TB)', ctx))
+
+    # 価格箱ブロックを拾う
     blk = ""
-    for bid, span in (
-        ("apex_desktop", 20000),
-        ("corePriceDisplay_desktop_feature_div", 20000),
-        ("corePrice_feature_div", 20000),
-    ):
+    for bid, span in (("apex_desktop", 20000),
+                      ("corePriceDisplay_desktop_feature_div", 20000),
+                      ("corePrice_feature_div", 20000)):
         m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
         if m:
             blk = m.group(1)
             break
     if not blk:
-        blk = H  # 最悪、全体から拾う（保険）
+        blk = H  # 保険
 
-    # 打消し/旧価格の近傍ワード
-    BAD_NEAR = re.compile(
-        r"(a-text-price|a-text-strike|priceBlockStrikePriceString|basisPrice|listPrice|希望小売価格|定価|旧価格)",
-        re.I,
-    )
-    STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券)", re.I)
-
-    def is_unit_price(ctx: str, val: int) -> bool:
-        # 例: ￥247/袋, ￥300/個 … などは小さい値(<=999)のときだけ単価扱いで除外
-        return val is not None and val <= 999 and re.search(r"[\/／]\s*(袋|個|枚|本|set|セット|ml|mL|L|g|kg|mm|cm|GB|MB|TB)", ctx)
-
-    # 候補収集（a-offscreen 優先、whole は保険）
-    cands: list[int] = []
+    # --- 候補収集 ---
+    cands: list[tuple[int, int, int, str]] = []  # (score, val, pos, kind)
 
     for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*[¥￥]?\s*([\d,，]{1,10})<', blk, re.I):
-        val = to_v(m.group(1))
-        if not val:
-            continue
-        i = m.start()
+        val = to_v(m.group(1)); i = m.start()
         ctx = blk[max(0, i-300): m.end()+300]
-        if BAD_NEAR.search(ctx) or STOP.search(ctx) or is_unit_price(ctx, val):
-            continue
-        cands.append(val)
+        if not val:
+            log_hit("offscreen", None, ctx, "dropped", "not_numeric");  continue
+        if BAD_NEAR.search(ctx):
+            log_hit("offscreen", val, ctx, "dropped", "near_strike");   continue
+        if STOP.search(ctx):
+            log_hit("offscreen", val, ctx, "dropped", "near_stop");     continue
+        if is_unit_price(ctx, val):
+            log_hit("offscreen", val, ctx, "dropped", "unit_price");    continue
+
+        score = 1
+        if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', ctx, re.I):
+            score += 2
+        log_hit("offscreen", val, ctx, "kept", f"score={score}")
+        cands.append((score, val, i, "offscreen"))
 
     for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
-        val = to_v(m.group(1))
-        if not val:
-            continue
-        i = m.start()
+        val = to_v(m.group(1)); i = m.start()
         ctx = blk[max(0, i-200): m.end()+200]
-        if BAD_NEAR.search(ctx) or STOP.search(ctx) or is_unit_price(ctx, val):
-            continue
-        cands.append(val)
-
-    # 近傍に priceToPay / data-a-color="price" がある候補はさらに優先（同点は最安）
-    if cands:
-        best = None
-        best_score = -1
-        for v in cands:
-            # v の登場位置近辺をもう一度検索してスコア付け
-            m = re.search(rf'[¥￥]?\s*{v:,}'.replace(',', r'[,，]'), blk)
-            score = 0
-            if m:
-                i = m.start()
-                ctx = blk[max(0, i-300): m.end()+300]
-                if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', ctx, re.I):
-                    score += 2
-                if re.search(r'税込', ctx):
-                    score += 1
-            # 更新
-            if score > best_score or (score == best_score and (best is None or v < best)):
-                best = v
-                best_score = score
-        if best:
-            return best
-
-    # ブロックで拾えないときの最後の保険（テキスト）
-    for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{4,7})\s*円", T[:40000]):
-        val = to_v(m.group(1))
         if not val:
+            log_hit("whole", None, ctx, "dropped", "not_numeric");  continue
+        if BAD_NEAR.search(ctx):
+            log_hit("whole", val, ctx, "dropped", "near_strike");   continue
+        if STOP.search(ctx):
+            log_hit("whole", val, ctx, "dropped", "near_stop");     continue
+        if is_unit_price(ctx, val):
+            log_hit("whole", val, ctx, "dropped", "unit_price");    continue
+
+        score = 1
+        if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', ctx, re.I):
+            score += 2
+        log_hit("whole", val, ctx, "kept", f"score={score}")
+        cands.append((score, val, i, "whole"))
+
+    # 採用
+    if cands:
+        best_score = max(s for s,_,_,_ in cands)
+        vals = sorted([v for s,v,_,_ in cands if s == best_score])
+        picked = vals[0]
+        trace["picked"] = {"val": picked, "how": "min_in_top_score", "top_score": best_score}
+        globals()['__amz_trace__'] = trace  # ← 外から読めるように保存
+        return picked
+
+    # --- 最後の保険：テキスト側 ---
+    for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{4,7})\s*円", T[:40000]):
+        val = to_v(m.group(1)); i = m.start()
+        if not val: 
             continue
-        i = m.start()
         ctx = T[max(0, i-140): i+140]
         if STOP.search(ctx) or is_unit_price(ctx, val):
-            continue
+            log_hit("text", val, ctx, "dropped", "stop_or_unit");  continue
+        log_hit("text", val, ctx, "kept", "text_fallback")
+        trace["picked"] = {"val": val, "how": "text_fallback"}
+        globals()['__amz_trace__'] = trace
         return val
 
+    globals()['__amz_trace__'] = trace
     return None
 
 
@@ -1092,14 +1101,17 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_surugaya(html, text)
     # Amazon.co.jp
     elif ("amazon.co.jp" in host) or host.endswith(".amazon.co.jp"):
-        # まずは “今手元のHTML” から抽出
+        # 1st pass: まずは手元HTMLで抽出
         if debug:
             H = html or ""
             T = text or ""
             print("[AMZ] len(html)=", len(H))
             print("[AMZ] markers:", {
-                "priceToPay": bool(re.search(r'id=["\']priceToPay["\']', H, re.I)),
+                "apex":       bool(re.search(r'id=["\']apex_desktop["\']', H, re.I)),
                 "corePrice":  bool(re.search(r'id=["\']corePrice_feature_div["\']', H, re.I)),
+                "corePriceDisp": bool(re.search(r'id=["\']corePriceDisplay_desktop_feature_div["\']', H, re.I)),
+                "priceToPay_id":    bool(re.search(r'id=["\']priceToPay["\']', H, re.I)),
+                "priceToPay_class": bool(re.search(r'class=["\'][^"\']*\bpriceToPay\b', H, re.I)),
                 "aOffscreen": bool(re.search(r'class=["\']a-offscreen["\']', H, re.I)),
                 "buyNow":     bool(re.search(r"(今すぐ買う|Buy Now)", T)),
                 "addCart":    bool(re.search(r"(カートに入れる|Add to Cart)", T)),
@@ -1108,12 +1120,31 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
             })
 
         s = stock_from_amazon_jp(html, text)
-        if s: 
+        if s:
             stock = s
         price = price_from_amazon_jp(html, text)
 
-        # ここで何も取れず、かつ URL が詳細形でない場合 → HTMLから詳細URLを推定して再取得（Amazon専用）
-        if (price is None and stock in ("UNKNOWN", None, "")) and not re.search(r"/(dp|gp/product)/", url):
+        # どこから拾っているかのトレース（price_from_amazon_jp 内で __amz_trace__ をセットしている想定）
+        if debug and "__amz_trace__" in globals():
+            try:
+                print("[AMZ_TRACE-1]", json.dumps(globals()["__amz_trace__"], ensure_ascii=False)[:4000])
+            except Exception:
+                pass
+
+        # 再取得するかの判定
+        need_follow = False
+        if price is None and stock in ("UNKNOWN", "", None):
+            need_follow = True
+        if not re.search(r"/(dp|gp/product)/", url):
+            need_follow = True
+        if len(html or "") < 3000:
+            need_follow = True
+        if re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", html or "", re.I):
+            need_follow = True
+
+        # 2nd pass: HTML から /dp/… を推定して一度だけ再取得（Amazon専用）
+        if need_follow:
+            dp_url = None
             try:
                 dp_url = _amz_guess_dp_url(host, url, html)
             except Exception:
@@ -1121,16 +1152,24 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
 
             if dp_url:
                 try:
-                    amz_html2 = fetch_html(dp_url)  # ★ Amazonだけの再取得
+                    amz_html2 = fetch_html(dp_url)
                     amz_text2 = strip_tags(amz_html2).replace("\u3000", " ").replace("\u00A0", " ")
                     s2 = stock_from_amazon_jp(amz_html2, amz_text2)
-                    if s2: stock = s2
+                    if s2:
+                        stock = s2
                     p2 = price_from_amazon_jp(amz_html2, amz_text2)
-                    if p2: price = p2
+                    if p2 is not None:
+                        price = p2
                     if debug:
                         print("[AMZ] follow dp:", dp_url, " len=", len(amz_html2), " price=", p2, " stock=", s2)
+                        if "__amz_trace__" in globals():
+                            try:
+                                print("[AMZ_TRACE-2]", json.dumps(globals()["__amz_trace__"], ensure_ascii=False)[:4000])
+                            except Exception:
+                                pass
                 except Exception:
                     pass
+
 
     # Mercari 
     elif ("mercari" in host) or ("jp.mercari.com" in host):
