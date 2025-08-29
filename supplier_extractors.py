@@ -651,7 +651,15 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
 
     # ========== 3) テキスト保険（最後の手段） ==========
     STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|最大|上限|%|％|実質|相当|円相当|ギフト券|プロモーション)", re.I)
-    for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,]()*
+    for m in re.finditer(
+        r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円",
+        T[:30000]
+    ):
+        i = m.start()
+        ctx = T[max(0, i-120): i+120]
+        if STOP.search(ctx):
+            continue
+        add(50, m.group(1))
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
