@@ -75,20 +75,68 @@ def to_int_yen(s: str) -> int | None:
 
 # ========== fetch_html ==========
 def fetch_html(url: str) -> str:
-    ua_pc  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
-    ua_sp  = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-    headers = lambda ua: {"User-Agent": ua, "Accept-Language": "ja,en;q=0.8"}
+    """
+    PC/モバイルを取りに行き、ロボットチェック/同意ページなどを検出したら
+    もう一方のUAで再試行。最終的に得られたものを連結して返す。
+    """
+    import requests, re
 
-    def try_get(u, ua):
+    UA_PC = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    UA_MB = (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+    )
+
+    BASE_HEADERS = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "DNT": "1",
+    }
+
+    def blocked(s: str) -> bool:
+        """ロボット/同意/空HTMLなどを検出"""
+        if not s or len(s) < 800:
+            return True
+        t = s.lower()
+        return bool(re.search(
+            r"(robot check|captcha|are you a robot|enable cookies|ブラウザの設定でcookie|javascriptを有効|アクセスが集中|ただいまアクセスが|redirecting\.\.\.)",
+            t))
+
+    def try_get(ua: str) -> str:
+        headers = dict(BASE_HEADERS)
+        headers["User-Agent"] = ua
         try:
-            r=requests.get(u, headers=headers(ua), timeout=20)
-            if r.status_code==200: return r.text
-        except: return ""
+            with requests.Session() as sess:
+                sess.headers.update(headers)
+                r = sess.get(url, timeout=25, allow_redirects=True)
+                if r.status_code == 200 and r.text:
+                    return r.text
+        except Exception:
+            return ""
         return ""
 
-    html_pc = try_get(url, ua_pc)
-    html_mb = try_get(url, ua_sp)
+    html_pc = try_get(UA_PC)
+    if blocked(html_pc):
+        # PC がブロック気味 → MB 先行で再取得
+        html_mb = try_get(UA_MB)
+        # もう一度PCも軽く再試行（MB経由で緩むケースあり）
+        if blocked(html_pc):
+            html_pc = try_get(UA_PC)
+    else:
+        html_mb = try_get(UA_MB)
+        if blocked(html_mb):
+            html_mb = try_get(UA_MB)  # もう一回だけ
+
     return (html_pc or "") + "\n<!-- MOBILE MERGE -->\n" + (html_mb or "")
+
 
 # ========== サイト別価格抽出 ==========
 def price_from_offmall(html: str, text: str) -> int | None:
@@ -628,33 +676,33 @@ def stock_from_amazon_jp(html: str, text: str) -> str | None:
         return "LAST_ONE" if n == 1 else "IN_STOCK"
     return None
 
-
-
 def stock_from_mercari(html: str, text: str) -> str | None:
     """
-    メルカリ 在庫判定
-    - 先に『購入手続きへ/購入に進む/カートに入れる/今すぐ購入』があれば在庫ありを最優先
-    - その後に SOLD OUT/売り切れ を見る（関連商品の SOLD を誤検知しないため）
+    メルカリ 在庫判定（安全版）
+    - まず購入UIがあれば IN_STOCK（最優先）
+    - 次に SOLD OUT / 売り切れ（ただし購入UIが見えない時だけ OUT）
+    - どちらも取れない＝ボットページの可能性 → None（UNKNOWN）
     """
     t = text
-    # 1) 購入ボタン系（最優先）
+
+    # 1) 購入UI（最優先）
     if re.search(r"(購入手続きへ|購入に進む|カートに入れる|今すぐ購入)", t):
-        # 数量 1 の明示があれば LAST_ONE を優先
         m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", t)
         if m:
             n = int(z2h_digits(m.group(1)))
             return "LAST_ONE" if n == 1 else "IN_STOCK"
         return "IN_STOCK"
 
-    # 2) SOLD OUT / 売り切れ
+    # 2) SOLD OUT/売り切れ（購入UIが無い時のみ有効）
     if re.search(r"(SOLD\s*OUT|売り切れ|売り切れました)", t, re.I) or re.search(r"(sold[\s_\-]?out)", html, re.I):
         return "OUT_OF_STOCK"
 
     # 3) ラスト1
     if re.search(r"(残り\s*1\s*(?:点|個|枚|本)|ラスト\s*1)", t):
         return "LAST_ONE"
-    return None
 
+    # 4) 判定不能（＝取得HTMLが怪しい）
+    return None
 
 def price_from_mercari(html: str, text: str) -> int | None:
     """
