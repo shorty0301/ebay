@@ -9,7 +9,7 @@ import re, json, functools, requests
 from typing import Dict, Any
 from bs4 import BeautifulSoup
 
-# ========= 共通ユーティリティ ==========
+# ======== 共通ユーティリティ ==========
 def strip_tags(s: str) -> str:
     if not s: return ""
     soup = BeautifulSoup(s, "html.parser")
