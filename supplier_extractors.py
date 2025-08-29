@@ -1028,7 +1028,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         if s: stock = s
         price = price_from_surugaya(html, text)
     # Amazon.co.jp
-    elif ("amazon.co.jp" in host) or (host.endswith(".amazon.co.jp")):
+    elif (("amazon.co.jp" in host) or host.endswith(".amazon.co.jp")) and re.search(r"/(dp|gp/product)/", url):
         if debug:
             H = html or ""
             T = text or ""
