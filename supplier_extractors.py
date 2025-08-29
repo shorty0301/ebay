@@ -140,31 +140,70 @@ def price_from_offmall(html: str, text: str) -> int | None:
     best = max(s for s, _ in cands)
     return min(v for s, v in cands if s == best)
 
+
 def price_from_rakuma(html: str, text: str) -> int | None:
     """
-    Rakuma/Fril 価格抽出（見出し最優先）
-    1) 見出し～冒頭エリア(～2000文字)で「¥2,500 送料込(み)」形式を最優先で取得
-    2) それで無ければ構造化データ(JSON/LD, meta)を採用
-    3) さらに無ければ円/¥付きの金額のみから文脈スコアで選定（条件文/キャンペーンは除外）
+    Rakuma/Fril 価格抽出（上部強制・送料込優先）
+    1) ページ上部(〜1800字)のみを見る
+    2) 上部で「円/¥が数値に付く」候補のうち『送料込/送料込み 近傍』を最優先
+    3) それが無ければ上部の候補から最小値（=見出し横の本体価格を狙う）
+    4) それでも無ければ、構造化データ(JSON/LD, meta)でフォールバック
+    ※ キャンペーン/条件文(最大/円OFF/以上/まで/相当/還元/倍/クーポン…）は除外
     """
+    # --- 上部テキストのみ対象 ---
+    head = text[:1800]
 
-    # 0) ヘルパ
+    # ノイズ（条件・キャンペーンなど）
+    STOP = re.compile(
+        r"(最大|ポイント|pt|還元|倍|クーポン|割引|OFF|円OFF|％|%|上限|参考|相当|円相当|"
+        r"手数料|送料別|キャンペーン|セール|特典|抽選|進呈|付与|"
+        r"以上|以下|未満|超|から|〜|~|まで|条件|対象|合計|総額|合算)",
+        re.I,
+    )
+    # 価格語（弱め）と『送料込』キーワード（強）
+    PRICE_WORD  = re.compile(r"(商品価格|販売価格|価格|税込|税抜|販売|円|¥|￥)", re.I)
+    SHIPPING_OK = re.compile(r"(送料込|送料込み)", re.I)
+
+    # 円/¥ が“その数値に付いている”候補のみ
+    pat = re.compile(
+        r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
+    )
+
     def to_v(s: str) -> int | None:
         return to_int_yen(s)
 
-    # 1) 見出し付近の「¥xxxx 送料込(み)」を最優先（本体価格の定型）
-    head = text[:2000]
-    mlist = list(re.finditer(
-        r"[¥￥]\s*(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*(?:円)?\s*(?:送料込|送料込み)",
-        head
-    ))
-    if mlist:
-        vals = [to_v(m.group(1)) for m in mlist]
-        vals = [v for v in vals if v and 0 < v < 10_000_000]
-        if vals:
-            return min(vals)  # 見出しに複数あっても最小（=セール価格）を採用
+    cand_with_ship: list[int] = []
+    cand_header: list[int]    = []
 
-    # 2) 構造化データ / meta
+    for m in pat.finditer(head):
+        s = m.group(0)
+        i = m.start()
+        ctx = head[max(0, i-100): i+len(s)+100]
+
+        # ノイズ文脈は捨てる
+        if STOP.search(ctx):
+            continue
+
+        v = to_v(s)
+        if not v or not (0 < v < 10_000_000):
+            continue
+
+        if SHIPPING_OK.search(ctx):
+            cand_with_ship.append(v)
+        else:
+            # 価格語が近いものを主に残す（完全に0にはしない）
+            if PRICE_WORD.search(ctx):
+                cand_header.append(v)
+
+    # 1) 送料込の近傍があれば、その中の最小値を採用
+    if cand_with_ship:
+        return min(cand_with_ship)
+
+    # 2) それが無ければ、上部候補の最小値を採用（見出し横を想定）
+    if cand_header:
+        return min(cand_header)
+
+    # 3) フォールバック：構造化データ
     for rx in [
         r'"price"\s*:\s*"?(\d{3,7})"?',
         r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})',
@@ -173,53 +212,10 @@ def price_from_rakuma(html: str, text: str) -> int | None:
         m = re.search(rx, html, re.I)
         if m:
             v = to_v(m.group(1))
-            if v: return v
+            if v:
+                return v
 
-    # 3) 円/¥が数値に付いたものだけを候補にして、条件文/キャンペーンを徹底除外
-    STOP = re.compile(
-        r"(最大|ポイント|pt|還元|倍|クーポン|割引|OFF|円OFF|％|%|上限|参考|相当|円相当|"
-        r"手数料|送料別|キャンペーン|セール|特典|抽選|進呈|付与|"
-        r"以上|以下|未満|超|から|〜|~|まで|条件|対象|合計|総額|合算)",
-        re.I,
-    )
-    PRICE_WORD = re.compile(r"(商品価格|販売価格|価格|税込|税抜|販売|円|¥|￥|送料込|送料込み)", re.I)
-
-    pat = re.compile(
-        r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
-    )
-
-    cands: list[tuple[int, int, int]] = []  # (score, value, index)
-
-    for m in pat.finditer(text):
-        s = m.group(0)
-        i = m.start()
-        ctx = text[max(0, i - 100): i + len(s) + 100]
-
-        if STOP.search(ctx):
-            continue
-
-        v = to_v(s)
-        if not v or not (0 < v < 10_000_000):
-            continue
-
-        score = 0
-        if PRICE_WORD.search(ctx): score += 4
-        if re.search(r"[¥￥]|円", s): score += 3
-        if re.search(r"\d{1,3}(?:[,，]\d{3})+", s): score += 1
-        if i < 1500: score += 2         # 見出し～上部を優先
-        if re.search(r"送料込|送料込み", ctx): score += 1
-
-        cands.append((score, v, i))
-
-    if not cands:
-        return None
-
-    best = max(s for s, _, _ in cands)
-    top  = [(v, idx) for s, v, idx in cands if s == best]
-    first_idx = min(idx for v, idx in top)
-    return min(v for v, idx in top if idx == first_idx)
-
-
+    return None
 
 
 
