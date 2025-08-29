@@ -571,10 +571,6 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """
-    Amazon.co.jp 価格抽出（構造化→UI断片→テキスト保険）
-    価格は a-offscreen / a-price-whole / priceToPay / buybox 付近に出現することが多い
-    """
     def to_v(s): return to_int_yen(s)
 
     # 1) 構造化データ / meta / data-*
@@ -589,31 +585,30 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             v = to_v(m.group(1))
             if v: return v
 
-    # 2) UI断片（a-offscreen / priceToPay / buybox / whole+symbol）
+    # 2) UI断片（buybox / priceToPay / a-offscreen など）
     for rx in [
-        r'class=["\']a-offscreen["\']>[\s　]*[¥￥]\s*([\d,，]{3,10})<',  # 例: <span class="a-offscreen">￥1,620</span>
-        r'id=["\']priceblock_ourprice["\'][^>]*>[^\d¥￥]*[¥￥]\s*([\d,，]{3,10})',
-        r'id=["\']priceblock_dealprice["\'][^>]*>[^\d¥￥]*[¥￥]\s*([\d,，]{3,10})',
-        r'id=["\']price_inside_buybox["\'][^>]*>[^\d¥￥]*[¥￥]?\s*([\d,，]{3,10})',
         r'id=["\']corePrice_feature_div["\'][\s\S]{0,250}?[¥￥]\s*([\d,，]{3,10})',
         r'id=["\']priceToPay["\'][\s\S]{0,150}?[¥￥]\s*([\d,，]{3,10})',
-        r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<',  # 整数部のみ
+        r'class=["\']a-offscreen["\']>[\s　]*[¥￥]\s*([\d,，]{3,10})<',
+        r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<',
     ]:
         m = re.search(rx, html, re.I)
         if m:
             v = to_v(m.group(1))
             if v: return v
 
-    # 3) テキスト保険
+    # 3) テキスト保険（最後の手段） ← ここは最終 fallback にする
     STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|最大|上限|%|％|実質|相当|円相当)", re.I)
     for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", text[:20000]):
         ctx = text[max(0, m.start()-80): m.end()+80]
-        if STOP.search(ctx): 
+        if STOP.search(ctx):
             continue
         v = to_v(m.group(1))
-        if v: 
+        if v:
             return v
+
     return None
+
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
