@@ -205,8 +205,6 @@ def price_from_rakuma(html: str, text: str) -> int | None:
 
     return None
 
-
-
 def price_from_surugaya(html: str, text: str) -> int | None:
     # 駿河屋
     cands = []
@@ -246,7 +244,6 @@ def price_from_yahoo_auction(html: str, text: str) -> int | None:
             v = to_v(m.group(1))
             if v: return v
     return None
-
 
 def stock_from_yahoo_auction(html: str, text: str) -> str | None:
     """ヤフオク在庫判定（=出品状態）"""
@@ -380,6 +377,33 @@ def stock_from_paypay_fleamarket(html: str, text: str) -> str | None:
         return "LAST_ONE"
     return None
 
+def stock_from_yshopping(html: str, text: str) -> str | None:
+    """
+    Yahoo!ショッピング / PayPayモール 在庫判定
+    - JSON-LD の availability を最優先
+    - 画面テキストの購入可否ワード / 売り切れワード
+    - 残り数量で LAST_ONE
+    """
+    # 1) JSON-LD availability
+    m = re.search(r'itemprop=["\']availability["\'][^>]*(InStock|OutOfStock)', html, re.I)
+    if m:
+        return "IN_STOCK" if re.search(r'InStock', m.group(0), re.I) else "OUT_OF_STOCK"
+
+    # 2) 購入できる系
+    if re.search(r"(在庫あり|カートに入れる|今すぐ購入|注文手続き|購入手続き|注文に進む)", text):
+        return "IN_STOCK"
+
+    # 3) 売り切れ/取扱い不可系
+    if re.search(r"(在庫なし|在庫切れ|完売|販売終了|お取り扱いできません|取り扱いできません)", text):
+        return "OUT_OF_STOCK"
+
+    # 4) 残り数量
+    m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個)", text)
+    if m:
+        n = int(z2h_digits(m.group(1)))
+        return "LAST_ONE" if n == 1 else "IN_STOCK"
+
+    return None
 
 
 # ========== 在庫・価格 抽出のメイン ==========
