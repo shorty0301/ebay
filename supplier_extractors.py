@@ -884,7 +884,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         s = stock_from_surugaya(html, text)
         if s: stock = s
         price = price_from_surugaya(html, text)
-　　    # --- Amazon.co.jp ---
+　　# --- Amazon.co.jp ---
     elif ("amazon.co.jp" in host) or ("www.amazon.co.jp" in host):
         s = stock_from_amazon_jp(html, text)
         if s: stock = s
