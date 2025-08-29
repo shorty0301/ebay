@@ -54,6 +54,14 @@ def to_int_yen(s: str) -> int | None:
     except:
         return None
 
+# ファイル先頭の共通ユーティリティ付近に追加
+def _log(dbg, **kv):
+    if dbg is not None:
+        dbg.append(kv)
+
+def _ctx(text: str, start: int, length: int, span: int = 40) -> str:
+    """周辺文脈を短く切り出す"""
+    return text[max(0, start-span): start+length+span]
 
 # ========== fetch_html ==========
 def fetch_html(url: str) -> str:
