@@ -414,15 +414,25 @@ def price_from_paypay_fleamarket(html: str, text: str) -> int | None:
 
 def stock_from_surugaya(html: str, text: str) -> str | None:
     """
-    駿河屋 在庫判定（通販在庫を最優先）
-    優先順位:
-      1) 「通販在庫」表記・在庫数
-      2) 強い否定語（売り切れ/在庫なし/販売終了…）
-      3) 記号（×/○/△）
-      4) 残り数量
-      5) 購入ボタン系
+    駿河屋 在庫判定（カート優先版）
+    優先度:
+      1) 強い否定（売り切れ等）→ OUT
+      2) カート/数量/購入ボタンの存在 → IN
+      3) 「通販在庫：×/○/△」「通販在庫 数」→ OUT/LAST_ONE/IN
+      4) 一般の在庫記号・残り数量
     """
-    # --- 1) 通販在庫の数値・記号を最優先 ---
+    # --- 1) 強い否定語（まず完全に売り切れ表示を優先） ---
+    if re.search(r"(売り切れ|在庫切れ|在庫なし|品切れ|販売終了|取扱い終了|お取り扱いできません)", text):
+        return "OUT_OF_STOCK"
+
+    # --- 2) カート/数量/購入ボタンが見えていれば在庫あり ---
+    #   テキストとHTMLの両方で広めに見る
+    if (re.search(r"(カートに入れる|今すぐ購入|購入手続き|ご注文|注文手続き)", text) or
+        re.search(r"(数量|カート数量)", text) or
+        re.search(r'(add[-\s]?to[-\s]?cart|id=["\']addToCart["\']|name=["\']addToCart["\']|class=["\'][^"\']*add-to-cart)', html, re.I)):
+        return "IN_STOCK"
+
+    # --- 3) 「通販在庫」表記（数値/記号） ---
     m = re.search(r"(通販在庫|ネット在庫)\s*(?:数|：|:)?\s*([0-9０-９]+)", text)
     if m:
         n = int(z2h_digits(m.group(2)))
@@ -430,7 +440,6 @@ def stock_from_surugaya(html: str, text: str) -> str | None:
             return "OUT_OF_STOCK"
         return "LAST_ONE" if n == 1 else "IN_STOCK"
 
-    # 例: 通販在庫：× / ○ / △
     if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[×✕ｘX]", text):
         return "OUT_OF_STOCK"
     if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[○〇◯]", text):
@@ -438,11 +447,7 @@ def stock_from_surugaya(html: str, text: str) -> str | None:
     if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[△▲]", text):
         return "LAST_ONE"
 
-    # --- 2) 強い否定（一般在庫表現）---
-    if re.search(r"(売り切れ|在庫切れ|在庫なし|品切れ|販売終了|取扱い終了|お取り扱いできません)", text):
-        return "OUT_OF_STOCK"
-
-    # --- 3) 一般の記号表現（通販の明記が無い場合）---
+    # --- 4) 一般の在庫記号・残り数量 ---
     if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[×✕ｘX]", text):
         return "OUT_OF_STOCK"
     if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[○〇◯]", text):
@@ -450,18 +455,12 @@ def stock_from_surugaya(html: str, text: str) -> str | None:
     if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[△▲]", text):
         return "LAST_ONE"
 
-    # --- 4) 残り数量 ---
     m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", text)
     if m:
         n = int(z2h_digits(m.group(1)))
         return "LAST_ONE" if n == 1 else "IN_STOCK"
 
-    # --- 5) 購入ボタン系（在庫ありのシグナル）---
-    if re.search(r"(カートに入れる|今すぐ購入|購入手続き|ご注文|注文手続き)", text):
-        return "IN_STOCK"
-
     return None
-
 
 def stock_from_rakuma(html: str, text: str) -> str | None:
     """
