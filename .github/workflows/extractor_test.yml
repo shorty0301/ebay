@@ -40,7 +40,7 @@ jobs:
           echo "    print(f'[{i}/{len(urls)}] GET {u}', flush=True)" >> run_extract_test.py
           echo "    try:" >> run_extract_test.py
           echo "        html = fetch_html(u)" >> run_extract_test.py
-          echo "        info = extract_supplier_info(u, html, debug=True)" >> run_extract_test.py
+          echo "        info = extract_supplier_info(u, html)" >> run_extract_test.py
           echo "        rec = {'url':u,'stock':info.get('stock'),'qty':info.get('qty'),'price':info.get('price'),'debug':info.get('_debug',{})}" >> run_extract_test.py
           echo "        print(json.dumps(rec,ensure_ascii=False,indent=2), flush=True)" >> run_extract_test.py
           echo "        results.append(rec)" >> run_extract_test.py
