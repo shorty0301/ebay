@@ -569,6 +569,206 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
     return None
 
+# ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
+def price_from_amazon_jp(html: str, text: str) -> int | None:
+    """
+    Amazon.co.jp 価格抽出（構造化データ最優先 → UI断片 → 保険）
+    除外：ポイント/還元/クーポン等のノイズ
+    """
+    def to_v(s): return to_int_yen(s)
+
+    # 1) 構造化データ / meta / data-*
+    for rx in [
+        r'"price"\s*:\s*"?(\d{2,8})"?',  # JSON-LD や price フィールド
+        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{2,8})',
+        r'itemprop=["\']price["\'][^>]*content=["\']?(\d{2,8})',
+        r'data-asin-price\s*=\s*["\']?(\d{2,8})',
+    ]:
+        m = re.search(rx, html, re.I)
+        if m:
+            v = to_v(m.group(1))
+            if v:
+                return v
+
+    # 2) UI断片（a-price-whole / price_inside_buybox）
+    # a-price-whole は数値部のみ（, あり）
+    m = re.search(r'class=["\']a-price-whole["\'][^>]*>(\d{1,3}(?:[,，]\d{3})+|\d{3,7})<', html)
+    if m:
+        v = to_v(m.group(1))
+        if v:
+            return v
+
+    for rx in [
+        r'id=["\']price_inside_buybox["\'][^>]*>\s*([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|\d{3,7})',
+        r'id=["\']corePrice_feature_div["\'][\s\S]{0,200}?([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|\d{3,7})',
+    ]:
+        m = re.search(rx, html)
+        if m:
+            v = to_v(m.group(1))
+            if v:
+                return v
+
+    # 3) 保険：テキスト中の価格（ノイズ除外）
+    STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|最大|上限|%|％|実質|相当|円相当)", re.I)
+    for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", text[:15000]):
+        ctx = text[max(0, m.start()-80): m.end()+80]
+        if STOP.search(ctx):
+            continue
+        v = to_v(m.group(1))
+        if v:
+            return v
+    return None
+
+
+def stock_from_amazon_jp(html: str, text: str) -> str | None:
+    """
+    Amazon.co.jp 在庫判定
+    - 強い否定/肯定ワードを優先
+    """
+    t = text
+    # 明確な在庫なし
+    if re.search(r"(現在お取り扱いできません|一時的に在庫切れ|この商品の再入荷予定は立っておりません)", t):
+        return "OUT_OF_STOCK"
+    # 明確な在庫あり・購入可能
+    if re.search(r"(在庫あり。|カートに入れる|今すぐ買う|通常\d+.*?以内に発送)", t):
+        return "IN_STOCK"
+    # ラスト1系（Amazonは数量文言があれば拾う）
+    m = re.search(r"残り\s*([0-9０-９]+)\s*点", t)
+    if m:
+        n = int(z2h_digits(m.group(1)))
+        return "LAST_ONE" if n == 1 else "IN_STOCK"
+    return None
+
+
+def price_from_mercari(html: str, text: str) -> int | None:
+    """
+    メルカリ 価格抽出（見出し・ボタン近傍優先）
+    - SOLD/ポイント系は除外
+    """
+    def to_v(s): return to_int_yen(s)
+
+    STOP = re.compile(r"(ポイント|還元|%|％|OFF|円OFF|割引|最大|上限|相当|円相当|クーポン|キャンペーン)", re.I)
+
+    # 1) “購入手続きへ”付近の価格（最優先）
+    head = text[:6000]
+    for btn in re.finditer(r"(購入手続きへ|購入に進む|カートに入れる|今すぐ購入)", head):
+        i = btn.start()
+        ctx = head[max(0, i-1000): i+1000]
+        for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", ctx):
+            win = ctx[max(0, m.start()-80): m.end()+80]
+            if STOP.search(win):
+                continue
+            v = to_v(m.group(1))
+            if v:
+                return v
+
+    # 2) 先頭域で最初に出る “¥付き” 価格（ノイズを避ける）
+    for m in re.finditer(r"[¥￥]\s*(\d{1,3}(?:[,，]\d{3})+|\d{3,7})", head[:2500]):
+        win = head[max(0, m.start()-80): m.end()+80]
+        if STOP.search(win):
+            continue
+        v = to_v(m.group(1))
+        if v:
+            return v
+
+    # 3) 構造化データの保険
+    m = re.search(r'"price"\s*:\s*"?(\d{2,8})"?', html, re.I)
+    if m:
+        v = to_v(m.group(1))
+        if v:
+            return v
+    return None
+
+
+def stock_from_mercari(html: str, text: str) -> str | None:
+    """
+    メルカリ 在庫判定
+    """
+    t = text
+    # SOLD OUT
+    if re.search(r"(SOLD\s*OUT|売り切れ|売り切れました)", t, re.I) or re.search(r"(sold[\s_\-]?out)", html, re.I):
+        return "OUT_OF_STOCK"
+    # 購入ボタン系
+    if re.search(r"(購入手続きへ|購入に進む|カートに入れる|今すぐ購入)", t):
+        return "IN_STOCK"
+    # ラスト1
+    if re.search(r"(残り\s*1\s*(?:点|個|枚|本)|ラスト\s*1)", t):
+        return "LAST_ONE"
+    return None
+
+
+def price_from_rakuten_ichiba(html: str, text: str) -> int | None:
+    """
+    楽天市場 価格抽出（構造化データ / 「税込/価格」近傍 / 保険）
+    ポイント/クーポン等は除外
+    """
+    def to_v(s): return to_int_yen(s)
+
+    # 1) 構造化データ / meta
+    for rx in [
+        r'"price"\s*:\s*"?(\d{2,8})"?',
+        r'"lowPrice"\s*:\s*"?(\d{2,8})"?',
+        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{2,8})',
+        r'itemprop=["\']price["\'][^>]*content=["\']?(\d{2,8})',
+        r'data-(?:price|amount|item-price)\s*=\s*["\']?(\d{2,8})',
+    ]:
+        m = re.search(rx, html, re.I)
+        if m:
+            v = to_v(m.group(1))
+            if v:
+                return v
+
+    # 2) 「税込/価格/販売価格」近傍
+    STOP = re.compile(r"(ポイント|pt|還元|%|％|クーポン|OFF|円OFF|割引|最大|上限|実質|相当|円相当|付与|進呈|獲得)", re.I)
+    LABEL = re.compile(r"(税込|税抜|価格|販売価格|本体価格|セール価格|お支払い金額)", re.I)
+    YEN   = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
+
+    for m in re.finditer(r"(税込|税抜|価格|販売価格|本体価格|セール価格|お支払い金額)[^\d¥￥]{0,12}("+YEN+")", text[:25000], re.I):
+        s = m.group(2)
+        v = to_v(s)
+        if not v:
+            continue
+        ctx = text[max(0, m.start()-120): m.end()+120]
+        if STOP.search(ctx):
+            continue
+        return v
+
+    # 3) 保険：上部域の “円” 付き
+    head = text[:8000]
+    for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", head):
+        ctx = head[max(0, m.start()-80): m.end()+80]
+        if STOP.search(ctx):
+            continue
+        v = to_v(m.group(1))
+        if v:
+            return v
+    return None
+
+
+def stock_from_rakuten_ichiba(html: str, text: str) -> str | None:
+    """
+    楽天市場 在庫判定
+    - JSON-LD availability / 画面ワード / 残り数量
+    """
+    # 1) JSON-LD availability
+    m = re.search(r'itemprop=["\']availability["\'][^>]*(InStock|OutOfStock)', html, re.I)
+    if m:
+        return "IN_STOCK" if re.search(r'InStock', m.group(0), re.I) else "OUT_OF_STOCK"
+
+    t = text
+    # 2) 購入可能ワード
+    if re.search(r"(在庫あり|カートに入れる|ご購入手続き|買い物かごに入れる|注文手続き|今すぐ購入)", t):
+        return "IN_STOCK"
+    # 3) 売り切れ
+    if re.search(r"(在庫なし|在庫切れ|売り切れ|販売終了|お取り扱いできません)", t):
+        return "OUT_OF_STOCK"
+    # 4) 残り数量
+    m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", t)
+    if m:
+        n = int(z2h_digits(m.group(1)))
+        return "LAST_ONE" if n == 1 else "IN_STOCK"
+    return None
+
 
 # ========== 在庫・価格 抽出のメイン ==========
 from typing import Dict, Any
@@ -684,6 +884,24 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         s = stock_from_surugaya(html, text)
         if s: stock = s
         price = price_from_surugaya(html, text)
+　　    # --- Amazon.co.jp ---
+    elif ("amazon.co.jp" in host) or ("www.amazon.co.jp" in host):
+        s = stock_from_amazon_jp(html, text)
+        if s: stock = s
+        price = price_from_amazon_jp(html, text)
+
+    # --- Mercari ---
+    elif ("mercari" in host) or ("jp.mercari.com" in host):
+        s = stock_from_mercari(html, text)
+        if s: stock = s
+        price = price_from_mercari(html, text)
+
+    # --- 楽天市場（item系） ---
+    elif ("item.rakuten.co.jp" in host) or ("rakuten.co.jp" in host):
+        s = stock_from_rakuten_ichiba(html, text)
+        if s: stock = s
+        price = price_from_rakuten_ichiba(html, text)
+
 
     if price is None:
         # 汎用の価格抽出ロジック（3桁も許容・文脈で絞る）
