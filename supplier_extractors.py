@@ -182,12 +182,46 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         qty = str(n)
         stock = "LAST_ONE" if n == 1 else "IN_STOCK"
 
-    # 強い在庫ワード
-    if re.search(r"(売り切れ|在庫切れ|完売|販売終了|取扱(い)?終了|SOLD\s*OUT)", text, re.I):
+    # --- 在庫判定（スコア方式、誤検出を抑制） ---
+    # 0個系は最優先で在庫なし
+    if re.search(r"(残り|在庫)\s*0\s*(?:点|個|枚|本)?", text):
         stock = "OUT_OF_STOCK"
-    elif re.search(r"(在庫あり|購入手続き|今すぐ購入|カートに入れる|即日発送)", text, re.I):
-        if stock != "LAST_ONE":
+
+    # ラスト1点系は強い肯定
+    if re.search(r"(残り\s*1\s*(?:点|個|枚|本)|ラスト\s*1)", text):
+        stock = "LAST_ONE"
+
+    # 近傍に否定/注意語がある「売り切れ」はノーカウントにする
+    NEG_STOP = re.compile(r"(場合|こと|可能性|恐れ|注意|お問い合わせ|ご了承ください)")
+    POS_WORD = re.compile(r"(在庫あり|購入手続き|今すぐ購入|カートに入れる|ご購入|購入する|注文手続き|お買い物かご)", re.I)
+    NEG_WORD = re.compile(r"(売り切れ|在庫切れ|完売|販売終了|取扱(?:い)?終了|SOLD\s*OUT)", re.I)
+
+    pos_score = 0
+    for m in POS_WORD.finditer(text):
+        i = m.start()
+        ctx = text[max(0, i-25): i+len(m.group(0))+25]
+        # 「できません/不可」みたいな否定の近傍は無効化
+        if re.search(r"(できません|不可|入れられない|品切)", ctx):
+            continue
+        pos_score += 3
+
+    neg_score = 0
+    for m in NEG_WORD.finditer(text):
+        i = m.start()
+        ctx = text[max(0, i-20): i+len(m.group(0))+20]
+        # 注意書きっぽい文は除外
+        if NEG_STOP.search(ctx):
+            continue
+        neg_score += 4
+
+    # 量情報があれば上書き（LAST_ONE優先）
+    if stock == "UNKNOWN":
+        if pos_score >= 3 and neg_score < 4:
             stock = "IN_STOCK"
+        elif neg_score >= 4 and pos_score < 3:
+            stock = "OUT_OF_STOCK"
+        # どちらも強ければ未知のままにしておく（誤判定を避ける）
+
 
     # 価格抽出（まずサイト別 → なければ汎用）
     if ("hardoff" in host) or ("offmall" in host) or ("netmall.hardoff.co.jp" in host):
