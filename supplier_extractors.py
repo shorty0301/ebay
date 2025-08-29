@@ -54,14 +54,6 @@ def to_int_yen(s: str) -> int | None:
     except:
         return None
 
-def _log(dbg, **kv):
-    if dbg is not None:
-        dbg.append(kv)
-
-def _ctx(text: str, start: int, length: int, span: int = 40) -> str:
-    """周辺文脈を短く切り出す"""
-    return text[max(0, start-span): start+length+span]
-
 
 # ========== fetch_html ==========
 def fetch_html(url: str) -> str:
@@ -259,6 +251,119 @@ def stock_from_rakuma(html: str, text: str) -> str | None:
 
     return None
 
+def price_from_yahoo_auction(html: str, text: str, dbg: list | None = None) -> int | None:
+    """
+    ヤフオク価格抽出
+    優先度: 落札価格 > 現在価格 > 即決価格
+    """
+    def to_v(s): return to_int_yen(s)
+
+    # A) ラベル近傍（最優先）
+    P = re.compile(r"(落札価格|現在価格|即決価格)[^\d¥￥]{0,8}([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})")
+    cands = []
+    for m in P.finditer(text[:8000]):
+        label, num = m.group(1), m.group(2)
+        v = to_v(num)
+        if not v: 
+            _log(dbg, price_rule="auc_label_skip", label=label, raw=num); 
+            continue
+        pri = {"落札価格": 3, "現在価格": 2, "即決価格": 1}.get(label, 0)
+        cands.append((pri, v))
+        _log(dbg, price_rule="auc_label_hit", label=label, value=v)
+
+    if cands:
+        best_pri = max(p for p, _ in cands)
+        val = min(v for p, v in cands if p == best_pri)
+        _log(dbg, price_rule="auc_pick", pri=best_pri, value=val)
+        return val
+
+    # B) 構造化データのフォールバック
+    for rx in [r'"price"\s*:\s*"?(\d{3,7})"?', r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})']:
+        m = re.search(rx, html, re.I)
+        if m:
+            v = to_v(m.group(1))
+            if v:
+                _log(dbg, price_rule="auc_json_pick", value=v)
+                return v
+
+    _log(dbg, price_rule="auc_none")
+    return None
+
+
+def stock_from_yahoo_auction(html: str, text: str, dbg: list | None = None) -> str | None:
+    """
+    ヤフオク在庫判定（=出品状態）
+    OUT: 終了/落札/出品終了
+    IN : 入札する/即決する が存在
+    """
+    if re.search(r"(終了しました|落札されました|出品終了|このオークションは終了)", text):
+        _log(dbg, stock_rule="auc_ended"); return "OUT_OF_STOCK"
+    if re.search(r"(入札する|即決で落札|今すぐ落札|入札受付中)", text):
+        _log(dbg, stock_rule="auc_open");  return "IN_STOCK"
+    _log(dbg, stock_rule="auc_unknown");   return None
+
+def price_from_yshopping(html: str, text: str, dbg: list | None = None) -> int | None:
+    """
+    Yahoo!ショッピング/PayPayモール 価格抽出
+    優先: JSON-LD/meta > 価格ラベル近傍
+    """
+    def to_v(s): return to_int_yen(s)
+
+    # A) 構造化データ（最優先）
+    for rx in [
+        r'"price"\s*:\s*"?(\d{3,7})"?',
+        r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})',
+        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{3,7})'
+    ]:
+        m = re.search(rx, html, re.I)
+        if m:
+            v = to_v(m.group(1))
+            if v:
+                _log(dbg, price_rule="ys_json_pick", value=v)
+                return v
+
+    # B) ラベル近傍
+    P = re.compile(r"(販売価格|価格|税込|税抜)[^\d¥￥]{0,8}([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})")
+    cands=[]
+    for m in P.finditer(text[:6000]):
+        v = to_v(m.group(2))
+        if v:
+            cands.append(v)
+            _log(dbg, price_rule="ys_label_hit", value=v, ctx=_ctx(text, m.start(), len(m.group(0))))
+    if cands:
+        val = min(cands)
+        _log(dbg, price_rule="ys_label_pick", value=val)
+        return val
+
+    _log(dbg, price_rule="ys_none")
+    return None
+
+
+def stock_from_yshopping(html: str, text: str, dbg: list | None = None) -> str | None:
+    """
+    Yahoo!ショッピング/PayPayモール 在庫判定
+    """
+    # JSON-LD availability
+    if re.search(r'itemprop=["\']availability["\'][^>]*(InStock|OutOfStock)', html, re.I):
+        st = "IN_STOCK" if re.search(r'InStock', html, re.I) else "OUT_OF_STOCK"
+        _log(dbg, stock_rule="ys_json", value=st); return st
+
+    # 画面テキスト
+    if re.search(r"(在庫あり|カートに入れる|今すぐ購入|注文手続き)", text):
+        _log(dbg, stock_rule="ys_buyable"); return "IN_STOCK"
+    if re.search(r"(在庫なし|在庫切れ|完売|販売終了|お取り扱いできません)", text):
+        _log(dbg, stock_rule="ys_oos");     return "OUT_OF_STOCK"
+
+    # 残り○点
+    m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個)", text)
+    if m:
+        n = int(z2h_digits(m.group(1)))
+        _log(dbg, stock_rule="ys_qty", qty=n)
+        return "LAST_ONE" if n == 1 else "IN_STOCK"
+
+    _log(dbg, stock_rule="ys_unknown")
+    return None
+
 # ========== 在庫・価格 抽出のメイン ==========
 from typing import Dict, Any
 import re
@@ -353,10 +458,18 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         if s:
             stock = s
         price = price_from_rakuma(html, text)
-
-
     elif ("suruga-ya" in host) or ("surugaya" in host):
         price = price_from_surugaya(html, text)
+    # --- ヤフオク ---
+    elif "auctions.yahoo.co.jp" in host:
+        s = stock_from_yahoo_auction(html, text, dbg=dbg)
+        if s: stock = s
+        price = price_from_yahoo_auction(html, text, dbg=dbg)
+    # --- Yahoo!ショッピング / PayPayモール ---
+    elif ("shopping.yahoo.co.jp" in host) or ("store.shopping.yahoo.co.jp" in host) or ("paypaymall.yahoo.co.jp" in host):
+        s = stock_from_yshopping(html, text, dbg=dbg)
+        if s: stock = s
+        price = price_from_yshopping(html, text, dbg=dbg)
 
     if price is None:
         # 汎用の価格抽出ロジック（3桁も許容・文脈で絞る）
