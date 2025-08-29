@@ -325,9 +325,12 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_offmall(html, text)
     # --- ラクマ専用の在庫上書き ---
     elif ("fril" in host) or ("rakuma" in host) or ("fril.jp" in host) or ("rakuma.rakuten.co.jp" in host):
+        # 在庫は専用ロジック
         s = stock_from_rakuma(html, text)
         if s:
             stock = s
+        price = price_from_rakuma(html, text)
+
 
     elif ("suruga-ya" in host) or ("surugaya" in host):
         price = price_from_surugaya(html, text)
