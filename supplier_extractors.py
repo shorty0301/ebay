@@ -142,35 +142,37 @@ def price_from_offmall(html: str, text: str) -> int | None:
 
 def price_from_rakuma(html: str, text: str) -> int | None:
     """
-    Rakuma/Fril 価格抽出（強化版）
-    - JSON/LD・meta の price を最優先
-    - テキストは「円/¥が数値そのものに付いている」ものだけ採用
-    - キャンペーン文（最大/円OFF/ポイント/倍/還元…）は徹底除外
-    - ページ上部（見出し付近）の金額にボーナス
+    Rakuma/Fril 価格抽出（さらに強化）
+    - JSON/LD・meta price 最優先
+    - テキストは『円/¥が数値そのものに付いているもの』だけ
+    - キャンペーン・条件文（◯円以上/まで/から 等）や OFF/ポイント等を厳しく除外
+    - スコア同点なら『出現位置が最も早いもの』、それでも同じなら最小値
     """
-    def add(lst: list[tuple[int, int]], s: str, score: int):
+    def add(lst: list[tuple[int, int, int]], s: str, score: int, idx: int):
         v = to_int_yen(s)
         if v and 0 < v < 10_000_000:
-            lst.append((score, v))
+            lst.append((score, v, idx))
 
-    cands: list[tuple[int, int]] = []
+    cands: list[tuple[int, int, int]] = []
 
-    # 1) 構造化データ・埋め込みJSON・meta を強く採用
+    # 1) 構造化データ / meta
     for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
-        add(cands, m.group(1), 9)
+        add(cands, m.group(1), 10, 0)
     for m in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})', html, re.I):
-        add(cands, m.group(1), 9)
+        add(cands, m.group(1), 10, 0)
     for m in re.finditer(r'(?:product:price:amount|og:price:amount)"?\s*content=["\']?(\d{3,7})', html, re.I):
-        add(cands, m.group(1), 9)
+        add(cands, m.group(1), 10, 0)
 
-    # 2) テキスト：通貨明示＋文脈スコア（裸数字は拾わない）
+    # 2) テキスト抽出（厳しめの除外）
     STOP = re.compile(
-        r"(最大|ポイント|pt|還元|倍|クーポン|割引|OFF|円OFF|％|%|上限|参考|相当|手数料|手数|送料別|キャンペーン)",
+        r"(最大|ポイント|pt|還元|倍|クーポン|割引|OFF|円OFF|％|%|上限|参考|相当|円相当|"
+        r"手数料|手数|送料別|キャンペーン|セール|特典|抽選|進呈|付与|"
+        r"以上|以下|未満|超|から|〜|~|まで|合計|総額|合算)",
         re.I,
     )
-    PRICE_WORD = re.compile(r"(価格|税込|税抜|販売|円|¥|￥|送料込|送料込み)", re.I)
+    PRICE_WORD = re.compile(r"(商品価格|販売価格|価格|税込|税抜|販売|円|¥|￥|送料込|送料込み)", re.I)
 
-    # 円/¥ が“数値そのもの”に付いている形のみ許可
+    # 円/¥が数値本体に付いている表現のみ
     pat = re.compile(
         r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
     )
@@ -178,8 +180,9 @@ def price_from_rakuma(html: str, text: str) -> int | None:
     for m in pat.finditer(text):
         s = m.group(0)
         i = m.start()
-        ctx = text[max(0, i - 80): i + len(s) + 80]
+        ctx = text[max(0, i - 100): i + len(s) + 100]
 
+        # ノイズ文脈は即除外
         if STOP.search(ctx):
             continue
 
@@ -188,19 +191,27 @@ def price_from_rakuma(html: str, text: str) -> int | None:
             continue
 
         score = 0
-        if PRICE_WORD.search(ctx): score += 4      # 価格語近傍
-        if re.search(r"[¥￥]|円", s): score += 3   # 通貨記号/円（本体に付与）
+        # 価格語近傍
+        if PRICE_WORD.search(ctx): score += 4
+        # 通貨明示（このパターンは必ず付くが、より強く評価）
+        if re.search(r"[¥￥]|円", s): score += 3
+        # カンマ表記
         if re.search(r"\d{1,3}(?:[,，]\d{3})+", s): score += 1
-        if i < 1200: score += 2                    # ページ上部ボーナス
+        # ページ上部ボーナス（見出し横の本体価格を優先）
+        if i < 1500: score += 2
+        # 「送料込」周辺はさらに加点
         if re.search(r"送料込|送料込み", ctx): score += 1
 
-        cands.append((score, v))
+        add(cands, s, score, i)
 
     if not cands:
         return None
 
-    best = max(s for s, _ in cands)
-    return min(v for s, v in cands if s == best)
+    # スコア最大 → 最も早い出現位置 → その中の最小値 を採用
+    best_score = max(s for s, _, _ in cands)
+    top = [(v, idx) for s, v, idx in cands if s == best_score]
+    min_idx = min(idx for v, idx in top)
+    return min(v for v, idx in top if idx == min_idx)
 
 
 
