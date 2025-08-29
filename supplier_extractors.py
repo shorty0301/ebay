@@ -571,57 +571,136 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    def to_v(s): return to_int_yen(s)
+    """
+    Amazon.co.jp 価格抽出（buybox優先・堅牢版）
+    1) buybox系(priceToPay/corePrice_feature_div) > a-offscreen 近傍 > meta/JSON > テキスト保険
+    2) STOP語(ポイント/還元/クーポン/OFF/実質 等)近傍は除外
+    3) 複数候補はスコア最大を採用（同点は最頻値→最大値）
+    """
+    H = str(html or "")
+    T = str(text or "")
 
-    # 1) 構造化データ / meta / data-*
-    for rx in [
-        r'"price"\s*:\s*"?(\d{2,8})"?',
-        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{2,8})',
-        r'itemprop=["\']price["\'][^>]*content=["\']?(\d{2,8})',
-        r'data-asin-price\s*=\s*["\']?(\d{2,8})',
-    ]:
-        m = re.search(rx, html, re.I)
+    def to_v(s: str) -> int | None:
+        return to_int_yen(s)
+
+    # スコア付き候補を管理
+    cands: list[tuple[int, int]] = []
+
+    def add(score: int, raw: str | int | float):
+        v = to_v(str(raw))
+        if v: 
+            # 1〜9,999,999円に限定
+            if 0 < v < 10_000_000:
+                cands.append((score, v))
+
+    # ========== 0) 位置情報 ==========
+    # buyboxがページに存在する位置（近いほどスコア加点）
+    idx_buybox = -1
+    for rx in [r'id=["\']buybox["\']', r'id=["\']apex_desktop["\']', r'id=["\']corePrice_feature_div["\']']:
+        m = re.search(rx, H, re.I)
         if m:
-            v = to_v(m.group(1))
-            if v: return v
+            idx_buybox = m.start()
+            break
 
-    # 2) UI断片（buybox / priceToPay / a-offscreen など）
+    def near_buybox(i: int) -> int:
+        # buyboxが見つかっていれば距離に応じて0〜20点
+        if idx_buybox < 0: 
+            return 0
+        d = abs(i - idx_buybox)
+        if d < 500:   return 20
+        if d < 1500:  return 12
+        if d < 4000:  return 6
+        return 2
+
+    # ========== 1) buybox系（最優先） ==========
     for rx in [
-        r'id=["\']corePrice_feature_div["\'][\s\S]{0,250}?[¥￥]\s*([\d,，]{3,10})',
-        r'id=["\']priceToPay["\'][\s\S]{0,150}?[¥￥]\s*([\d,，]{3,10})',
-        r'class=["\']a-offscreen["\']>[\s　]*[¥￥]\s*([\d,，]{3,10})<',
-        r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<',
+        # priceToPay 近傍
+        r'(id=["\']priceToPay["\'][\s\S]{0,400}?)([¥￥]\s*[\d,，]{3,10})',
+        # corePrice_feature_div 近傍
+        r'(id=["\']corePrice_feature_div["\'][\s\S]{0,600}?)([¥￥]\s*[\d,，]{3,10})',
     ]:
-        m = re.search(rx, html, re.I)
-        if m:
-            v = to_v(m.group(1))
-            if v: return v
+        for m in re.finditer(rx, H, re.I):
+            ctx, yen = m.group(1), m.group(2)
+            add(100 + near_buybox(m.start()), yen)
 
-    # 3) テキスト保険（最後の手段） ← ここは最終 fallback にする
-    STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|最大|上限|%|％|実質|相当|円相当)", re.I)
-    for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", text[:20000]):
-        ctx = text[max(0, m.start()-80): m.end()+80]
-        if STOP.search(ctx):
-            continue
-        v = to_v(m.group(1))
-        if v:
-            return v
+    # a-offscreen（実価格が入ることが多い）
+    for m in re.finditer(r'(class=["\']a-offscreen["\']>[\s　]*)([¥￥]\s*[\d,，]{3,10})<', H, re.I):
+        add(85 + near_buybox(m.start()), m.group(2))
 
-    return None
+    # a-price-whole (+ fraction) パーツの結合（念のため）
+    for m in re.finditer(
+        r'(?:id=["\']corePrice_feature_div["\'][\s\S]{0,600}?|)'
+        r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})</'
+        r'(?:span)[\s\S]{0,40}?class=["\']a-price-fraction["\'][^>]*>(\d{2})</',
+        H, re.I):
+        whole = m.group(1)
+        frac  = m.group(2)
+        # 円は通常小数無しだが、念のため四捨五入せず結合（"1620"+"00"→1620）
+        add(82 + near_buybox(m.start()), f"{whole}")
 
+    # ========== 2) 構造化データ / meta ==========
+    for rx in [
+        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?([\d,，]{1,10})',
+        r'itemprop=["\']price["\'][^>]*content=["\']?([\d,，]{1,10})',
+        r'"price"\s*:\s*"?([\d,，]{1,10})"?',          # JSON 内 price
+        r'"priceAmount"\s*:\s*"?([\d,，]{1,10})"?',    # twister-plus-price-data 等
+        r'data-asin-price\s*=\s*["\']?([\d,，]{1,10})',
+    ]:
+        for m in re.finditer(rx, H, re.I):
+            add(70, m.group(1))
+
+    # ========== 3) テキスト保険（最後の手段） ==========
+    STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|最大|上限|%|％|実質|相当|円相当|ギフト券|プロモーション)", re.I)
+    for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,]()*
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
+    """
+    Amazon.co.jp 在庫判定（購入UIを最優先。日/英どちらでも検出）
+    優先度: 購入UI > 明確な在庫なし > 構造化availability > 残数表示 > 不明
+    """
     t = text
-    if re.search(r"(現在お取り扱いできません|一時的に在庫切れ|再入荷予定は立っておりません)", t):
-        return "OUT_OF_STOCK"
-    if re.search(r"(在庫あり。|カートに入れる|今すぐ買う|通常\d+.*?以内に発送|最短でお届け)", t):
+
+    # 0) 構造化 availability（保険・後順位）
+    has_instock_struct  = bool(re.search(r'(itemprop=["\']availability["\'][^>]*InStock|"\s*availability"\s*:\s*".*InStock)', html, re.I))
+    has_outstock_struct = bool(re.search(r'(itemprop=["\']availability["\'][^>]*OutOfStock|"\s*availability"\s*:\s*".*OutOfStock)', html, re.I))
+
+    # 1) 購入UI（最優先：見えれば在庫あり）
+    #    日本語/英語UIの両方を許容。句読点の有無や全角空白も吸収。
+    if re.search(r"(カートに入れる|今すぐ買う|今すぐ購入|購入手続き)[\s　]*", t) \
+       or re.search(r"(Add to Cart|Buy Now)", t, re.I) \
+       or re.search(r"在庫あり[\s　]*[。.!？]?", t):
+        # 残数表示があれば反映
+        m = re.search(r"残り[\s　]*([0-9０-９]+)[\s　]*(?:点|個|枚|本)", t)
+        if m:
+            n = int(z2h_digits(m.group(1)))
+            return "LAST_ONE" if n == 1 else "IN_STOCK"
+        # 発送案内（通常X日/時間以内に発送・最短でお届け 等）でも在庫あり判定
+        if re.search(r"(通常[0-9０-９]+.*?以内に発送|最短でお届け|通常[^\n]{0,30}?発送)", t):
+            return "IN_STOCK"
         return "IN_STOCK"
-    m = re.search(r"残り\s*([0-9０-９]+)\s*点", t)
+
+    # 2) 明確な在庫なしテキスト
+    if re.search(r"(現在お取り扱いできません|一時的に在庫切れ|在庫切れです|再入荷予定は立っておりません)", t) \
+       or re.search(r"(Currently unavailable|Temporarily out of stock)", t, re.I):
+        return "OUT_OF_STOCK"
+
+    # 3) 構造化 availability（UIが見えない場合の保険）
+    if has_instock_struct and not has_outstock_struct:
+        return "IN_STOCK"
+    if has_outstock_struct and not has_instock_struct:
+        return "OUT_OF_STOCK"
+
+    # 4) 残数表示のみ検出できたケース
+    m = re.search(r"残り[\s　]*([0-9０-９]+)[\s　]*(?:点|個|枚|本)", t)
     if m:
         n = int(z2h_digits(m.group(1)))
         return "LAST_ONE" if n == 1 else "IN_STOCK"
+
+    # 5) 判定不能
     return None
+
+
 
 def stock_from_mercari(html: str, text: str) -> str | None:
     """
