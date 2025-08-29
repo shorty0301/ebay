@@ -89,79 +89,6 @@ def fetch_html(url: str) -> str:
     html_pc = try_get(url, ua_pc)
     html_mb = try_get(url, ua_sp)
     return (html_pc or "") + "\n<!-- MOBILE MERGE -->\n" + (html_mb or "")
-
-def _jsonld_price_avail(html: str) -> tuple[int|None, str|None]:
-    def to_v(s): 
-        v = to_int_yen(str(s))
-        return v
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        for sc in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
-            raw = (sc.string or sc.get_text() or "").strip()
-            if not raw: continue
-            try:
-                data = json.loads(raw)
-            except Exception:
-                raw = re.sub(r"//.*?$|/\*.*?\*/", "", raw, flags=re.S|re.M)
-                raw = re.sub(r",\s*([}\]])", r"\1", raw)
-                try: data = json.loads(raw)
-                except: continue
-
-            price, avail = None, None
-            def walk(x):
-                nonlocal price, avail
-                if isinstance(x, dict):
-                    if "price" in x and price is None:
-                        price = to_v(x["price"])
-                    if "availability" in x and avail is None:
-                        if re.search("InStock", str(x["availability"]), re.I):  avail="IN_STOCK"
-                        elif re.search("OutOfStock", str(x["availability"]), re.I): avail="OUT_OF_STOCK"
-                    for v in x.values(): walk(v)
-                elif isinstance(x, list):
-                    for it in x: walk(it)
-            walk(data)
-            if price or avail: return price, avail
-    except Exception:
-        pass
-    return None, None
-
-# ======== 強化GET（Amazon / Rakuten / Mercari 専用） =========
-def _strong_get_html(url: str) -> str:
-    UA_PC = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-    UA_MB = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
-
-    BASE = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Referer": "https://www.google.com/",
-        "sec-fetch-dest": "document",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-site": "none",
-        "sec-fetch-user": "?1",
-    }
-
-    def _try(ua: str) -> str:
-        h = dict(BASE); h["User-Agent"] = ua
-        try:
-            with requests.Session() as s:
-                s.headers.update(h)
-                r = s.get(url, timeout=25, allow_redirects=True)
-                if r.status_code == 200 and r.text:
-                    return r.text
-        except Exception:
-            return ""
-        return ""
-
-    pc = _try(UA_PC)
-    mb = _try(UA_MB)
-    return (pc or "") + "\n<!-- MOBILE MERGE -->\n" + (mb or "")
-
     
 # ========== サイト別価格抽出 ==========
 def price_from_offmall(html: str, text: str) -> int | None:
@@ -990,31 +917,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     m_host = re.search(r"https?://([^/]+)/?", url)
     host = m_host.group(1).lower() if m_host else ""
     text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
-    # 楽天は必ず強化取得で取り直し（他サイト無影響）
-    if "rakuten.co.jp" in host:
-        try:
-            strong = _strong_get_html(url)
-            if strong:
-                html = strong
-                text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
-        except Exception:
-            pass
-
-    # 3サイトだけ、取得HTMLが怪しい時に強化取得で再フェッチ（他サイトには一切影響なし）
-    is_target = (
-        ("amazon.co.jp" in host) or
-        ("rakuten.co.jp" in host) or
-        ("mercari.com" in host) or
-        ("jp.mercari.com" in host)
-    )
-    # JSON-LD 先読み（どのサイトでも有効）
-    p0, s0 = _jsonld_price_avail(html)
-    if s0: 
-        stock = s0
-    if p0 is not None:
-        price = p0
-
-
+    
     def _suspect(h: str, t: str) -> bool:
         if not h or len(h) < 1200:
             return True
@@ -1024,15 +927,14 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
             lt
         ))
 
-    if is_target and _suspect(html, text):
-        try:
-            strong = _strong_get_html(url)  # ← 既に定義済みの強化取得ヘルパ
-            if strong and len(strong) > len(html):
-                html = strong
-                text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
-        except Exception:
-            pass
-
+    if _suspect(html, text) and "_strong_get_html" in globals():
+    try:
+        strong = _strong_get_html(url)
+        if strong and len(strong) > len(html):
+            html = strong
+            text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
+    except Exception:
+        pass
     if debug:
         print(f"[DEBUG] host={host}")
 
@@ -1139,12 +1041,13 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp")) or ("rakuten.co.jp" in host):
         # 価格
         price = _price_from_rakuten(html, text)
-        # 在庫は既存の _stock_from_rakuten_combined/html判定 or あなたの stock_from_rakuten_ichiba を併用でOK
-        s, q = _stock_from_rakuten_combined(html, text, price)  # もし入れていれば
-        if s: stock = s
-        if q: qty = q
-        # 早期確定したいなら return
-
+        if "_stock_from_rakuten_combined" in globals():
+           try:
+               s, q = _stock_from_rakuten_combined(html, text, price)
+               if s: stock = s
+               if q: qty = q
+           except Exception:
+                pass
     
 
 
