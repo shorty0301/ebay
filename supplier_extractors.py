@@ -761,18 +761,18 @@ def price_from_mercari(html: str, text: str) -> int | None:
 
 def price_from_rakuten_ichiba(html: str, text: str) -> int | None:
     """
-    楽天市場 価格抽出（構造化 → 購入ボックス近傍のスコアリング → ラベル近傍 → 保険）
+    楽天市場 価格抽出（構造化 → 購入ボックス近傍スコアリング → ラベル近傍 → 保険）
     送料/ポイント/クーポン周辺は除外
     """
     def to_v(s): return to_int_yen(s)
 
-    # 1) 構造化データ / meta / data-*
+    # 1) 構造化データ / meta / data-*（カンマ・円付きもOK）
     for rx in [
-        r'"price"\s*:\s*"?(\d{2,8})"?',
-        r'"lowPrice"\s*:\s*"?(\d{2,8})"?',
-        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{2,8})',
-        r'itemprop=["\']price["\'][^>]*content=["\']?(\d{2,8})',
-        r'data-(?:price|amount|item-price)\s*=\s*["\']?(\d{2,8})',
+        r'"price"\s*:\s*"?([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?"?',   # ← 追加
+        r'"lowPrice"\s*:\s*"?([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?"?',
+        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?([\d,，]{1,10})',
+        r'itemprop=["\']price["\'][^>]*content=["\']?([\d,，]{1,10})',
+        r'data-(?:price|amount|item-price)\s*=\s*["\']?([\d,，]{1,10})',
     ]:
         m = re.search(rx, html, re.I)
         if m:
@@ -802,15 +802,15 @@ def price_from_rakuten_ichiba(html: str, text: str) -> int | None:
             score = 10
             if LABEL.search(win): score += 3
             if re.search(r"[¥￥]|円", s): score += 1
-            if SHIPPING.search(win): score -= 6   # 送料は強く減点
+            if SHIPPING.search(win): score -= 6   # 送料は強減点
             if re.search(r"\d{1,3}(?:[,，]\d{3})+", s): score += 1
             cands.append((score, v))
 
     if cands:
         best = max(s for s, _ in cands)
-        return max(v for s, v in cands if s == best)  # 同点は最大値（送料より本体価格を取りやすい）
+        return max(v for s, v in cands if s == best)  # 同点は最大値＝本体価格を取りやすい
 
-    # 3) ラベル近傍（本文全体）
+    # 3) ラベル近傍
     for m in re.finditer(r"(税込|税抜|価格|販売価格|本体価格|セール価格|お支払い金額)[^\d¥￥]{0,12}("+YEN+")",
                          joined[:35000], re.I):
         sv = m.group(2)
@@ -822,11 +822,11 @@ def price_from_rakuten_ichiba(html: str, text: str) -> int | None:
             continue
         return v
 
-    # 4) よくあるDOM直値（保険）
+    # 4) DOM直値（保険）
     for rx in [
         r'class=["\']price["\'][^>]*>\s*[¥￥]?\s*([\d,，]{3,10})\s*円',
         r'id=["\']price["\'][^>]*>\s*[¥￥]?\s*([\d,，]{3,10})\s*円',
-        r'data-price\s*=\s*["\']?(\d{2,8})',
+        r'data-price\s*=\s*["\']?([\d,，]{1,10})',
     ]:
         m = re.search(rx, html, re.I)
         if m:
@@ -882,7 +882,19 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     m_host = re.search(r"https?://([^/]+)/?", url)
     host = m_host.group(1).lower() if m_host else ""
     text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
-    
+    # host / text を作った直後に追加（既存の3サイト用ブロックはそのままでもOK）
+    if "rakuten.co.jp" in host:
+        BUY = re.compile(r"(購入手続き|購入手続きへ|買い物かごに入れる|かごに追加|かごに入れる)")
+        need_refetch = (not BUY.search(text)) or (not re.search(r'"price"\s*:', html))
+        if need_refetch:
+           try:
+               strong = _strong_get_html(url)
+               if strong and len(strong) > len(html):
+                   html = strong
+                   text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
+            except Exception:
+                pass
+
     # ← host と text を作った直後に追加
     # 3サイトだけ、取得HTMLが怪しい時に強化取得で再フェッチ（他サイトには一切影響なし）
     is_target = (
