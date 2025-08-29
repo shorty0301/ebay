@@ -123,17 +123,3 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
 @functools.lru_cache(maxsize=256)
 def fetch_and_extract(url: str) -> Dict[str, Any]:
     return extract_supplier_info(url, fetch_html(url))
-
-def extract_supplier_info(url: str, html: str, debug: bool = False):
-    # …既存処理…
-    if debug:
-        print(f"[DEBUG] Extracting {url} ...")
-    return {
-            "stock": stock,
-            "qty": qty,
-            "price": price,
-            "_debug": {
-                "host": host,
-                "text_snippet": text[:200]
-            }
-     }
