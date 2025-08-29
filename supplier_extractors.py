@@ -258,72 +258,127 @@ def stock_from_yahoo_auction(html: str, text: str) -> str | None:
 
 def price_from_yshopping(html: str, text: str) -> int | None:
     """
-    Yahoo!ショッピング / PayPayモール 価格抽出（キャンペーン除外・購入付近優先）
-    優先度:
-      1) 構造化データ (JSON-LD / meta)
-      2) 「カートに入れる/今すぐ購入」近傍の金額
-      3) 価格ラベル（販売価格/税込/セール価格 等）近傍
-    ※ ポイント/円相当/クーポン/○円OFF/最大/上限 などは除外
+    Yahoo!ショッピング / PayPayモール 価格抽出（購入価格優先・キャンペーン除外）
     """
     def to_v(s): return to_int_yen(s)
 
-    # --- 共通正規表現 ---
-    YEN = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
-    STOP = re.compile(
-        r"(ポイント|pt|獲得|進呈|付与|相当|円相当|PayPay|%|％|"
-        r"クーポン|OFF|円OFF|割引|値引|最大|上限|還元|キャンペーン|セール期間|タイムセール|まとめ買い|条件|対象)",
-        re.I,
-    )
-    PRICE_LABEL = re.compile(r"(販売価格|本体価格|価格|セール価格|最終価格|税込|税抜)", re.I)
-    OLD_LABEL   = re.compile(r"(通常価格|参考価格|メーカー希望小売価格|希望小売価格)", re.I)
-    BUY_WORD    = re.compile(r"(カートに入れる|今すぐ購入|注文手続き)", re.I)
-
-    # 1) 構造化データ（最優先）
+    # A) 構造化データ / meta / data-*（最優先）
     for rx in [
-        r'"price"\s*:\s*"?(\d{3,7})"?',
-        r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})',
-        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{3,7})',
-        r'data-(?:price|amount)\s*=\s*["\']?(\d{3,7})',   # 一部テンプレのdata属性
+        r'"price"\s*:\s*"?(\d{2,8})"?',
+        r'"lowPrice"\s*:\s*"?(\d{2,8})"?',
+        r'itemprop=["\']price["\'][^>]*content=["\']?(\d{2,8})',
+        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{2,8})',
+        r'data-(?:price|amount|y-price|item-price|paypay-price|price-value)\s*=\s*["\']?(\d{2,8})',
     ]:
         m = re.search(rx, html, re.I)
         if m:
             v = to_v(m.group(1))
             if v: return v
 
-    # 2) 購入ボタン近傍（強め）
-    cands: list[tuple[int,int]] = []  # (score, value)
-    for m in BUY_WORD.finditer(text[:12000]):
+    # B) 右側カラム/ボタン周り（「カートに入れる/今すぐ購入」近傍）
+    STOP = re.compile(r"(ポイント|pt|獲得|進呈|付与|相当|円相当|PayPay|%|％|クーポン|OFF|円OFF|割引|最大|上限|還元|キャンペーン|条件|対象)", re.I)
+    PRICE_LABEL = re.compile(r"(価格|販売価格|本体価格|セール価格|税込|税抜|お支払い金額|支払金額)", re.I)
+    BUY = re.compile(r"(カートに入れる|今すぐ購入|注文手続き|注文に進む|購入手続き)", re.I)
+    YEN = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
+
+    cands: list[tuple[int,int]] = []
+
+    # 右側（テキスト冒頭～2万字の中で、購入ボタン付近広めに）
+    for m in BUY.finditer(text[:20000]):
         i = m.start()
-        ctx = text[max(0, i-600): i+600]  # ボタン近辺を広めに
+        ctx = text[max(0, i-1000): i+1000]
         for n in re.finditer(YEN, ctx):
             s = n.group(0)
             v = to_v(s)
             if not v: continue
-            win = ctx[max(0, n.start()-60): n.end()+60]
-            if STOP.search(win): continue
-            score = 8
-            if PRICE_LABEL.search(win): score += 2
+            win = ctx[max(0, n.start()-120): n.end()+120]
+            if STOP.search(win): 
+                continue
+            score = 10
+            if PRICE_LABEL.search(win): score += 3
             if re.search(r"[¥￥]|円", s): score += 1
-            if OLD_LABEL.search(win): score -= 2
             cands.append((score, v))
 
-    # 3) 価格ラベル近傍（本文全体から）
-    P = re.compile(r"(販売価格|本体価格|価格|セール価格|最終価格|税込|税抜)[^\d¥￥]{0,10}("+YEN+")", re.I)
-    for m in P.finditer(text[:15000]):
+    # C) 「価格ラベル」近傍（本文全体）
+    P = re.compile(r"(価格|販売価格|本体価格|セール価格|税込|税抜|お支払い金額|支払金額)[^\d¥￥]{0,12}("+YEN+")", re.I)
+    for m in P.finditer(text[:25000]):
         s = m.group(2)
         v = to_v(s)
         if not v: continue
-        ctx = text[max(0, m.start()-80): m.end()+80]
+        ctx = text[max(0, m.start()-120): m.end()+120]
         if STOP.search(ctx): continue
-        score = 6
-        if OLD_LABEL.search(ctx): score -= 2
+        score = 7
         cands.append((score, v))
 
     if not cands:
+        # D) 保険：lowPriceがあれば採用
+        m = re.search(r'"lowPrice"\s*:\s*"?(\d{2,8})"?', html, re.I)
+        if m:
+            v = to_v(m.group(1))
+            if v: return v
         return None
 
     best = max(s for s,_ in cands)
     return min(v for s,v in cands if s == best)
+
+def price_from_paypay_fleamarket(html: str, text: str) -> int | None:
+    """
+    PayPayフリマの商品ページ価格。
+    ページ上部の大きい「600円」「○○円」を最優先。
+    クーポン/実質/相当/pt/PayPay 等は除外。
+    """
+    def to_v(s): return to_int_yen(s)
+
+    head = text[:3000]  # 見出し～購入ボタン付近
+
+    STOP = re.compile(r"(クーポン|適用で|実質|相当|円相当|ポイント|pt|PayPay|%|％|OFF|円OFF|割引|最大|上限)", re.I)
+
+    # 1) 見出しの「^\s*¥?1234円」形式（最優先）
+    p1 = re.compile(r"^\s*(?:[¥￥]?\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", re.M)
+    for m in p1.finditer(head):
+        s = m.group(1)
+        i = m.start(1)
+        ctx = head[max(0, i-60): i+60]
+        if STOP.search(ctx): 
+            continue
+        v = to_v(s)
+        if v: return v
+
+    # 2) 「購入手続きへ」ボタン近傍の金額
+    btn = re.search(r"(購入手続きへ|購入に進む)", head)
+    if btn:
+        i = btn.start()
+        ctx = head[max(0, i-600): i+600]
+        for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", ctx):
+            s = m.group(1)
+            win = ctx[max(0, m.start()-60): m.end()+60]
+            if STOP.search(win): 
+                continue
+            v = to_v(s)
+            if v: return v
+
+    # 3) 保険：先頭から最初に出る「¥付き金額」（ノイズ除外）
+    for m in re.finditer(r"[¥￥]\s*(\d{1,3}(?:[,，]\d{3})+|\d{3,7})", head):
+        s = m.group(1)
+        i = m.start(1)
+        ctx = head[max(0, i-60): i+60]
+        if STOP.search(ctx): 
+            continue
+        v = to_v(s)
+        if v: return v
+
+    return None
+
+
+def stock_from_paypay_fleamarket(html: str, text: str) -> str | None:
+    """PayPayフリマ在庫判定"""
+    if re.search(r"(売り切れました|SOLD\s*OUT|在庫なし|販売終了)", text, re.I):
+        return "OUT_OF_STOCK"
+    if re.search(r"(購入手続きへ|購入に進む)", text):
+        return "IN_STOCK"
+    if re.search(r"(残り\s*1\s*(?:点|個|枚|本)|ラスト\s*1)", text):
+        return "LAST_ONE"
+    return None
 
 
 
@@ -428,12 +483,19 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
          s = stock_from_yahoo_auction(html, text)
          if s: stock = s
          price = price_from_yahoo_auction(html, text)
+    # PayPayフリマ
+    elif "paypayfleamarket.yahoo.co.jp" in host:
+        s = stock_from_paypay_fleamarket(html, text)
+        if s: stock = s
+        price = price_from_paypay_fleamarket(html, text)
 
-    # --- Yahoo!ショッピング / PayPayモール ---
+    # Yahoo!ショッピング / PayPayモール
     elif ("shopping.yahoo.co.jp" in host) or ("store.shopping.yahoo.co.jp" in host) or ("paypaymall.yahoo.co.jp" in host):
         s = stock_from_yshopping(html, text)
         if s: stock = s
         price = price_from_yshopping(html, text)
+
+    
 
 
     if price is None:
