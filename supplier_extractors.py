@@ -38,6 +38,13 @@ def pick_best_price(cands) -> float:
         if n==n and 0<n<1e7: nums.append(n)
     return min(nums) if nums else float("nan")
 
+def yen_to_int(s: str) -> int | None:
+    """
+    金額文字列を整数に変換（全角→半角、数字以外を除去）
+    """
+    t = re.sub(r"[^\d]", "", z2h_digits(str(s or "")))
+    return int(t) if t else None
+
 # ========== fetch_html ==========
 def fetch_html(url: str) -> str:
     ua_pc  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
