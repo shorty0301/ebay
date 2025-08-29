@@ -882,7 +882,8 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     m_host = re.search(r"https?://([^/]+)/?", url)
     host = m_host.group(1).lower() if m_host else ""
     text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
-        # ← host と text を作った直後に追加
+    
+    # ← host と text を作った直後に追加
     # 3サイトだけ、取得HTMLが怪しい時に強化取得で再フェッチ（他サイトには一切影響なし）
     is_target = (
         ("amazon.co.jp" in host) or
