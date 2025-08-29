@@ -91,21 +91,44 @@ def fetch_html(url: str) -> str:
     return (html_pc or "") + "\n<!-- MOBILE MERGE -->\n" + (html_mb or "")
 
 # ======== 強い取得（対象3サイト専用） =========
-if price is None or stock == "UNKNOWN":
-    rhtml = _render_html(url)
-    if rhtml:
-        rtext = strip_tags(rhtml).replace("\u3000"," ").replace("\u00A0"," ")
-        # 既存の各サイト関数で再判定
-        if "rakuten.co.jp" in host:
-            stock = stock_from_rakuten_ichiba(rhtml, rtext) or stock
-            price = price_from_rakuten_ichiba(rhtml, rtext) or price
-        elif "amazon.co.jp" in host:
-            stock = stock_from_amazon_jp(rhtml, rtext) or stock
-            price = price_from_amazon_jp(rhtml, rtext) or price
-        elif "mercari.com" in host or "jp.mercari.com" in host:
-            stock = stock_from_mercari(rhtml, rtext) or stock
-            price = price_from_mercari(rhtml, rtext) or price
+def _jsonld_price_avail(html: str) -> tuple[int|None, str|None]:
+    def to_v(s): 
+        v = to_int_yen(str(s))
+        return v
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for sc in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+            raw = (sc.string or sc.get_text() or "").strip()
+            if not raw: continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                raw = re.sub(r"//.*?$|/\*.*?\*/", "", raw, flags=re.S|re.M)
+                raw = re.sub(r",\s*([}\]])", r"\1", raw)
+                try: data = json.loads(raw)
+                except: continue
 
+            price, avail = None, None
+            def walk(x):
+                nonlocal price, avail
+                if isinstance(x, dict):
+                    if "price" in x and price is None:
+                        price = to_v(x["price"])
+                    if "availability" in x and avail is None:
+                        if re.search("InStock", str(x["availability"]), re.I):  avail="IN_STOCK"
+                        elif re.search("OutOfStock", str(x["availability"]), re.I): avail="OUT_OF_STOCK"
+                    for v in x.values(): walk(v)
+                elif isinstance(x, list):
+                    for it in x: walk(it)
+            walk(data)
+            if price or avail: return price, avail
+    except Exception:
+        pass
+    return None, None
+
+p0, s0 = _jsonld_price_avail(html)
+if s0: stock = s0
+if p0 is not None: price = p0
 # ========== サイト別価格抽出 ==========
 def price_from_offmall(html: str, text: str) -> int | None:
     """
