@@ -90,7 +90,6 @@ def fetch_html(url: str) -> str:
     html_mb = try_get(url, ua_sp)
     return (html_pc or "") + "\n<!-- MOBILE MERGE -->\n" + (html_mb or "")
 
-# ======== 強い取得（対象3サイト専用） =========
 def _jsonld_price_avail(html: str) -> tuple[int|None, str|None]:
     def to_v(s): 
         v = to_int_yen(str(s))
@@ -125,6 +124,44 @@ def _jsonld_price_avail(html: str) -> tuple[int|None, str|None]:
     except Exception:
         pass
     return None, None
+
+# ======== 強化GET（Amazon / Rakuten / Mercari 専用） =========
+def _strong_get_html(url: str) -> str:
+    UA_PC = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    UA_MB = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
+
+    BASE = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.google.com/",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+    }
+
+    def _try(ua: str) -> str:
+        h = dict(BASE); h["User-Agent"] = ua
+        try:
+            with requests.Session() as s:
+                s.headers.update(h)
+                r = s.get(url, timeout=25, allow_redirects=True)
+                if r.status_code == 200 and r.text:
+                    return r.text
+        except Exception:
+            return ""
+        return ""
+
+    pc = _try(UA_PC)
+    mb = _try(UA_MB)
+    return (pc or "") + "\n<!-- MOBILE MERGE -->\n" + (mb or "")
+
     
 # ========== サイト別価格抽出 ==========
 def price_from_offmall(html: str, text: str) -> int | None:
@@ -733,58 +770,53 @@ def price_from_mercari(html: str, text: str) -> int | None:
             return v
     return None
 
-def price_from_rakuten_ichiba(html: str, text: str) -> int | None:
-    def to_v(s): return to_int_yen(s)
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        for sc in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
-            raw = (sc.string or sc.get_text() or "").strip()
-            if not raw:
-                continue
-            # JSON が配列/オブジェクト/コメント混じりでも頑張って読む
-            try:
-                 data = json.loads(raw)
-            except Exception:
-                # 末尾の , やコメントで壊れているケースの簡易修正
-                raw2 = re.sub(r"//.*?$|/\*.*?\*/", "", raw, flags=re.S|re.M)
-                raw2 = re.sub(r",\s*([}\]])", r"\1", raw2)
-                try:
-                    data = json.loads(raw2)
-                except Exception:
-                    continue
+# ======== Rakuten helpers (GAS移植) =========
+def _availability_from_meta_or_ld(html: str) -> str | None:
+    # JSON-LD / microdata の availability を見る
+    if re.search(r'itemprop=["\']availability["\'][^>]*InStock', html, re.I):
+        return "IN_STOCK"
+    if re.search(r'itemprop=["\']availability["\'][^>]*OutOfStock', html, re.I):
+        return "OUT_OF_STOCK"
+    # JSON-LDをざっくり
+    m = re.search(r'"availability"\s*:\s*"([^"]+)"', html, re.I)
+    if m:
+        v = m.group(1)
+        if re.search(r'InStock', v, re.I): return "IN_STOCK"
+        if re.search(r'OutOfStock', v, re.I): return "OUT_OF_STOCK"
+    # isSoldOut / inStock フラグ
+    m = re.search(r'"(?:isSoldOut|soldOut)"\s*:\s*(true|false)', html, re.I)
+    if m: return "OUT_OF_STOCK" if m.group(1).lower()=="true" else "IN_STOCK"
+    m = re.search(r'"(?:isInStock|inStock)"\s*:\s*(true|false)', html, re.I)
+    if m: return "IN_STOCK" if m.group(1).lower()=="true" else "OUT_OF_STOCK"
+    return None
 
-            def walk(x):
-                if isinstance(x, dict):
-                    # price のキー
-                    if "price" in x:
-                        v = to_v(str(x["price"]))
-                        if v:
-                            return v
-                    # offers の下に price があることが多い
-                    if "offers" in x:
-                        v = walk(x["offers"])
-                        if v:
-                            return v
-                    for v2 in x.values():
-                        v = walk(v2)
-                        if v:
-                            return v
-                elif isinstance(x, list):
-                    for it in x:
-                        v = walk(it)
-                        if v:
-                            return v
-                return None
 
-            v = walk(data)
-            if v:
-                return v
-    except Exception:
-        pass 
-        
-    # 1) 構造化データ / meta / data-*（カンマ・円付きもOK）
+def _price_from_rakuten_books(html: str) -> int | None:
+    # 楽天ブックスは JSON-LD, itemprop=price, og:price:amount などに出やすい
     for rx in [
-        r'"price"\s*:\s*"?([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?"?',   # ← 追加
+        r'"price"\s*:\s*"?([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?"?',
+        r'itemprop=["\']price["\'][^>]*content=["\']?([\d,，]{1,10})',
+        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?([\d,，]{1,10})',
+        r'data-(?:price|amount|item-price)\s*=\s*["\']?([\d,，]{1,10})',
+    ]:
+        m = re.search(rx, html, re.I)
+        if m:
+            v = to_int_yen(m.group(1))
+            if v: return v
+    return None
+
+
+def _price_from_rakuten_common(html: str, text: str) -> int | None:
+    # GAS側 _priceFromRakuten(html, text) のイメージを再現（既存の楽天関数でもOK）
+    STOP     = re.compile(r"(ポイント|pt|還元|%|％|クーポン|OFF|円OFF|割引|最大|上限|実質|相当|円相当|付与|進呈|獲得)", re.I)
+    SHIPPING = re.compile(r"(送料|配送料|メール便)", re.I)
+    LABEL    = re.compile(r"(税込|税抜|価格|販売価格|本体価格|セール価格|お支払い金額)", re.I)
+    BUY      = re.compile(r"(購入手続き|購入手続きへ|買い物かごに入れる|かごに追加|かごに入れる)", re.I)
+    YEN      = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
+
+    # 1) JSON-LD/メタ先（カンマ/円付き対応）
+    for rx in [
+        r'"price"\s*:\s*"?([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?"?',
         r'"lowPrice"\s*:\s*"?([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?"?',
         r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?([\d,，]{1,10})',
         r'itemprop=["\']price["\'][^>]*content=["\']?([\d,，]{1,10})',
@@ -792,90 +824,150 @@ def price_from_rakuten_ichiba(html: str, text: str) -> int | None:
     ]:
         m = re.search(rx, html, re.I)
         if m:
-            v = to_v(m.group(1))
+            v = to_int_yen(m.group(1))
             if v: return v
 
-    STOP     = re.compile(r"(ポイント|pt|還元|%|％|クーポン|OFF|円OFF|割引|最大|上限|実質|相当|円相当|付与|進呈|獲得)", re.I)
-    SHIPPING = re.compile(r"(送料|配送料|メール便)", re.I)
-    LABEL    = re.compile(r"(税込|税抜|価格|販売価格|本体価格|セール価格|お支払い金額)", re.I)
-    BUY      = re.compile(r"(購入手続き|購入手続きへ|買い物かごに入れる|かごに追加|かごに入れる)", re.I)
-    YEN      = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
-
-    # 2) 購入ボックス近傍（スコアリング）
+    # 2) 購入ボックス付近（スコアリング：送料/ポイント近傍は除外）
     cands: list[tuple[int,int]] = []
-    joined = text
-    for b in BUY.finditer(joined[:35000]):
+    for b in BUY.finditer(text[:35000]):
         i = b.start()
-        ctx = joined[max(0, i-1600): i+1600]
-        for m in re.finditer(YEN, ctx):
-            s = m.group(0)
-            v = to_v(s)
-            if not v: 
-                continue
-            win = ctx[max(0, m.start()-120): m.end()+120]
-            if STOP.search(win): 
+        ctx = text[max(0, i-1600): i+1600]
+        for n in re.finditer(YEN, ctx):
+            s = n.group(0)
+            v = to_int_yen(s)
+            if not v: continue
+            win = ctx[max(0, n.start()-120): n.end()+120]
+            if STOP.search(win) or SHIPPING.search(win): 
                 continue
             score = 10
             if LABEL.search(win): score += 3
             if re.search(r"[¥￥]|円", s): score += 1
-            if SHIPPING.search(win): score -= 6   # 送料は強減点
             if re.search(r"\d{1,3}(?:[,，]\d{3})+", s): score += 1
             cands.append((score, v))
-
     if cands:
-        best = max(s for s, _ in cands)
-        return max(v for s, v in cands if s == best)  # 同点は最大値＝本体価格を取りやすい
+        best = max(s for s,_ in cands)
+        # キャンペーンの小さい数字を避けるため同点は最大値を採用
+        return max(v for s,v in cands if s==best)
 
     # 3) ラベル近傍
     for m in re.finditer(r"(税込|税抜|価格|販売価格|本体価格|セール価格|お支払い金額)[^\d¥￥]{0,12}("+YEN+")",
-                         joined[:35000], re.I):
-        sv = m.group(2)
-        v = to_v(sv)
-        if not v: 
-            continue
-        ctx = joined[max(0, m.start()-120): m.end()+120]
+                         text[:35000], re.I):
+        v = to_int_yen(m.group(2))
+        if not v: continue
+        ctx = text[max(0, m.start()-120): m.end()+120]
         if STOP.search(ctx) or SHIPPING.search(ctx): 
             continue
         return v
 
-    # 4) DOM直値（保険）
-    for rx in [
-        r'class=["\']price["\'][^>]*>\s*[¥￥]?\s*([\d,，]{3,10})\s*円',
-        r'id=["\']price["\'][^>]*>\s*[¥￥]?\s*([\d,，]{3,10})\s*円',
-        r'data-price\s*=\s*["\']?([\d,，]{1,10})',
-    ]:
-        m = re.search(rx, html, re.I)
-        if m:
-            v = to_v(m.group(1))
-            if v: return v
-
-    # 5) テキスト保険（上部）
-    head = joined[:12000]
+    # 4) テキスト保険（上部）
+    head = text[:12000]
     for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", head):
         ctx = head[max(0, m.start()-80): m.end()+80]
         if STOP.search(ctx) or SHIPPING.search(ctx): 
             continue
-        v = to_v(m.group(1))
+        v = to_int_yen(m.group(1))
         if v: return v
 
     return None
 
+# ====== 価格抽出：Rakuten（簡易・税込優先 / GAS移植相当） ======
+def _collect_jsonld_prices(html: str) -> list[int]:
+    out: list[int] = []
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+        for sc in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+            raw = (sc.string or sc.get_text() or "").strip()
+            if not raw:
+                continue
+            # コメントや末尾カンマを軽く除去
+            raw2 = re.sub(r"//.*?$|/\*.*?\*/", "", raw, flags=re.S | re.M)
+            raw2 = re.sub(r",\s*([}\]])", r"\1", raw2)
+            try:
+                data = json.loads(raw2)
+            except Exception:
+                continue
+
+            def walk(x):
+                if isinstance(x, dict):
+                    # price が文字列/数値どちらでも取りうる
+                    if "price" in x:
+                        v = to_int_yen(str(x["price"]))
+                        if v:
+                            out.append(v)
+                    for v in x.values():
+                        walk(v)
+                elif isinstance(x, list):
+                    for it in x:
+                        walk(it)
+
+            walk(data)
+    except Exception:
+        pass
+    return out
 
 
-def stock_from_rakuten_ichiba(html: str, text: str) -> str | None:
-    m = re.search(r'itemprop=["\']availability["\'][^>]*(InStock|OutOfStock)', html, re.I)
-    if m:
-        return "IN_STOCK" if re.search(r'InStock', m.group(0), re.I) else "OUT_OF_STOCK"
-    if re.search(r"(在庫あり|かごに追加|買い物かごに入れる|購入手続き|今すぐ購入|注文手続き)", text):
-        return "IN_STOCK"
-    if re.search(r"(在庫なし|在庫切れ|売り切れ|販売終了|お取り扱いできません)", text):
-        return "OUT_OF_STOCK"
-    m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", text)
-    if m:
-        n = int(z2h_digits(m.group(1)))
-        return "LAST_ONE" if n == 1 else "IN_STOCK"
-    return None
+def _price_from_rakuten(html: str, text: str) -> int | None:
+    H = str(html or "")
+    T = re.sub(r"\s+", " ", str(text or ""))  # GAS同様にスペース正規化
 
+    # STOP語（実質/ポイント/クーポン/手数料など）: 価格候補から除外
+    STOP = re.compile(r"(参考(?:小売)?価格|実質|ポイント|付与|獲得|クーポン|割引|値引|上限|注文合計|代引|着払い|配送料|手数料|SPU|下取り|買取)")
+
+    def _add(cands: list[int], v: str | int | float):
+        s = strip_tags(str(v or "")).strip()
+        if not s:
+            return
+        # 「送料」が含まれるが「送料無料/送料込/送料込み」ではない → 除外
+        if re.search(r"送料", s) and not re.search(r"(送料無料|送料込|送料込み)", s):
+            return
+        if STOP.search(s):
+            return
+        # 通貨記号あり：厳密パース / なし：カンマ除去して数値化
+        if re.search(r"[¥￥円,，]", s):
+            n = parse_yen_strict(s)
+            if n == n:  # not NaN
+                iv = int(n)
+            else:
+                iv = None
+        else:
+            t = re.sub(r"[^\d]", "", s)
+            iv = int(t) if t else None
+
+        if iv and 0 < iv < 10_000_000:
+            cands.append(iv)
+
+    cand: list[int] = []
+
+    # 1) meta / itemprop=price / og:price:amount など
+    for rx in [
+        r'<meta[^>]+(?:name|property)=["\'](?:product:price:amount|og:price:amount|price)["\'][^>]*content=["\']([^"\']+)["\']',
+        r'<(?:meta|data|input)[^>]+itemprop=["\']price["\'][^>]*content=["\']([^"\']+)["\']',
+    ]:
+        for m in re.finditer(rx, H, re.I | re.S):
+            _add(cand, m.group(1))
+
+    # 2) JSON-LD内の price 群
+    for v in _collect_jsonld_prices(H):
+        _add(cand, v)
+
+    # 3) price系クラスを含む要素のテキスト
+    for m in re.finditer(
+        r'<(?:span|div|p|em|strong)[^>]+class=["\'][^"\']*(?:\bprice(?:2|3)?\b|Price__value|itemPrice|productPrice|RPrice\b|priceBox|main-price)[^"\']*["\'][^>]*>([\s\S]*?)</(?:span|div|p|em|strong)>',
+        H, re.I):
+        _add(cand, m.group(1))
+
+    # 4) 「税込」の前後にある金額（優先）
+    #    税込 [数値] / [数値] 税込 の両方
+    r1 = re.compile(r"税込[^0-9¥￥]{0,10}([¥￥]?\s?\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円?", re.I)
+    r2 = re.compile(r"([¥￥]?\s?\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円[^ぁ-んァ-ヶA-Za-z0-9]{0,8}税込", re.I)
+    for m in r1.finditer(T):
+        _add(cand, m.group(1))
+    for m in r2.finditer(T):
+        _add(cand, m.group(1))
+
+    if not cand:
+        return None
+    return min(cand)  # GAS同様、最小値（通常価格）を採用
 
 
 
@@ -1044,13 +1136,16 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         s = stock_from_mercari(html, text)
         if s: stock = s
         price = price_from_mercari(html, text)
-
-    # 楽天市場（item系） ---
-    elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp") and "/item/" in url):
-        s = stock_from_rakuten_ichiba(html, text)
+    elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp")) or ("rakuten.co.jp" in host):
+        # 価格
+        price = _price_from_rakuten(html, text)
+        # 在庫は既存の _stock_from_rakuten_combined/html判定 or あなたの stock_from_rakuten_ichiba を併用でOK
+        s, q = _stock_from_rakuten_combined(html, text, price)  # もし入れていれば
         if s: stock = s
-        price = price_from_rakuten_ichiba(html, text)
+        if q: qty = q
+        # 早期確定したいなら return
 
+    
 
 
     if price is None:
