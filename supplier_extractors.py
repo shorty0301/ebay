@@ -1055,45 +1055,45 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_surugaya(html, text)
     # Amazon.co.jp
     elif ("amazon.co.jp" in host) or host.endswith(".amazon.co.jp"):
-    # まずは “今手元のHTML” から抽出
-    if debug:
-        H = html or ""
-        T = text or ""
-        print("[AMZ] len(html)=", len(H))
-        print("[AMZ] markers:", {
-            "priceToPay": bool(re.search(r'id=["\']priceToPay["\']', H, re.I)),
-            "corePrice":  bool(re.search(r'id=["\']corePrice_feature_div["\']', H, re.I)),
-            "aOffscreen": bool(re.search(r'class=["\']a-offscreen["\']', H, re.I)),
-            "buyNow":     bool(re.search(r"(今すぐ買う|Buy Now)", T)),
-            "addCart":    bool(re.search(r"(カートに入れる|Add to Cart)", T)),
-            "unavail":    bool(re.search(r"(現在お取り扱いできません|Currently unavailable)", T, re.I)),
-            "robot":      bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", H, re.I)),
-        })
+        # まずは “今手元のHTML” から抽出
+        if debug:
+            H = html or ""
+            T = text or ""
+            print("[AMZ] len(html)=", len(H))
+            print("[AMZ] markers:", {
+                "priceToPay": bool(re.search(r'id=["\']priceToPay["\']', H, re.I)),
+                "corePrice":  bool(re.search(r'id=["\']corePrice_feature_div["\']', H, re.I)),
+                "aOffscreen": bool(re.search(r'class=["\']a-offscreen["\']', H, re.I)),
+                "buyNow":     bool(re.search(r"(今すぐ買う|Buy Now)", T)),
+                "addCart":    bool(re.search(r"(カートに入れる|Add to Cart)", T)),
+                "unavail":    bool(re.search(r"(現在お取り扱いできません|Currently unavailable)", T, re.I)),
+                "robot":      bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", H, re.I)),
+            })
 
-    s = stock_from_amazon_jp(html, text)
-    if s: 
-        stock = s
-    price = price_from_amazon_jp(html, text)
+        s = stock_from_amazon_jp(html, text)
+        if s: 
+            stock = s
+        price = price_from_amazon_jp(html, text)
 
-    # ここで何も取れず、かつ URL が詳細形でない場合 → HTMLから詳細URLを推定して再取得（Amazon専用）
-    if (price is None and stock in ("UNKNOWN", None, "")) and not re.search(r"/(dp|gp/product)/", url):
-        try:
-            dp_url = _amz_guess_dp_url(host, url, html)
-        except Exception:
-            dp_url = None
-
-        if dp_url:
+        # ここで何も取れず、かつ URL が詳細形でない場合 → HTMLから詳細URLを推定して再取得（Amazon専用）
+        if (price is None and stock in ("UNKNOWN", None, "")) and not re.search(r"/(dp|gp/product)/", url):
             try:
-                amz_html2 = fetch_html(dp_url)  # ★ Amazonだけの再取得
-                amz_text2 = strip_tags(amz_html2).replace("\u3000", " ").replace("\u00A0", " ")
-                s2 = stock_from_amazon_jp(amz_html2, amz_text2)
-                if s2: stock = s2
-                p2 = price_from_amazon_jp(amz_html2, amz_text2)
-                if p2: price = p2
-                if debug:
-                    print("[AMZ] follow dp:", dp_url, " len=", len(amz_html2), " price=", p2, " stock=", s2)
+                dp_url = _amz_guess_dp_url(host, url, html)
             except Exception:
-                pass
+                dp_url = None
+
+            if dp_url:
+                try:
+                    amz_html2 = fetch_html(dp_url)  # ★ Amazonだけの再取得
+                    amz_text2 = strip_tags(amz_html2).replace("\u3000", " ").replace("\u00A0", " ")
+                    s2 = stock_from_amazon_jp(amz_html2, amz_text2)
+                    if s2: stock = s2
+                    p2 = price_from_amazon_jp(amz_html2, amz_text2)
+                    if p2: price = p2
+                    if debug:
+                        print("[AMZ] follow dp:", dp_url, " len=", len(amz_html2), " price=", p2, " stock=", s2)
+                except Exception:
+                    pass
 
     # Mercari 
     elif ("mercari" in host) or ("jp.mercari.com" in host):
