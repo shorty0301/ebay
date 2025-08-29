@@ -928,13 +928,14 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         ))
 
     if _suspect(html, text) and "_strong_get_html" in globals():
-    try:
-        strong = _strong_get_html(url)
-        if strong and len(strong) > len(html):
-            html = strong
-            text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
-    except Exception:
-        pass
+        try:
+            strong = _strong_get_html(url)
+            if strong and len(strong) > len(html):
+                html = strong
+                text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
+        except Exception:
+            pass
+            
     if debug:
         print(f"[DEBUG] host={host}")
 
