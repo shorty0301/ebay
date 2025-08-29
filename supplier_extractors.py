@@ -206,18 +206,60 @@ def price_from_rakuma(html: str, text: str) -> int | None:
     return None
 
 def price_from_surugaya(html: str, text: str) -> int | None:
-    # 駿河屋
-    cands = []
-    for m in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})', html):
-        v = to_int_yen(m.group(1))
-        if v: cands.append(v)
-    for m in re.finditer(r'(?:販売価格|税込|税抜)[^0-9¥￥]{0,10}([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})', text):
-        v = to_int_yen(m.group(1))
-        if v: cands.append(v)
-    for m in re.finditer(r'(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円', text):
-        v = to_int_yen(m.group(1))
-        if v: cands.append(v)
-    return min(cands) if cands else None
+    """
+    駿河屋 価格抽出
+    優先度:
+      1) JSON-LD / meta の price
+      2) 「販売価格/税込/通販価格/ネット価格」近傍
+      3) 末尾が「円」の金額（保険）
+    除外: 買取価格/定価/参考価格/ポイント/割引/送料 等
+    """
+    def to_v(s): return to_int_yen(s)
+
+    # --- 1) 構造化データ（最優先） ---
+    for rx in [
+        r'"price"\s*:\s*"?(\d{2,8})"?',
+        r'"lowPrice"\s*:\s*"?(\d{2,8})"?',
+        r'itemprop=["\']price["\'][^>]*content=["\']?(\d{2,8})',
+        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{2,8})',
+    ]:
+        m = re.search(rx, html, re.I)
+        if m:
+            v = to_v(m.group(1))
+            if v: return v
+
+    # --- 2) ラベル近傍 ---
+    STOP = re.compile(r"(ポイント|pt|還元|%|％|クーポン|OFF|円OFF|割引|値引|送料|手数料|相当|円相当|定価|参考価格|買取価格)", re.I)
+    LABEL = re.compile(r"(販売価格|税込価格|税込|税抜|通販価格|ネット価格|価格)", re.I)
+    YEN   = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
+
+    cands: list[int] = []
+    P = re.compile(r"(販売価格|税込価格|税込|税抜|通販価格|ネット価格|価格)[^\d¥￥]{0,12}("+YEN+")", re.I)
+    for m in P.finditer(text[:20000]):
+        s = m.group(2)
+        v = to_v(s)
+        if not v: 
+            continue
+        ctx = text[max(0, m.start()-100): m.end()+100]
+        if STOP.search(ctx): 
+            continue
+        cands.append(v)
+
+    if cands:
+        return min(cands)
+
+    # --- 3) 保険：末尾が「円」の金額（上部優先 & ノイズ除外） ---
+    head = text[:7000]
+    for m in re.finditer(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})\s*円", head):
+        s = m.group(1)
+        ctx = head[max(0, m.start()-60): m.end()+60]
+        if STOP.search(ctx): 
+            continue
+        v = to_v(s)
+        if v: 
+            return v
+
+    return None
 
 def price_from_yahoo_auction(html: str, text: str) -> int | None:
     """ヤフオク価格抽出"""
@@ -243,14 +285,6 @@ def price_from_yahoo_auction(html: str, text: str) -> int | None:
         if m:
             v = to_v(m.group(1))
             if v: return v
-    return None
-
-def stock_from_yahoo_auction(html: str, text: str) -> str | None:
-    """ヤフオク在庫判定（=出品状態）"""
-    if re.search(r"(終了しました|落札されました|出品終了|このオークションは終了)", text):
-        return "OUT_OF_STOCK"
-    if re.search(r"(入札する|即決で落札|今すぐ落札|入札受付中)", text):
-        return "IN_STOCK"
     return None
 
 def price_from_yshopping(html: str, text: str) -> int | None:
@@ -318,7 +352,6 @@ def price_from_yshopping(html: str, text: str) -> int | None:
     best = max(s for s,_ in cands)
     return min(v for s,v in cands if s == best)
 
-
 def price_from_paypay_fleamarket(html: str, text: str) -> int | None:
     """
     PayPayフリマ 価格抽出（行スキャン+ボタン近傍+保険）
@@ -379,7 +412,81 @@ def price_from_paypay_fleamarket(html: str, text: str) -> int | None:
 
     return None
 
+def stock_from_surugaya(html: str, text: str) -> str | None:
+    """
+    駿河屋 在庫判定
+    優先: JSON-LD availability → 画面テキスト
+    例: 「カートに入れる」=在庫あり / 「売り切れました」=在庫なし
+    記号: 在庫：×/△/○ などにも対応
+    """
+    # JSON-LD
+    m = re.search(r'itemprop=["\']availability["\'][^>]*(InStock|OutOfStock)', html, re.I)
+    if m:
+        return "IN_STOCK" if re.search(r'InStock', m.group(0), re.I) else "OUT_OF_STOCK"
 
+    # 強い否定
+    if re.search(r"(売り切れ|在庫切れ|在庫なし|品切れ|販売終了|取扱い終了|お取り扱いできません)", text):
+        return "OUT_OF_STOCK"
+
+    # 記号ベース
+    # 例: 在庫：× / 通販在庫：× / 在庫：△（残少） / 在庫：○
+    if re.search(r"(在庫|通販在庫)\s*[:：]?\s*[×✕ｘX]", text):
+        return "OUT_OF_STOCK"
+    if re.search(r"(在庫|通販在庫)\s*[:：]?\s*[○〇◯]", text):
+        return "IN_STOCK"
+    if re.search(r"(在庫|通販在庫)\s*[:：]?\s*[△▲]", text):
+        return "LAST_ONE"
+
+    # 残り数量
+    m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", text)
+    if m:
+        n = int(z2h_digits(m.group(1)))
+        return "LAST_ONE" if n == 1 else "IN_STOCK"
+
+    # 購入系
+    if re.search(r"(カートに入れる|今すぐ購入|購入手続き|ご注文|注文手続き)", text):
+        return "IN_STOCK"
+
+    return None
+
+def stock_from_rakuma(html: str, text: str) -> str | None:
+    """
+    Rakuma/Fril 在庫判定
+    - JSON内の sold/sold_out を優先
+    - SOLD OUT 表示や購入ボタンで判定
+    """
+    # JSONの状態
+    if re.search(r'"(status|itemState|availability)"\s*:\s*"?(sold[_\- ]?out|sold)"?', html, re.I):
+        return "OUT_OF_STOCK"
+    if re.search(r'itemprop=["\']availability["\'][^>]*OutOfStock', html, re.I):
+        return "OUT_OF_STOCK"
+
+    # 画面テキスト
+    if re.search(r"(SOLD\s*OUT|売り切れ|在庫なし|販売終了|売り切れました)", text, re.I):
+        return "OUT_OF_STOCK"
+
+    # 購入系（在庫あり）
+    if re.search(r"(購入手続き|購入に進む|カートに入れる|今すぐ購入)", text):
+        return "IN_STOCK"
+
+    # ラスト1
+    if re.search(r"(残り\s*1\s*(?:点|個|枚|本)|ラスト\s*1)", text):
+        return "LAST_ONE"
+
+    # HTMLの soldout クラス
+    if re.search(r"(sold[\s_\-]?out)", html, re.I):
+        return "OUT_OF_STOCK"
+
+    return None
+
+def stock_from_yahoo_auction(html: str, text: str) -> str | None:
+    """ヤフオク在庫判定（=出品状態）"""
+    if re.search(r"(終了しました|落札されました|出品終了|このオークションは終了)", text):
+        return "OUT_OF_STOCK"
+    if re.search(r"(入札する|即決で落札|今すぐ落札|入札受付中)", text):
+        return "IN_STOCK"
+    return None
+    
 def stock_from_paypay_fleamarket(html: str, text: str) -> str | None:
     """PayPayフリマ在庫判定"""
     if re.search(r"(売り切れました|SOLD\s*OUT|在庫なし|販売終了)", text, re.I):
@@ -506,15 +613,13 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     # 価格抽出（まずサイト別 → なければ汎用）
     if ("hardoff" in host) or ("offmall" in host) or ("netmall.hardoff.co.jp" in host):
         price = price_from_offmall(html, text)
-    # --- ラクマ専用の在庫上書き ---
+    # --- ラクマ
     elif ("fril" in host) or ("rakuma" in host) or ("fril.jp" in host) or ("rakuma.rakuten.co.jp" in host):
         # 在庫は専用ロジック
         s = stock_from_rakuma(html, text)
         if s:
             stock = s
         price = price_from_rakuma(html, text)
-    elif ("suruga-ya" in host) or ("surugaya" in host):
-        price = price_from_surugaya(html, text)
     # --- ヤフオク ---
     elif "auctions.yahoo.co.jp" in host:
          s = stock_from_yahoo_auction(html, text)
@@ -531,6 +636,11 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         s = stock_from_yshopping(html, text)
         if s: stock = s
         price = price_from_yshopping(html, text)
+    # 駿河屋
+    elif ("suruga-ya" in host) or ("surugaya" in host):
+        s = stock_from_surugaya(html, text)
+        if s: stock = s
+        price = price_from_surugaya(html, text)
 
     
 
