@@ -892,7 +892,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
                if strong and len(strong) > len(html):
                    html = strong
                    text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
-            except Exception:
+           except Exception:
                 pass
 
     # ← host と text を作った直後に追加
