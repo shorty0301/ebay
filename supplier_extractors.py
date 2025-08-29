@@ -174,8 +174,8 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_rakuma(html, text)
     elif ("suruga-ya" in host) or ("surugaya" in host):
         price = price_from_surugaya(html, text)
+        
     if price is None:
-    
     STOP = re.compile(r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計\s*\d+|合計金額ではない|%|％)", re.I)
     UNIT_NOISE = re.compile(r"(個|点|件|cm|mm|g|kg|W|V|GB|MB|TB|時間|日|年|サイズ|型番|JAN|品番)", re.I)
     PRICE_KEY = re.compile(r"(価格|税込|税抜|販売|支払|お支払い|お買い上げ|円|¥|￥)", re.I)
