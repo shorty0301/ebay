@@ -414,40 +414,54 @@ def price_from_paypay_fleamarket(html: str, text: str) -> int | None:
 
 def stock_from_surugaya(html: str, text: str) -> str | None:
     """
-    駿河屋 在庫判定
-    優先: JSON-LD availability → 画面テキスト
-    例: 「カートに入れる」=在庫あり / 「売り切れました」=在庫なし
-    記号: 在庫：×/△/○ などにも対応
+    駿河屋 在庫判定（通販在庫を最優先）
+    優先順位:
+      1) 「通販在庫」表記・在庫数
+      2) 強い否定語（売り切れ/在庫なし/販売終了…）
+      3) 記号（×/○/△）
+      4) 残り数量
+      5) 購入ボタン系
     """
-    # JSON-LD
-    m = re.search(r'itemprop=["\']availability["\'][^>]*(InStock|OutOfStock)', html, re.I)
+    # --- 1) 通販在庫の数値・記号を最優先 ---
+    m = re.search(r"(通販在庫|ネット在庫)\s*(?:数|：|:)?\s*([0-9０-９]+)", text)
     if m:
-        return "IN_STOCK" if re.search(r'InStock', m.group(0), re.I) else "OUT_OF_STOCK"
+        n = int(z2h_digits(m.group(2)))
+        if n <= 0:
+            return "OUT_OF_STOCK"
+        return "LAST_ONE" if n == 1 else "IN_STOCK"
 
-    # 強い否定
+    # 例: 通販在庫：× / ○ / △
+    if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[×✕ｘX]", text):
+        return "OUT_OF_STOCK"
+    if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[○〇◯]", text):
+        return "IN_STOCK"
+    if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[△▲]", text):
+        return "LAST_ONE"
+
+    # --- 2) 強い否定（一般在庫表現）---
     if re.search(r"(売り切れ|在庫切れ|在庫なし|品切れ|販売終了|取扱い終了|お取り扱いできません)", text):
         return "OUT_OF_STOCK"
 
-    # 記号ベース
-    # 例: 在庫：× / 通販在庫：× / 在庫：△（残少） / 在庫：○
-    if re.search(r"(在庫|通販在庫)\s*[:：]?\s*[×✕ｘX]", text):
+    # --- 3) 一般の記号表現（通販の明記が無い場合）---
+    if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[×✕ｘX]", text):
         return "OUT_OF_STOCK"
-    if re.search(r"(在庫|通販在庫)\s*[:：]?\s*[○〇◯]", text):
+    if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[○〇◯]", text):
         return "IN_STOCK"
-    if re.search(r"(在庫|通販在庫)\s*[:：]?\s*[△▲]", text):
+    if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[△▲]", text):
         return "LAST_ONE"
 
-    # 残り数量
+    # --- 4) 残り数量 ---
     m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", text)
     if m:
         n = int(z2h_digits(m.group(1)))
         return "LAST_ONE" if n == 1 else "IN_STOCK"
 
-    # 購入系
+    # --- 5) 購入ボタン系（在庫ありのシグナル）---
     if re.search(r"(カートに入れる|今すぐ購入|購入手続き|ご注文|注文手続き)", text):
         return "IN_STOCK"
 
     return None
+
 
 def stock_from_rakuma(html: str, text: str) -> str | None:
     """
