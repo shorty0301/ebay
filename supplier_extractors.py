@@ -573,10 +573,9 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
     Amazon.co.jp 価格抽出（現行価格を最優先）
-    優先度: class="priceToPay" 直近 > data-a-color="price" 直近
-          > corePriceDisplay_desktop_feature_div / apex_desktop / corePrice_feature_div 内の a-offscreen
-          > 既存ID（旧UI） > 構造化データ > テキスト保険
-    ※ 打消し/参考価格（a-text-price/strike/basisPrice等）や単価表記（￥247/袋）は除外
+    - class="priceToPay" / data-a-color="price" 近傍を最優先
+    - 打消し/参考価格ブロック(a-text-price/strike/basisPrice等)は除去
+    - 「単価(¥247/袋 など)」は “小さい数字(<=999)” のときだけ除外
     """
     H = str(html or "")
     T = str(text or "")
@@ -584,7 +583,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     def to_v(s: str) -> int | None:
         return to_int_yen(s)
 
-    # --- 打消し/参考価格ブロックを丸ごと除去（先にノイズを削ってから探す） ---
+    # ---- 打消し/参考価格ブロック除去 ----
     def drop_old_price_blocks(s: str) -> str:
         B = str(s or "")
         patterns = [
@@ -600,9 +599,9 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
 
     H2 = drop_old_price_blocks(H)
 
-    # --- 1) class="priceToPay" 直近の a-offscreen（最優先＝今の支払額） ---
+    # ---- 1) class="priceToPay" 直近（最優先） ----
     m = re.search(
-        r'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\'][\s\S]{0,600}?class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<',
+        r'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\'][\s\S]{0,1000}?class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<',
         H2, re.I
     )
     if m:
@@ -610,9 +609,9 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if v:
             return v
 
-    # --- 2) data-a-color="price" 直近（実価格の色指定が付くことが多い） ---
+    # ---- 2) data-a-color="price" 直近（次点）----
     m = re.search(
-        r'data-a-color\s*=\s*["\']price["\'][\s\S]{0,400}?class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<',
+        r'data-a-color\s*=\s*["\']price["\'][\s\S]{0,600}?class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<',
         H2, re.I
     )
     if m:
@@ -620,7 +619,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if v:
             return v
 
-    # --- 3) 価格ブロック内の a-offscreen を収集して最安を採用（参考価格は除去済み） ---
+    # ---- 3) 主要価格ブロック内の a-offscreen を収集（参考/打消しは除去済み）----
     blocks: list[str] = []
     for bid, span in (
         ("corePriceDisplay_desktop_feature_div", 6000),
@@ -632,21 +631,36 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             blocks.append(mm.group(1))
 
     cands: list[int] = []
+
+    # 単価（/袋 など）の除外判定：値が小さい(<=999)時だけ単価扱いにする
+    def is_unit_price(ctx: str, val: int) -> bool:
+        if val is None:
+            return False
+        if val <= 999 and re.search(r"[\/／]\s*(?:袋|個|枚|本|ml|mL|L|g|kg|mm|cm|GB|MB|TB)", ctx):
+            return True
+        return False
+
     for blk in blocks:
         for mm in re.finditer(r'class=["\']a-offscreen["\']\s*>\s*[¥￥]\s*([\d,，]{3,10})<', blk, re.I):
+            i = mm.start()
             v = to_v(mm.group(1))
-            if v:
-                cands.append(v)
-        # whole だけの表記も一応拾う（円は小数なし想定）
+            if not v:
+                continue
+            ctx = blk[max(0, i-160): i+160]
+            if is_unit_price(ctx, v):
+                continue  # 例: ¥247/袋 などは除外（ただし 1728 は除外しない）
+            cands.append(v)
+
+        # whole だけの表記も拾う（円は小数なし想定）
         for mm in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
             v = to_v(mm.group(1))
-            if v:
+            if v and not is_unit_price(blk, v):
                 cands.append(v)
 
     if cands:
-        return min(cands)  # 参考価格が高く残っても最安=現行価格が選ばれやすい
+        return min(cands)  # 通常: 現行価格(1728)が最安、参考価格(1996)は高い
 
-    # --- 4) 旧UIのID（保険） ---
+    # ---- 4) 旧UIのID（保険）----
     for id_ in ("priceblock_dealprice", "priceblock_ourprice", "price_inside_buybox"):
         m = re.search(r'id=["\']%s["\'][\s\S]{0,300}?[¥￥]\s*([\d,，]{3,10})' % id_, H2, re.I)
         if m:
@@ -654,7 +668,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             if v:
                 return v
 
-    # --- 5) 構造化データ / meta（参考の値になることがあるので最後） ---
+    # ---- 5) 構造化データ / meta（最後）----
     for rx in [
         r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?([\d,，]{1,10})',
         r'itemprop=["\']price["\'][^>]*content=["\']?([\d,，]{1,10})',
@@ -667,23 +681,19 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             if v:
                 return v
 
-    # --- 6) テキスト保険：単価/ポイント/参考 近傍は除外 ---
+    # ---- 6) テキスト保険（単価/ポイント/参考の近傍は除外）----
     STOP = re.compile(r"(参考価格|定価|希望小売価格|通常価格|リスト価格|List\s*Price|ポイント|pt|還元|クーポン|OFF|円OFF|割引|最大|上限|%|％|実質|相当|円相当|ギフト券)", re.I)
-    def is_unit_price(ctx: str) -> bool:
-        if re.search(r"[\/／]\s*[¥￥]?\s*\d", ctx):  # 例: ￥247/袋
-            return True
-        if re.search(r"(袋|個|枚|本|ml|mL|L|g|kg|mm|cm|GB|MB|TB)", ctx):
-            return True
-        return False
-
     for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", T[:40000]):
         i = m.start()
-        ctx = T[max(0, i-140): i+140]
-        if STOP.search(ctx) or is_unit_price(ctx):
-            continue
         v = to_v(m.group(1))
-        if v:
-            return v
+        if not v:
+            continue
+        ctx = T[max(0, i-140): i+140]
+        if STOP.search(ctx):
+            continue
+        if is_unit_price(ctx, v):
+            continue
+        return v
 
     return None
 
