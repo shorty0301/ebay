@@ -318,51 +318,64 @@ def price_from_yshopping(html: str, text: str) -> int | None:
     best = max(s for s,_ in cands)
     return min(v for s,v in cands if s == best)
 
+
 def price_from_paypay_fleamarket(html: str, text: str) -> int | None:
     """
-    PayPayフリマの商品ページ価格。
-    ページ上部の大きい「600円」「○○円」を最優先。
-    クーポン/実質/相当/pt/PayPay 等は除外。
+    PayPayフリマ 価格抽出（行スキャン+ボタン近傍+保険）
+    - まず見出しの「○○円」だけが書かれた行を優先
+    - 次に『購入手続きへ』近傍の金額
+    - それでもなければ先頭域から¥付き金額を保険で拾う
+    - クーポン/実質/相当/pt/PayPay/%/OFF 等は除外
     """
     def to_v(s): return to_int_yen(s)
 
-    head = text[:3000]  # 見出し～購入ボタン付近
+    STOP = re.compile(r"(クーポン|適用|実質|相当|円相当|ポイント|pt|PayPay|%|％|OFF|円OFF|割引|最大|上限|ボーナス|還元)", re.I)
+    # 「600円」「12,300円」など（カンマ・全角半角対応）
+    LINE_PRICE = re.compile(r"^(?:[¥￥]?\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円$")
+    # 任意の場所に現れる金額（保険用）
+    ANY_PRICE = re.compile(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円")
 
-    STOP = re.compile(r"(クーポン|適用で|実質|相当|円相当|ポイント|pt|PayPay|%|％|OFF|円OFF|割引|最大|上限)", re.I)
-
-    # 1) 見出しの「^\s*¥?1234円」形式（最優先）
-    p1 = re.compile(r"^\s*(?:[¥￥]?\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", re.M)
-    for m in p1.finditer(head):
-        s = m.group(1)
-        i = m.start(1)
-        ctx = head[max(0, i-60): i+60]
-        if STOP.search(ctx): 
+    # 1) 行スキャン：上の方に出る“素の価格行”を最優先
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines[:120]:  # 冒頭〜120行くらいを見る
+        if STOP.search(ln):
             continue
-        v = to_v(s)
-        if v: return v
+        m = LINE_PRICE.match(ln)
+        if m:
+            v = to_v(m.group(1))
+            if v:
+                return v
 
-    # 2) 「購入手続きへ」ボタン近傍の金額
-    btn = re.search(r"(購入手続きへ|購入に進む)", head)
+    # 2) 『購入手続きへ / 購入に進む』近傍の金額を拾う
+    joined = "\n".join(lines)
+    btn = re.search(r"(購入手続きへ|購入に進む)", joined)
     if btn:
         i = btn.start()
-        ctx = head[max(0, i-600): i+600]
-        for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", ctx):
-            s = m.group(1)
-            win = ctx[max(0, m.start()-60): m.end()+60]
-            if STOP.search(win): 
+        ctx = joined[max(0, i-1200): i+1200]  # ボタン周辺を広めに
+        for m in ANY_PRICE.finditer(ctx):
+            win = ctx[max(0, m.start()-80): m.end()+80]
+            if STOP.search(win):
                 continue
-            v = to_v(s)
-            if v: return v
+            v = to_v(m.group(1))
+            if v:
+                return v
 
-    # 3) 保険：先頭から最初に出る「¥付き金額」（ノイズ除外）
-    for m in re.finditer(r"[¥￥]\s*(\d{1,3}(?:[,，]\d{3})+|\d{3,7})", head):
-        s = m.group(1)
-        i = m.start(1)
-        ctx = head[max(0, i-60): i+60]
-        if STOP.search(ctx): 
+    # 3) 保険：先頭域（見出し〜説明）の¥付き金額から、STOP近傍を除いて最初の1つ
+    head = text[:5000]
+    for m in ANY_PRICE.finditer(head):
+        win = head[max(0, m.start()-60): m.end()+60]
+        if STOP.search(win):
             continue
-        v = to_v(s)
-        if v: return v
+        v = to_v(m.group(1))
+        if v:
+            return v
+
+    # 4) 最終保険：HTMLの price っぽい数値
+    m = re.search(r'"price"\s*:\s*"?(\d{2,8})"?', html, re.I)
+    if m:
+        v = to_v(m.group(1))
+        if v:
+            return v
 
     return None
 
