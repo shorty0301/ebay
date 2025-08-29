@@ -614,7 +614,7 @@ def stock_from_amazon_jp(html: str, text: str) -> str | None:
 
     # 在庫あり UI
     if re.search(r"(在庫あり|カートに入れる|今すぐ買う|今すぐ購入)", t):
-        m = re.search(r"残り\s*([0-9０-９]+)\s*点", t)
+        m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", t)
         if m:
             n = int(z2h_digits(m.group(1)))
             return "LAST_ONE" if n == 1 else "IN_STOCK"
@@ -1042,6 +1042,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
                 "unavail":    bool(re.search(r"(現在お取り扱いできません|Currently unavailable)", T, re.I)),
                 "robot":      bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", H, re.I)),
             })
+
         s = stock_from_amazon_jp(html, text)
         if s: stock = s
         price = price_from_amazon_jp(html, text)
