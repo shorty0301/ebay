@@ -75,68 +75,82 @@ def to_int_yen(s: str) -> int | None:
 
 # ========== fetch_html ==========
 def fetch_html(url: str) -> str:
+    ua_pc  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
+    ua_sp  = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    headers = lambda ua: {"User-Agent": ua, "Accept-Language": "ja,en;q=0.8"}
+
+    def try_get(u, ua):
+        try:
+            r=requests.get(u, headers=headers(ua), timeout=20)
+            if r.status_code==200: return r.text
+        except: return ""
+        return ""
+
+    html_pc = try_get(url, ua_pc)
+    html_mb = try_get(url, ua_sp)
+    return (html_pc or "") + "\n<!-- MOBILE MERGE -->\n" + (html_mb or "")
+
+# ======== 強い取得（対象3サイト専用） =========
+def _strong_get_html(url: str) -> str:
     """
-    PC/モバイルを取りに行き、ロボットチェック/同意ページなどを検出したら
-    もう一方のUAで再試行。最終的に得られたものを連結して返す。
+    Amazon/Rakuten/Mercari専用の強化GET。
+    - Google参照元/各種 sec-ch ヘッダを付与
+    - PC/MB で取得、短小HTMLやブロック文言なら別UAに再試行
+    戻りは旧fetch_htmlと同じPC+MB連結
     """
     import requests, re
 
-    UA_PC = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-    UA_MB = (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-    )
+    def blocked(s: str) -> bool:
+        if not s or len(s) < 800:
+            return True
+        t = s.lower()
+        return bool(re.search(
+            r"(captcha|robot|are you a robot|enable cookies|javascriptを有効|cookie|アクセスが集中|ただいまアクセス|redirecting\.\.\.)",
+            t))
 
-    BASE_HEADERS = {
+    UA_PC = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    UA_MB = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
+
+    BASE = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "DNT": "1",
+        "Referer": "https://www.google.com/",
+        # ここから “それっぽさ” を追加（無くても他サイトに影響なし）
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
     }
 
-    def blocked(s: str) -> bool:
-        """ロボット/同意/空HTMLなどを検出"""
-        if not s or len(s) < 800:
-            return True
-        t = s.lower()
-        return bool(re.search(
-            r"(robot check|captcha|are you a robot|enable cookies|ブラウザの設定でcookie|javascriptを有効|アクセスが集中|ただいまアクセスが|redirecting\.\.\.)",
-            t))
-
     def try_get(ua: str) -> str:
-        headers = dict(BASE_HEADERS)
-        headers["User-Agent"] = ua
+        h = dict(BASE); h["User-Agent"] = ua
         try:
-            with requests.Session() as sess:
-                sess.headers.update(headers)
-                r = sess.get(url, timeout=25, allow_redirects=True)
+            with requests.Session() as s:
+                s.headers.update(h)
+                r = s.get(url, timeout=25, allow_redirects=True)
                 if r.status_code == 200 and r.text:
                     return r.text
         except Exception:
             return ""
         return ""
 
-    html_pc = try_get(UA_PC)
-    if blocked(html_pc):
-        # PC がブロック気味 → MB 先行で再取得
-        html_mb = try_get(UA_MB)
-        # もう一度PCも軽く再試行（MB経由で緩むケースあり）
-        if blocked(html_pc):
-            html_pc = try_get(UA_PC)
+    pc = try_get(UA_PC)
+    if blocked(pc):
+        mb = try_get(UA_MB)
+        if blocked(pc):
+            pc = try_get(UA_PC)
     else:
-        html_mb = try_get(UA_MB)
-        if blocked(html_mb):
-            html_mb = try_get(UA_MB)  # もう一回だけ
+        mb = try_get(UA_MB)
+        if blocked(mb):
+            mb = try_get(UA_MB)
 
-    return (html_pc or "") + "\n<!-- MOBILE MERGE -->\n" + (html_mb or "")
-
+    return (pc or "") + "\n<!-- MOBILE MERGE -->\n" + (mb or "")
 
 # ========== サイト別価格抽出 ==========
 def price_from_offmall(html: str, text: str) -> int | None:
