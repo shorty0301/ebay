@@ -571,38 +571,78 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    def to_v(s): return to_int_yen(s)
-    H, T = str(html or ""), str(text or "")
+    """
+    Amazon.co.jp 価格抽出（現行価格優先）
+    優先度: priceToPay内のa-offscreen > corePrice内のa-offscreen(※参考価格を除外)
+          > 既存price系ID > 構造化データ > テキスト保険
+    """
+    H = str(html or "")
+    T = str(text or "")
 
-    # 優先: buybox/corePrice/priceToPay/a-offscreen
-    for rx in [
-        r'id=["\']corePrice_feature_div["\'][\s\S]{0,400}?[¥￥]\s*([\d,，]{3,10})',
-        r'id=["\']priceToPay["\'][\s\S]{0,200}?[¥￥]\s*([\d,，]{3,10})',
-        r'class=["\']a-offscreen["\']>\s*[¥￥]\s*([\d,，]{3,10})<',
-    ]:
-        m = re.search(rx, H, re.I)
+    def to_v(s: str) -> int | None:
+        return to_int_yen(s)
+
+    # 参考価格系のキーワード（この近傍の値は“旧価格”扱いで除外）
+    LIST = re.compile(r"(参考価格|定価|希望小売価格|通常価格|リスト価格|List\s*Price)", re.I)
+    STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|最大|上限|%|％|実質|相当|円相当|ギフト券)", re.I)
+
+    # 1) priceToPay ブロック直下の a-offscreen（最優先＝今支払う額）
+    m = re.search(
+        r'id=["\']priceToPay["\'][\s\S]{0,500}?class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<',
+        H, re.I
+    )
+    if m:
+        v = to_v(m.group(1))
+        if v:
+            return v
+
+    # 2) corePrice_feature_div 内の a-offscreen（参考価格/打消し周辺は除外）
+    m = re.search(r'id=["\']corePrice_feature_div["\']([\s\S]{0,1500})</', H, re.I)
+    if m:
+        block = m.group(1)
+        for m2 in re.finditer(r'class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<', block, re.I):
+            around = block[max(0, m2.start()-160): m2.end()+160]
+            if re.search(r"(a-text-price|strike|priceBlockStrikePriceString)", around, re.I):
+                continue  # 打消し価格 = 旧価格
+            if LIST.search(around):
+                continue     # 参考価格/定価 などは除外
+            v = to_v(m2.group(1))
+            if v:
+                return v
+
+    # 3) 既存の price系 ID
+    for id_ in ("priceblock_dealprice", "priceblock_ourprice", "price_inside_buybox"):
+        m = re.search(r'id=["\']%s["\'][\s\S]{0,200}?[¥￥]\s*([\d,，]{3,10})' % id_, H, re.I)
         if m:
             v = to_v(m.group(1))
-            if v: return v
+            if v:
+                return v
 
-    # 構造化データの保険
+    # 4) 構造化データ / meta
     for rx in [
         r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?([\d,，]{1,10})',
         r'itemprop=["\']price["\'][^>]*content=["\']?([\d,，]{1,10})',
         r'"price"\s*:\s*"?([\d,，]{1,10})"?',
+        r'data-asin-price\s*=\s*["\']?([\d,，]{1,10})',
     ]:
         m = re.search(rx, H, re.I)
         if m:
             v = to_v(m.group(1))
-            if v: return v
+            if v:
+                return v
 
-    # ★ fallback: 汎用ロジックで最初に出た「¥xxxx円」
-    m = re.search(r"[¥￥]\s*([\d,，]{3,10})\s*円", T)
-    if m:
+    # 5) テキスト保険：近傍に参考価格/ポイント等がある候補は捨てる
+    for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", T[:40000]):
+        i = m.start()
+        ctx = T[max(0, i-120): i+120]
+        if STOP.search(ctx) or LIST.search(ctx):
+            continue
         v = to_v(m.group(1))
-        if v: return v
+        if v:
+            return v
 
     return None
+
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
