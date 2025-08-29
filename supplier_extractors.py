@@ -760,12 +760,54 @@ def price_from_mercari(html: str, text: str) -> int | None:
     return None
 
 def price_from_rakuten_ichiba(html: str, text: str) -> int | None:
-    """
-    楽天市場 価格抽出（構造化 → 購入ボックス近傍スコアリング → ラベル近傍 → 保険）
-    送料/ポイント/クーポン周辺は除外
-    """
     def to_v(s): return to_int_yen(s)
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for sc in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+            raw = (sc.string or sc.get_text() or "").strip()
+            if not raw:
+                continue
+            # JSON が配列/オブジェクト/コメント混じりでも頑張って読む
+            try:
+                 data = json.loads(raw)
+            except Exception:
+                # 末尾の , やコメントで壊れているケースの簡易修正
+                raw2 = re.sub(r"//.*?$|/\*.*?\*/", "", raw, flags=re.S|re.M)
+                raw2 = re.sub(r",\s*([}\]])", r"\1", raw2)
+                try:
+                    data = json.loads(raw2)
+                except Exception:
+                    continue
 
+            def walk(x):
+                if isinstance(x, dict):
+                    # price のキー
+                    if "price" in x:
+                        v = to_v(str(x["price"]))
+                        if v:
+                            return v
+                    # offers の下に price があることが多い
+                    if "offers" in x:
+                        v = walk(x["offers"])
+                        if v:
+                            return v
+                    for v2 in x.values():
+                        v = walk(v2)
+                        if v:
+                            return v
+                elif isinstance(x, list):
+                    for it in x:
+                        v = walk(it)
+                        if v:
+                            return v
+                return None
+
+            v = walk(data)
+            if v:
+                return v
+    except Exception:
+        pass 
+        
     # 1) 構造化データ / meta / data-*（カンマ・円付きもOK）
     for rx in [
         r'"price"\s*:\s*"?([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?"?',   # ← 追加
@@ -882,18 +924,16 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     m_host = re.search(r"https?://([^/]+)/?", url)
     host = m_host.group(1).lower() if m_host else ""
     text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
-    # host / text を作った直後に追加（既存の3サイト用ブロックはそのままでもOK）
+    # 楽天は必ず強化取得で取り直し（他サイト無影響）
     if "rakuten.co.jp" in host:
-        BUY = re.compile(r"(購入手続き|購入手続きへ|買い物かごに入れる|かごに追加|かごに入れる)")
-        need_refetch = (not BUY.search(text)) or (not re.search(r'"price"\s*:', html))
-        if need_refetch:
-           try:
-               strong = _strong_get_html(url)
-               if strong and len(strong) > len(html):
-                   html = strong
-                   text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
-           except Exception:
-                pass
+        try:
+            strong = _strong_get_html(url)
+            if strong:
+                html = strong
+                text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
+    except Exception:
+        pass
+
 
     # ← host と text を作った直後に追加
     # 3サイトだけ、取得HTMLが怪しい時に強化取得で再フェッチ（他サイトには一切影響なし）
