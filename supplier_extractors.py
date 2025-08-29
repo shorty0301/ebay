@@ -140,19 +140,42 @@ def price_from_offmall(html: str, text: str) -> int | None:
     best = max(s for s, _ in cands)
     return min(v for s, v in cands if s == best)
 
-
-
-
 def price_from_rakuma(html: str, text: str) -> int | None:
-    # Rakuma/Fril
-    cands = []
+    """
+    Rakuma/Fril 価格抽出
+    - JSON/LD や埋め込みJSONの "price" を最優先
+    - テキストは ¥ / 円 近傍を優先
+    """
+    def add(lst, s, score):
+        v = to_int_yen(s)
+        if v and 0 < v < 10_000_000:
+            lst.append((score, v))
+
+    cands: list[tuple[int, int]] = []
+
+    # 1) 構造化データ / 埋め込みJSON
     for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
-        v = to_int_yen(m.group(1))
-        if v: cands.append(v)
-    for m in re.finditer(r'(?:[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円', text):
-        v = to_int_yen(m.group(0))
-        if v: cands.append(v)
-    return min(cands) if cands else None
+        add(cands, m.group(1), 8)
+    for m in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})', html):
+        add(cands, m.group(1), 8)
+
+    # 2) 画面テキスト（¥/円 近傍を優先）
+    PRICE_WORD = re.compile(r"(価格|税込|税抜|販売|円|¥|￥)", re.I)
+    pat = re.compile(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})(?:\s*円)?")
+    for m in pat.finditer(text):
+        s = m.group(1)
+        i = m.start(1)
+        ctx = text[max(0, i-32): i+len(s)+32]
+        score = 0
+        if re.search(r"[¥￥]|円", s) or re.search(r"[¥￥]|円", ctx): score += 3
+        if PRICE_WORD.search(ctx): score += 2
+        if re.search(r"\d{1,3}(?:[,，]\d{3})+", s): score += 1
+        add(cands, s, score)
+
+    if not cands:
+        return None
+    best = max(s for s, _ in cands)
+    return min(v for s, v in cands if s == best)
 
 
 def price_from_surugaya(html: str, text: str) -> int | None:
@@ -168,6 +191,35 @@ def price_from_surugaya(html: str, text: str) -> int | None:
         v = to_int_yen(m.group(1))
         if v: cands.append(v)
     return min(cands) if cands else None
+def stock_from_rakuma(html: str, text: str) -> str | None:
+    """
+    Rakuma/Fril 在庫判定
+    - JSON内の sold/sold_out を優先
+    - SOLD OUT 表示や購入ボタンで判定
+    """
+    # JSONの状態
+    if re.search(r'"(status|itemState|availability)"\s*:\s*"?(sold[_\- ]?out|sold)"?', html, re.I):
+        return "OUT_OF_STOCK"
+    if re.search(r'itemprop=["\']availability["\'][^>]*OutOfStock', html, re.I):
+        return "OUT_OF_STOCK"
+
+    # 画面テキスト
+    if re.search(r"(SOLD\s*OUT|売り切れ|在庫なし|販売終了)", text, re.I):
+        return "OUT_OF_STOCK"
+
+    # 購入系
+    if re.search(r"(購入手続き|購入に進む|カートに入れる|今すぐ購入)", text):
+        return "IN_STOCK"
+
+    # ラスト1
+    if re.search(r"(残り\s*1\s*(?:点|個|枚|本)|ラスト\s*1)", text):
+        return "LAST_ONE"
+
+    # HTMLの soldout クラス
+    if re.search(r"(sold[\s_\-]?out)", html, re.I):
+        return "OUT_OF_STOCK"
+
+    return None
 
 # ========== 在庫・価格 抽出のメイン ==========
 from typing import Dict, Any
@@ -256,8 +308,12 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     # 価格抽出（まずサイト別 → なければ汎用）
     if ("hardoff" in host) or ("offmall" in host) or ("netmall.hardoff.co.jp" in host):
         price = price_from_offmall(html, text)
-    elif ("fril" in host) or ("rakuma" in host) or ("fril.jp" in host) or ("rakuten" in host):
-        price = price_from_rakuma(html, text)
+    # --- ラクマ専用の在庫上書き ---
+    elif ("fril" in host) or ("rakuma" in host) or ("fril.jp" in host) or ("rakuma.rakuten.co.jp" in host):
+        s = stock_from_rakuma(html, text)
+        if s:
+            stock = s
+
     elif ("suruga-ya" in host) or ("surugaya" in host):
         price = price_from_surugaya(html, text)
 
