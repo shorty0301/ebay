@@ -572,8 +572,8 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp 価格抽出（現行価格優先）
-    優先度: priceToPay内のa-offscreen > corePrice内のa-offscreen(※参考価格を除外)
+    Amazon.co.jp 価格抽出（現行価格を最優先）
+    優先度: priceToPay内のa-offscreen > apex_desktop内のa-offscreen(※打消し/参考価格は除外)
           > 既存price系ID > 構造化データ > テキスト保険
     """
     H = str(html or "")
@@ -582,13 +582,14 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     def to_v(s: str) -> int | None:
         return to_int_yen(s)
 
-    # 参考価格系のキーワード（この近傍の値は“旧価格”扱いで除外）
+    # 参考・打消しのキーワード（近傍にある候補は除外）
     LIST = re.compile(r"(参考価格|定価|希望小売価格|通常価格|リスト価格|List\s*Price)", re.I)
+    STRIKE = re.compile(r"(a-text-price|strike|priceBlockStrikePriceString|a-text-strike)", re.I)
     STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|最大|上限|%|％|実質|相当|円相当|ギフト券)", re.I)
 
-    # 1) priceToPay ブロック直下の a-offscreen（最優先＝今支払う額）
+    # 1) priceToPay 直下の a-offscreen（最優先＝実際に支払う額）
     m = re.search(
-        r'id=["\']priceToPay["\'][\s\S]{0,500}?class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<',
+        r'id=["\']priceToPay["\'][\s\S]{0,800}?class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<',
         H, re.I
     )
     if m:
@@ -596,29 +597,50 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if v:
             return v
 
-    # 2) corePrice_feature_div 内の a-offscreen（参考価格/打消し周辺は除外）
-    m = re.search(r'id=["\']corePrice_feature_div["\']([\s\S]{0,1500})</', H, re.I)
+    # 2) apex_desktop ブロック内の a-offscreen をスコアリング
+    cands: list[tuple[int, int]] = []  # (score, value)
+    m = re.search(r'id=["\']apex_desktop["\']([\s\S]{0,6000})', H, re.I)
     if m:
         block = m.group(1)
         for m2 in re.finditer(r'class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<', block, re.I):
-            around = block[max(0, m2.start()-160): m2.end()+160]
-            if re.search(r"(a-text-price|strike|priceBlockStrikePriceString)", around, re.I):
-                continue  # 打消し価格 = 旧価格
-            if LIST.search(around):
-                continue     # 参考価格/定価 などは除外
+            around = block[max(0, m2.start()-240): m2.end()+240]
+            # 打消し/参考価格は除外
+            if STRIKE.search(around) or LIST.search(around):
+                continue
+            v = to_v(m2.group(1))
+            if not v:
+                continue
+            # priceToPay / data-a-color="price" 近傍を加点
+            score = 10
+            if re.search(r"(priceToPay|data-a-color\s*=\s*['\"]price['\"])", around, re.I):
+                score += 10
+            cands.append((score, v))
+
+    if cands:
+        best = max(s for s, _ in cands)
+        return min(v for s, v in cands if s == best)  # 同点は最安＝現行価格が多い
+
+    # 3) corePrice_feature_div 内（打消し価格は除外）
+    m = re.search(r'id=["\']corePrice_feature_div["\']([\s\S]{0,2000})', H, re.I)
+    if m:
+        block = m.group(1)
+        for m2 in re.finditer(r'class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{3,10})<', block, re.I):
+            around = block[max(0, m2.start()-200): m2.end()+200]
+            if STRIKE.search(around) or LIST.search(around):
+                continue
             v = to_v(m2.group(1))
             if v:
                 return v
 
-    # 3) 既存の price系 ID
+    # 4) 既存の price 系 ID（あれば）
     for id_ in ("priceblock_dealprice", "priceblock_ourprice", "price_inside_buybox"):
-        m = re.search(r'id=["\']%s["\'][\s\S]{0,200}?[¥￥]\s*([\d,，]{3,10})' % id_, H, re.I)
+        m = re.search(r'id=["\']%s["\'][\s\S]{0,300}?[¥￥]\s*([\d,，]{3,10})' % id_, H, re.I)
         if m:
             v = to_v(m.group(1))
             if v:
                 return v
 
-    # 4) 構造化データ / meta
+    # 5) 構造化データ / meta
     for rx in [
         r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?([\d,，]{1,10})',
         r'itemprop=["\']price["\'][^>]*content=["\']?([\d,，]{1,10})',
@@ -631,10 +653,10 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             if v:
                 return v
 
-    # 5) テキスト保険：近傍に参考価格/ポイント等がある候補は捨てる
+    # 6) テキスト保険：近傍に参考価格/ポイント等がある候補は捨てる
     for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", T[:40000]):
         i = m.start()
-        ctx = T[max(0, i-120): i+120]
+        ctx = T[max(0, i-140): i+140]
         if STOP.search(ctx) or LIST.search(ctx):
             continue
         v = to_v(m.group(1))
