@@ -660,6 +660,14 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if STOP.search(ctx):
             continue
         add(50, m.group(1))
+    # 4) fallback: 全文から最初に出た ¥xxxx 円
+    if not cands:
+        m = re.search(r"[¥￥]\s*([\d,，]{3,10})\s*円", T)
+        if m:
+            v = to_v(m.group(1))
+            if v:
+                return v
+    return None
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
@@ -707,7 +715,13 @@ def stock_from_amazon_jp(html: str, text: str) -> str | None:
 
     # 5) 判定不能
     return None
-
+    
+    # 6) fallback: 在庫あり/切れをゆるく判定
+    if "在庫あり" in t:
+        return "IN_STOCK"
+    if "在庫切れ" in t or "売り切れ" in t:
+        return "OUT_OF_STOCK"
+    return None
 
 
 def stock_from_mercari(html: str, text: str) -> str | None:
