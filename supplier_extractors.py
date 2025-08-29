@@ -837,9 +837,6 @@ def stock_from_rakuten_ichiba(html: str, text: str) -> str | None:
 
 
 # ========== 在庫・価格 抽出のメイン ==========
-from typing import Dict, Any
-import re
-
 def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str, Any]:
     """
     戻り値:
@@ -855,7 +852,8 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     qty:   str = ""
     price: Any = None
 
-    host = re.findall(r"https?://([^/]+)/?", url)[0].lower()
+    m_host = re.search(r"https?://([^/]+)/?", url)
+    host = m_host.group(1).lower() if m_host else ""
     text = strip_tags(html).replace("\u3000", " ").replace("\u00A0", " ")
 
     if debug:
@@ -963,10 +961,11 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_mercari(html, text)
 
     # 楽天市場（item系） ---
-    elif ("item.rakuten.co.jp" in host) or ("rakuten.co.jp" in host):
+    elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp") and "/item/" in url):
         s = stock_from_rakuten_ichiba(html, text)
         if s: stock = s
         price = price_from_rakuten_ichiba(html, text)
+
 
 
     if price is None:
