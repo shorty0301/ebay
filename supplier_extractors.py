@@ -11,10 +11,29 @@ from bs4 import BeautifulSoup
 
 # ======== 共通ユーティリティ ==========
 def strip_tags(s: str) -> str:
-    if not s: return ""
+    """HTMLからテキストを抽出（alt/title/aria-labelも補完）"""
+    if not s:
+        return ""
     soup = BeautifulSoup(s, "html.parser")
+
+    # alt/title/aria-label をテキストとして追加
+    for tag in soup.find_all(True):
+        texts = []
+        if tag.has_attr("alt"):
+            texts.append(tag["alt"])
+        if tag.has_attr("title"):
+            texts.append(tag["title"])
+        if tag.has_attr("aria-label"):
+            texts.append(tag["aria-label"])
+        if texts:
+            tag.append(" ".join(texts))
+
+    # テキスト化
     t = soup.get_text(" ", strip=True)
-    return re.sub(r"\s+", " ", t.replace("\u00A0"," ").replace("\u202F"," ").replace("\u2009"," ")).strip()
+    return re.sub(r"\s+", " ",
+                  t.replace("\u00A0", " ")
+                   .replace("\u202F", " ")
+                   .replace("\u2009", " ")).strip()
 
 def z2h_digits(s: str) -> str:
     Z="０１２３４５６７８９"; H="0123456789"
@@ -414,25 +433,25 @@ def price_from_paypay_fleamarket(html: str, text: str) -> int | None:
 
 def stock_from_surugaya(html: str, text: str) -> str | None:
     """
-    駿河屋 在庫判定（カート優先版）
+    駿河屋 在庫判定（画像アイコン/alt・購入UI対応）
     優先度:
-      1) 強い否定（売り切れ等）→ OUT
-      2) カート/数量/購入ボタンの存在 → IN
-      3) 「通販在庫：×/○/△」「通販在庫 数」→ OUT/LAST_ONE/IN
-      4) 一般の在庫記号・残り数量
+      1) 強い否定語（売り切れ/販売終了）
+      2) 購入UI（カート/数量/購入手続き） or add-to-cart系HTML
+      3) 通販在庫（数値 or 記号 ○/△/×）/ 在庫：あり・なし
+      4) 残り数量
     """
-    # --- 1) 強い否定語（まず完全に売り切れ表示を優先） ---
+
+    # 1) 強い否定（まず確定でOUT）
     if re.search(r"(売り切れ|在庫切れ|在庫なし|品切れ|販売終了|取扱い終了|お取り扱いできません)", text):
         return "OUT_OF_STOCK"
 
-    # --- 2) カート/数量/購入ボタンが見えていれば在庫あり ---
-    #   テキストとHTMLの両方で広めに見る
+    # 2) 購入UIが見えていれば在庫あり
     if (re.search(r"(カートに入れる|今すぐ購入|購入手続き|ご注文|注文手続き)", text) or
-        re.search(r"(数量|カート数量)", text) or
+        re.search(r"\b数量\b", text) or
         re.search(r'(add[-\s]?to[-\s]?cart|id=["\']addToCart["\']|name=["\']addToCart["\']|class=["\'][^"\']*add-to-cart)', html, re.I)):
         return "IN_STOCK"
 
-    # --- 3) 「通販在庫」表記（数値/記号） ---
+    # 3-a) 通販在庫：数値
     m = re.search(r"(通販在庫|ネット在庫)\s*(?:数|：|:)?\s*([0-9０-９]+)", text)
     if m:
         n = int(z2h_digits(m.group(2)))
@@ -440,21 +459,21 @@ def stock_from_surugaya(html: str, text: str) -> str | None:
             return "OUT_OF_STOCK"
         return "LAST_ONE" if n == 1 else "IN_STOCK"
 
-    if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[×✕ｘX]", text):
-        return "OUT_OF_STOCK"
-    if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[○〇◯]", text):
+    # 3-b) 在庫：あり/なし（テキスト or alt で入ってくる想定）
+    if re.search(r"(在庫|通販在庫|ネット在庫)\s*[:：]?\s*あり", text):
         return "IN_STOCK"
-    if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[△▲]", text):
+    if re.search(r"(在庫|通販在庫|ネット在庫)\s*[:：]?\s*なし", text):
+        return "OUT_OF_STOCK"
+
+    # 3-c) 記号（○/△/×）— alt 化で text に入ってくる
+    if re.search(r"(通販在庫|ネット在庫|在庫)\s*[:：]?\s*[×✕ｘX]", text):
+        return "OUT_OF_STOCK"
+    if re.search(r"(通販在庫|ネット在庫|在庫)\s*[:：]?\s*[○〇◯]", text):
+        return "IN_STOCK"
+    if re.search(r"(通販在庫|ネット在庫|在庫)\s*[:：]?\s*[△▲]", text):
         return "LAST_ONE"
 
-    # --- 4) 一般の在庫記号・残り数量 ---
-    if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[×✕ｘX]", text):
-        return "OUT_OF_STOCK"
-    if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[○〇◯]", text):
-        return "IN_STOCK"
-    if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[△▲]", text):
-        return "LAST_ONE"
-
+    # 4) 残り数量
     m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", text)
     if m:
         n = int(z2h_digits(m.group(1)))
