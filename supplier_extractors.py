@@ -257,51 +257,74 @@ def stock_from_yahoo_auction(html: str, text: str) -> str | None:
     return None
 
 def price_from_yshopping(html: str, text: str) -> int | None:
-    """Yahoo!ショッピング/PayPayモール 価格抽出"""
+    """
+    Yahoo!ショッピング / PayPayモール 価格抽出（キャンペーン除外・購入付近優先）
+    優先度:
+      1) 構造化データ (JSON-LD / meta)
+      2) 「カートに入れる/今すぐ購入」近傍の金額
+      3) 価格ラベル（販売価格/税込/セール価格 等）近傍
+    ※ ポイント/円相当/クーポン/○円OFF/最大/上限 などは除外
+    """
     def to_v(s): return to_int_yen(s)
 
-    # 構造化データ（最優先）
+    # --- 共通正規表現 ---
+    YEN = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
+    STOP = re.compile(
+        r"(ポイント|pt|獲得|進呈|付与|相当|円相当|PayPay|%|％|"
+        r"クーポン|OFF|円OFF|割引|値引|最大|上限|還元|キャンペーン|セール期間|タイムセール|まとめ買い|条件|対象)",
+        re.I,
+    )
+    PRICE_LABEL = re.compile(r"(販売価格|本体価格|価格|セール価格|最終価格|税込|税抜)", re.I)
+    OLD_LABEL   = re.compile(r"(通常価格|参考価格|メーカー希望小売価格|希望小売価格)", re.I)
+    BUY_WORD    = re.compile(r"(カートに入れる|今すぐ購入|注文手続き)", re.I)
+
+    # 1) 構造化データ（最優先）
     for rx in [
         r'"price"\s*:\s*"?(\d{3,7})"?',
         r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})',
-        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{3,7})'
+        r'(?:og:price:amount|product:price:amount)"?\s*content=["\']?(\d{3,7})',
+        r'data-(?:price|amount)\s*=\s*["\']?(\d{3,7})',   # 一部テンプレのdata属性
     ]:
         m = re.search(rx, html, re.I)
         if m:
             v = to_v(m.group(1))
             if v: return v
 
-    # ラベル近傍
-    P = re.compile(r"(販売価格|価格|税込|税抜)[^\d¥￥]{0,8}([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})")
-    cands=[]
-    for m in P.finditer(text[:6000]):
-        v = to_v(m.group(2))
-        if v: cands.append(v)
-    if cands:
-        return min(cands)
+    # 2) 購入ボタン近傍（強め）
+    cands: list[tuple[int,int]] = []  # (score, value)
+    for m in BUY_WORD.finditer(text[:12000]):
+        i = m.start()
+        ctx = text[max(0, i-600): i+600]  # ボタン近辺を広めに
+        for n in re.finditer(YEN, ctx):
+            s = n.group(0)
+            v = to_v(s)
+            if not v: continue
+            win = ctx[max(0, n.start()-60): n.end()+60]
+            if STOP.search(win): continue
+            score = 8
+            if PRICE_LABEL.search(win): score += 2
+            if re.search(r"[¥￥]|円", s): score += 1
+            if OLD_LABEL.search(win): score -= 2
+            cands.append((score, v))
 
-    return None
+    # 3) 価格ラベル近傍（本文全体から）
+    P = re.compile(r"(販売価格|本体価格|価格|セール価格|最終価格|税込|税抜)[^\d¥￥]{0,10}("+YEN+")", re.I)
+    for m in P.finditer(text[:15000]):
+        s = m.group(2)
+        v = to_v(s)
+        if not v: continue
+        ctx = text[max(0, m.start()-80): m.end()+80]
+        if STOP.search(ctx): continue
+        score = 6
+        if OLD_LABEL.search(ctx): score -= 2
+        cands.append((score, v))
 
+    if not cands:
+        return None
 
-def stock_from_yshopping(html: str, text: str) -> str | None:
-    """Yahoo!ショッピング/PayPayモール 在庫判定"""
-    # JSON-LD availability
-    if re.search(r'itemprop=["\']availability["\'][^>]*(InStock|OutOfStock)', html, re.I):
-        return "IN_STOCK" if re.search(r'InStock', html, re.I) else "OUT_OF_STOCK"
+    best = max(s for s,_ in cands)
+    return min(v for s,v in cands if s == best)
 
-    # 画面テキスト
-    if re.search(r"(在庫あり|カートに入れる|今すぐ購入|注文手続き)", text):
-        return "IN_STOCK"
-    if re.search(r"(在庫なし|在庫切れ|完売|販売終了|お取り扱いできません)", text):
-        return "OUT_OF_STOCK"
-
-    # 残り○点
-    m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個)", text)
-    if m:
-        n = int(z2h_digits(m.group(1)))
-        return "LAST_ONE" if n == 1 else "IN_STOCK"
-
-    return None
 
 
 # ========== 在庫・価格 抽出のメイン ==========
