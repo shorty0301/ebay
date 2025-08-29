@@ -206,7 +206,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
               n = float(t) if t else float("nan")
            if n != n or not (0 < n < 10_000_000):
                 continue
-              v = int(n)
+           v = int(n)
 
            # 404/200/302などのHTTPコードやエラーコードっぽい数字は除外（通貨記号や円が近傍にない場合）
            if v in (100,101,200,201,202,204,301,302,303,304,307,308,400,401,403,404,408,500,502,503,504) and not PRICE_KEY.search(ctx):
