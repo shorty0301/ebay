@@ -54,6 +54,15 @@ def to_int_yen(s: str) -> int | None:
     except:
         return None
 
+def _log(dbg, **kv):
+    if dbg is not None:
+        dbg.append(kv)
+
+def _ctx(text: str, start: int, length: int, span: int = 40) -> str:
+    """周辺文脈を短く切り出す"""
+    return text[max(0, start-span): start+length+span]
+
+
 # ========== fetch_html ==========
 def fetch_html(url: str) -> str:
     ua_pc  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
