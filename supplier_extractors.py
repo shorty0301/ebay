@@ -187,10 +187,10 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
            for m in pat_money.finditer(txt):
                yield m
 
-               # 裸数字も拾う（3〜7桁）。ただし文脈チェック必須。
-               pat_bare = re.compile(r"\b\d{3,7}\b")
-               for m in pat_bare.finditer(txt):
-                   yield m
+           # 裸数字も拾う（3〜7桁）。ただし文脈チェック必須。
+           pat_bare = re.compile(r"\b\d{3,7}\b")
+           for m in pat_bare.finditer(txt):
+               yield m
 
        price_cands = []  # (score, value)
        for m in iter_numbers_with_ctx(text):
@@ -199,22 +199,22 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
            ctx = text[max(0, i-24): i+len(h)+24]
 
            # 数値へ変換（全角対応）
-              n = parse_yen_strict(h)
+           n = parse_yen_strict(h)
            if n != n:  # NaN
               # 裸数字は parse_yen_strict だとNaNになりやすいので素直に整数化
               t = re.sub(r"[^\d]", "", z2h_digits(h))
               n = float(t) if t else float("nan")
            if n != n or not (0 < n < 10_000_000):
-                   continue
+                continue
               v = int(n)
 
            # 404/200/302などのHTTPコードやエラーコードっぽい数字は除外（通貨記号や円が近傍にない場合）
            if v in (100,101,200,201,202,204,301,302,303,304,307,308,400,401,403,404,408,500,502,503,504) and not PRICE_KEY.search(ctx):
-                continue
+               continue
 
            # ノイズ（ポイント・単位・送料表現など）の近傍は除外
            if STOP.search(ctx) or UNIT_NOISE.search(ctx):
-                   continue
+               continue
 
            # スコアリング
            score = 0
