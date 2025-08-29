@@ -125,10 +125,7 @@ def _jsonld_price_avail(html: str) -> tuple[int|None, str|None]:
     except Exception:
         pass
     return None, None
-
-p0, s0 = _jsonld_price_avail(html)
-if s0: stock = s0
-if p0 is not None: price = p0
+    
 # ========== サイト別価格抽出 ==========
 def price_from_offmall(html: str, text: str) -> int | None:
     """
@@ -918,6 +915,13 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         ("mercari.com" in host) or
         ("jp.mercari.com" in host)
     )
+    # JSON-LD 先読み（どのサイトでも有効）
+    p0, s0 = _jsonld_price_avail(html)
+    if s0: 
+        stock = s0
+    if p0 is not None:
+        price = p0
+
 
     def _suspect(h: str, t: str) -> bool:
         if not h or len(h) < 1200:
