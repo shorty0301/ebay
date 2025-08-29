@@ -664,7 +664,9 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     for id_ in ("priceblock_dealprice", "priceblock_ourprice", "price_inside_buybox"):
         m = re.search(r'id=["\']%s["\'][\s\S]{0,300}?[¥￥]\s*([\d,，]{3,10})' % id_, H, re.I)
         if m:
-            v = to_v(m.group(1));  if v: return v
+            v = to_v(m.group(1));  
+            if v: 
+                return v
 
     # 構造化データ保険（参考のことがあるため最後）
     for rx in [
