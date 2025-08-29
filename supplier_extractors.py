@@ -571,113 +571,97 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """Amazon.co.jp 現行価格を最優先で取得"""
+    """
+    Amazon.co.jp 現行価格を最優先で取得
+    - apex_desktop / corePriceDisplay_desktop_feature_div / corePrice_feature_div のブロック内だけを見る
+    - そこで見える a-offscreen / a-price-whole を収集
+    - 打消し系近傍は除外、/袋 等の「単価」は小さい値(<=999)の時だけ除外
+    - 残った候補の最安を返す（= 1,728 を選び 1,996 は落ちる想定）
+    """
     H = str(html or "")
     T = str(text or "")
 
     def to_v(s: str) -> int | None:
         return to_int_yen(s)
 
-    # --- まず価格コンテナを拾う（どれかに入っている想定） ---
-    block = ""
-    m = re.search(r'id=["\']corePriceDisplay_desktop_feature_div["\']([\s\S]{0,12000})', H, re.I)
-    if m:
-        block = m.group(1)
-    if not block:
-        m = re.search(r'id=["\']apex_desktop["\']([\s\S]{0,12000})', H, re.I)
+    # 価格箱のブロックを拾う（優先順）
+    blk = ""
+    for bid, span in (
+        ("apex_desktop", 20000),
+        ("corePriceDisplay_desktop_feature_div", 20000),
+        ("corePrice_feature_div", 20000),
+    ):
+        m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
         if m:
-            block = m.group(1)
-    if not block:
-        m = re.search(r'id=["\']corePrice_feature_div["\']([\s\S]{0,12000})', H, re.I)
-        if m:
-            block = m.group(1)
+            blk = m.group(1)
+            break
+    if not blk:
+        blk = H  # 最悪、全体から拾う（保険）
 
-    # 小さい値(<=999)で「/袋」などの単価が近傍にあるなら除外
+    # 打消し/旧価格の近傍ワード
+    BAD_NEAR = re.compile(
+        r"(a-text-price|a-text-strike|priceBlockStrikePriceString|basisPrice|listPrice|希望小売価格|定価|旧価格)",
+        re.I,
+    )
+    STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券)", re.I)
+
     def is_unit_price(ctx: str, val: int) -> bool:
-        if val is None:
-            return False
-        if val <= 999 and re.search(r'[\/／]\s*(袋|個|枚|本|ml|mL|L|g|kg|mm|cm|GB|MB|TB)', ctx):
-            return True
-        return False
+        # 例: ￥247/袋, ￥300/個 … などは小さい値(<=999)のときだけ単価扱いで除外
+        return val is not None and val <= 999 and re.search(r"[\/／]\s*(袋|個|枚|本|set|セット|ml|mL|L|g|kg|mm|cm|GB|MB|TB)", ctx)
 
-    # 参考/打消し近傍かどうか
-    BAD_NEAR = re.compile(r'(a-text-price|a-text-strike|priceBlockStrikePriceString|basisPrice|listPrice|参考価格|希望小売価格|通常価格)', re.I)
+    # 候補収集（a-offscreen 優先、whole は保険）
+    cands: list[int] = []
 
-    # --- ブロック内から候補収集（priceToPay/data-a-color="price" 近傍を優先） ---
-    def pick_from_block(blk: str) -> int | None:
-        if not blk:
-            return None
-        cands: list[tuple[int, int]] = []  # (score, value)
+    for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*[¥￥]?\s*([\d,，]{1,10})<', blk, re.I):
+        val = to_v(m.group(1))
+        if not val:
+            continue
+        i = m.start()
+        ctx = blk[max(0, i-300): m.end()+300]
+        if BAD_NEAR.search(ctx) or STOP.search(ctx) or is_unit_price(ctx, val):
+            continue
+        cands.append(val)
 
-        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*[¥￥]\s*([\d,，]{1,10})<', blk, re.I):
-            val = to_v(m.group(1))
-            if not val:
-                continue
-            i = m.start()
-            ctx = blk[max(0, i-300): m.end()+300]
+    for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
+        val = to_v(m.group(1))
+        if not val:
+            continue
+        i = m.start()
+        ctx = blk[max(0, i-200): m.end()+200]
+        if BAD_NEAR.search(ctx) or STOP.search(ctx) or is_unit_price(ctx, val):
+            continue
+        cands.append(val)
 
-            # 参考/打消しの近傍 → 除外
-            if BAD_NEAR.search(ctx):
-                continue
-            # 単価（/袋 等）で小さい値 → 除外（1728 は除外しない）
-            if is_unit_price(ctx, val):
-                continue
+    # 近傍に priceToPay / data-a-color="price" がある候補はさらに優先（同点は最安）
+    if cands:
+        best = None
+        best_score = -1
+        for v in cands:
+            # v の登場位置近辺をもう一度検索してスコア付け
+            m = re.search(rf'[¥￥]?\s*{v:,}'.replace(',', r'[,，]'), blk)
+            score = 0
+            if m:
+                i = m.start()
+                ctx = blk[max(0, i-300): m.end()+300]
+                if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', ctx, re.I):
+                    score += 2
+                if re.search(r'税込', ctx):
+                    score += 1
+            # 更新
+            if score > best_score or (score == best_score and (best is None or v < best)):
+                best = v
+                best_score = score
+        if best:
+            return best
 
-            score = 2 if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', ctx, re.I) else 1
-            cands.append((score, val))
-
-        # whole だけの表記も保険で拾う
-        for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
-            val = to_v(m.group(1))
-            if not val:
-                continue
-            i = m.start()
-            ctx = blk[max(0, i-120): m.end()+120]
-            if BAD_NEAR.search(ctx) or is_unit_price(ctx, val):
-                continue
-            score = 2 if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', ctx, re.I) else 1
-            cands.append((score, val))
-
-        if not cands:
-            return None
-        top = max(s for s, _ in cands)
-        vals = [v for s, v in cands if s == top]
-        return min(vals)  # 同点は最安＝現行価格が選ばれやすい
-
-    v = pick_from_block(block)
-    if v:
-        return v
-
-    # --- ブロック化できなかった場合の保険（ページ全体） ---
-    m = re.search(
-        r'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\'][\s\S]{0,1000}?class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{1,10})<',
-        H, re.I
-    )
-    if m:
-        v = to_v(m.group(1))
-        if v:
-            return v
-
-    m = re.search(
-        r'data-a-color\s*=\s*["\']price["\'][\s\S]{0,600}?class=["\']a-offscreen["\']\s*>[\s　]*[¥￥]\s*([\d,，]{1,10})<',
-        H, re.I
-    )
-    if m:
-        v = to_v(m.group(1))
-        if v:
-            return v
-
-    # --- 最後の保険：テキスト側（参考/ポイント/単価の近傍は除外） ---
-    STOP = re.compile(r'(参考価格|定価|希望小売価格|通常価格|リスト価格|List\s*Price|ポイント|pt|還元|クーポン|OFF|円OFF|割引|最大|上限|%|％|実質|相当|円相当|ギフト券)', re.I)
-    for m in re.finditer(r'(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{4,7})\s*円', T[:40000]):
+    # ブロックで拾えないときの最後の保険（テキスト）
+    for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{4,7})\s*円", T[:40000]):
         val = to_v(m.group(1))
         if not val:
             continue
         i = m.start()
         ctx = T[max(0, i-140): i+140]
-        if STOP.search(ctx):
-            continue
-        if is_unit_price(ctx, val):
+        if STOP.search(ctx) or is_unit_price(ctx, val):
             continue
         return val
 
