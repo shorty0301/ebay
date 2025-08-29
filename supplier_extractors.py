@@ -626,33 +626,6 @@ def stock_from_amazon_jp(html: str, text: str) -> str | None:
 
     return None
 
-def _amz_guess_dp_url(host: str, base_url: str, html: str) -> str | None:
-    """
-    取得HTMLから /dp/ または /gp/product/ の商品詳細URLを推定して返す。
-    1) <link rel="canonical" href=".../dp/ASIN"> を最優先
-    2) ページ内の href="/dp/ASIN" / "/gp/product/ASIN" を拾う
-    """
-    H = str(html or "")
-
-    # 1) canonical
-    m = re.search(
-        r'rel=["\']canonical["\'][^>]*href=["\']([^"\']+/(?:dp|gp/product)/[A-Z0-9]{10})',
-        H, re.I
-    )
-    if m:
-        u = m.group(1)
-        return u if u.startswith("http") else f"https://{host.rstrip('/')}/{u.lstrip('/')}"
-
-    # 2) ページ内リンク
-    m = re.search(r'href=["\'](/?(?:dp|gp/product)/[A-Z0-9]{10})', H, re.I)
-    if m:
-        path = m.group(1)
-        return path if path.startswith("http") else f"https://{host.rstrip('/')}/{path.lstrip('/')}"
-
-    return None
-
-
-
 def stock_from_mercari(html: str, text: str) -> str | None:
     """
     メルカリ 在庫判定（安全版）
@@ -1183,4 +1156,98 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
 @functools.lru_cache(maxsize=256)
 def fetch_and_extract(url: str) -> Dict[str, Any]:
     return extract_supplier_info(url, fetch_html(url))
+
+def _strong_get_html(url: str) -> str:
+    """
+    疑わしいHTMLのときにだけ呼ばれる“強化取得”。
+    ★ Amazon.co.jp 専用で挙動し、他サイトは一切変更しない ★
+    1) PCヘッダでもう一度
+    2) モバイルUAでもう一度
+    3) /dp/ASIN をURLから正規化して再取得（?以降は除去）
+    4) 最長のHTMLを返す（長い=本体を取れた可能性が高い）
+    """
+    try:
+        if "amazon.co.jp" not in url:
+            return ""  # 他サイトは触らない
+
+        import requests, re
+        sess = requests.Session()
+        UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
+        UA_MB = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+        H_PC = {
+            "User-Agent": UA_PC,
+            "Accept-Language": "ja,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Referer": "https://www.google.com/",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        H_MB = {
+            "User-Agent": UA_MB,
+            "Accept-Language": "ja,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Referer": "https://www.google.com/",
+        }
+
+        def _get(u, headers):
+            try:
+                r = sess.get(u, headers=headers, timeout=20, allow_redirects=True)
+                return r.status_code, (r.text or "")
+            except Exception:
+                return 0, ""
+
+        htmls: list[str] = []
+
+        # 1) 入力URL（そのまま）
+        sc1, h1 = _get(url, H_PC)
+        if sc1 == 200 and h1:
+            htmls.append(h1)
+        sc2, h2 = _get(url, H_MB)
+        if sc2 == 200 and h2:
+            htmls.append(h2)
+
+        # 2) URLに /dp/ASIN が含まれていれば、クエリを落として正規化
+        m = re.search(r"(https?://[^/]*amazon\.co\.jp)/(?:.*?)(/(?:dp|gp/product)/[A-Z0-9]{10})", url, re.I)
+        if m:
+            canon = m.group(1).rstrip("/") + m.group(2)
+            sc3, h3 = _get(canon, H_PC)
+            if sc3 == 200 and h3:
+                htmls.append(h3)
+            sc4, h4 = _get(canon + "?psc=1", H_PC)
+            if sc4 == 200 and h4:
+                htmls.append(h4)
+
+        # 3) 取れた中で最長のHTMLを返す（空なら空文字）
+        return max(htmls, key=len) if htmls else ""
+    except Exception:
+        return ""
+
+def _amz_guess_dp_url(host: str, base_url: str, html: str) -> str | None:
+    """
+    取得HTMLから /dp/ または /gp/product/ の商品詳細URLを推定して返す。
+    1) <link rel="canonical" href=".../dp/ASIN"> を最優先
+    2) ページ内の href="/dp/ASIN" / "/gp/product/ASIN" を拾う
+    """
+    H = str(html or "")
+
+    # 1) canonical
+    m = re.search(
+        r'rel=["\']canonical["\'][^>]*href=["\']([^"\']+/(?:dp|gp/product)/[A-Z0-9]{10})',
+        H, re.I
+    )
+    if m:
+        u = m.group(1)
+        return u if u.startswith("http") else f"https://{host.rstrip('/')}/{u.lstrip('/')}"
+
+    # 2) ページ内リンク
+    m = re.search(r'href=["\'](/?(?:dp|gp/product)/[A-Z0-9]{10})', H, re.I)
+    if m:
+        path = m.group(1)
+        return path if path.startswith("http") else f"https://{host.rstrip('/')}/{path.lstrip('/')}"
+
+    return None
+
 
