@@ -31,15 +31,16 @@ jobs:
           ls -la
           echo "=== print module path & function source ==="
           python - <<'PY'
-          import inspect
+          import inspect, re
           import supplier_extractors as se
           print("MODULE FILE:", se.__file__)
           src = inspect.getsource(se.extract_supplier_info)
           print(src)
-          # 新版の関数かどうか（先頭で stock を初期化してるか）を確認
-          assert 'stock = "UNKNOWN"' in src or "stock = 'UNKNOWN'" in src, \
-              "This is not the new function (no init of stock)."
+          # 型注釈あり/なし両方を許容
+          pat = r'stock\s*(?::\s*\w+)?\s*=\s*["\\\']UNKNOWN["\\\']'
+          assert re.search(pat, src), "This is not the new function (no proper init of stock)."
           PY
+
 
 
       - name: Run extractor smoke test
