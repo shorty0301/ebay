@@ -38,12 +38,21 @@ def pick_best_price(cands) -> float:
         if n==n and 0<n<1e7: nums.append(n)
     return min(nums) if nums else float("nan")
 
-def yen_to_int(s: str) -> int | None:
+def to_int_yen(s: str) -> int | None:
     """
-    金額文字列を整数に変換（全角→半角、数字以外を除去）
+    金額文字列を整数（円）に変換。
+    ・全角→半角
+    ・カンマ/記号を除去
+    ・範囲: 1〜9,999,999
     """
     t = re.sub(r"[^\d]", "", z2h_digits(str(s or "")))
-    return int(t) if t else None
+    if not t:
+        return None
+    try:
+        v = int(t)
+        return v if 0 < v < 10_000_000 else None
+    except:
+        return None
 
 # ========== fetch_html ==========
 def fetch_html(url: str) -> str:
@@ -63,9 +72,61 @@ def fetch_html(url: str) -> str:
     return (html_pc or "") + "\n<!-- MOBILE MERGE -->\n" + (html_mb or "")
 
 # ========== サイト別価格抽出 ==========
-def price_from_rakuma(html, text): return pick_best_price(re.findall(r"[¥￥]?\s?\d{1,3}(?:[,，]\d{3})+", text))
-def price_from_offmall(html, text): return pick_best_price(re.findall(r"[¥￥]?\s?\d{1,3}(?:[,，]\d{3})+", text))
-def price_from_surugaya(html, text): return pick_best_price(re.findall(r"[¥￥]?\s?\d{1,3}(?:[,，]\d{3})+", text))
+def price_from_offmall(html: str, text: str) -> int | None:
+    # HardOff NetMall（オフモール）
+    STOP = re.compile(r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計|%|％)", re.I)
+    cands = []
+
+    # 「販売価格/税込/価格」の近傍（カンマあり/なし両対応）
+    pat_ctx = re.compile(r"(?:販売価格|税込|税抜|価格)[^0-9¥￥]{0,10}([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})", re.I)
+    for m in pat_ctx.finditer(text):
+        s = m.group(1); i = m.start(1)
+        ctx = text[max(0, i-24): i+len(s)+24]
+        if STOP.search(ctx): continue
+        v = to_int_yen(s)
+        if v: cands.append(v)
+
+    # JSON内の "price": 22000 など
+    for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
+        v = to_int_yen(m.group(1))
+        if v: cands.append(v)
+
+    # 「円」付き（保険）
+    for m in re.finditer(r'(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円', text):
+        s = m.group(1); i = m.start(1)
+        ctx = text[max(0, i-24): i+len(s)+24]
+        if STOP.search(ctx): continue
+        v = to_int_yen(s)
+        if v: cands.append(v)
+
+    return min(cands) if cands else None
+
+
+def price_from_rakuma(html: str, text: str) -> int | None:
+    # Rakuma/Fril
+    cands = []
+    for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
+        v = to_int_yen(m.group(1))
+        if v: cands.append(v)
+    for m in re.finditer(r'(?:[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円', text):
+        v = to_int_yen(m.group(0))
+        if v: cands.append(v)
+    return min(cands) if cands else None
+
+
+def price_from_surugaya(html: str, text: str) -> int | None:
+    # 駿河屋
+    cands = []
+    for m in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})', html):
+        v = to_int_yen(m.group(1))
+        if v: cands.append(v)
+    for m in re.finditer(r'(?:販売価格|税込|税抜)[^0-9¥￥]{0,10}([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})', text):
+        v = to_int_yen(m.group(1))
+        if v: cands.append(v)
+    for m in re.finditer(r'(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円', text):
+        v = to_int_yen(m.group(1))
+        if v: cands.append(v)
+    return min(cands) if cands else None
 
 # ========== 在庫・価格 抽出のメイン ==========
 from typing import Dict, Any
@@ -105,8 +166,16 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     elif re.search(r"(在庫あり|購入手続き|今すぐ購入|カートに入れる|即日発送)", text, re.I):
         if stock != "LAST_ONE":
             stock = "IN_STOCK"
-            
-    # 価格抽出（3桁価格も許容。ただし文脈で絞り込み）
+
+    # 価格抽出（まずサイト別 → なければ汎用）
+    if ("hardoff" in host) or ("offmall" in host) or ("netmall.hardoff.co.jp" in host):
+        price = price_from_offmall(html, text)
+    elif ("fril" in host) or ("rakuma" in host) or ("fril.jp" in host) or ("rakuten" in host):
+        price = price_from_rakuma(html, text)
+    elif ("suruga-ya" in host) or ("surugaya" in host):
+        price = price_from_surugaya(html, text)
+    if price is None:
+    
     STOP = re.compile(r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計\s*\d+|合計金額ではない|%|％)", re.I)
     UNIT_NOISE = re.compile(r"(個|点|件|cm|mm|g|kg|W|V|GB|MB|TB|時間|日|年|サイズ|型番|JAN|品番)", re.I)
     PRICE_KEY = re.compile(r"(価格|税込|税抜|販売|支払|お支払い|お買い上げ|円|¥|￥)", re.I)
