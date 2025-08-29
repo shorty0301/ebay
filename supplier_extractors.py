@@ -142,7 +142,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         "_debug": {"host": "...", "text_snippet": "..."}  # debug時のみ
       }
     """
-    # ★ここが肝：最初にデフォルト値を用意（早期returnは禁止）
+    # ★デフォルト値（早期return禁止）
     stock: str = "UNKNOWN"
     qty:   str = ""
     price: Any = None
@@ -153,7 +153,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     if debug:
         print(f"[DEBUG] host={host}")
 
-    # 残り数量 → LAST_ONE/IN_STOCK に上書き
+    # 残り数量 → LAST_ONE / IN_STOCK
     m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", text)
     if m:
         n = int(z2h_digits(m.group(1)))
@@ -174,73 +174,71 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_rakuma(html, text)
     elif ("suruga-ya" in host) or ("surugaya" in host):
         price = price_from_surugaya(html, text)
-        
+
     if price is None:
-       # 汎用の価格抽出ロジック
-       STOP = re.compile(r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計\s*\d+|合計金額ではない|%|％)", re.I)
-       UNIT_NOISE = re.compile(r"(個|点|件|cm|mm|g|kg|W|V|GB|MB|TB|時間|日|年|サイズ|型番|JAN|品番)", re.I)
-       PRICE_KEY = re.compile(r"(価格|税込|税抜|販売|支払|お支払い|お買い上げ|円|¥|￥)", re.I)
+        # 汎用の価格抽出ロジック（3桁も許容・文脈で絞る）
+        STOP = re.compile(r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計\s*\d+|合計金額ではない|%|％)", re.I)
+        UNIT_NOISE = re.compile(r"(個|点|件|cm|mm|g|kg|W|V|GB|MB|TB|時間|日|年|サイズ|型番|JAN|品番)", re.I)
+        PRICE_KEY = re.compile(r"(価格|税込|税抜|販売|支払|お支払い|お買い上げ|円|¥|￥)", re.I)
 
-       def iter_numbers_with_ctx(txt: str):
-           # ¥12,345 / 12,345円 / ￥999 などの「通貨コンテキストあり」を優先
-           pat_money = re.compile(r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|\d{1,3}(?:[,，]\d{3})+\s*円|[¥￥]\s*\d{3,7}|\d{3,7}\s*円)")
-           for m in pat_money.finditer(txt):
-               yield m
+        def iter_numbers_with_ctx(txt: str):
+            # 通貨コンテキストあり（¥12,345 / 12,345円 / ￥999 など）優先
+            pat_money = re.compile(r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|\d{1,3}(?:[,，]\d{3})+\s*円|[¥￥]\s*\d{3,7}|\d{3,7}\s*円)")
+            for m in pat_money.finditer(txt):
+                yield m
+            # 裸数字（3〜7桁）
+            pat_bare = re.compile(r"\b\d{3,7}\b")
+            for m in pat_bare.finditer(txt):
+                yield m
 
-           # 裸数字も拾う（3〜7桁）。ただし文脈チェック必須。
-           pat_bare = re.compile(r"\b\d{3,7}\b")
-           for m in pat_bare.finditer(txt):
-               yield m
+        price_cands = []  # (score, value)
 
-       price_cands = []  # (score, value)
-       for m in iter_numbers_with_ctx(text):
-           h = m.group(0)
-           i = m.start()
-           ctx = text[max(0, i-24): i+len(h)+24]
+        for m in iter_numbers_with_ctx(text):
+            h = m.group(0)
+            i = m.start()
+            ctx = text[max(0, i-24): i+len(h)+24]
 
-           # 数値へ変換（全角対応）
-           n = parse_yen_strict(h)
-           if n != n:  # NaN
-              # 裸数字は parse_yen_strict だとNaNになりやすいので素直に整数化
-              t = re.sub(r"[^\d]", "", z2h_digits(h))
-              n = float(t) if t else float("nan")
-           if n != n or not (0 < n < 10_000_000):
+            # 数値へ変換（全角対応）
+            n = parse_yen_strict(h)
+            if n != n:  # NaN
+                # 裸数字は parse_yen_strict だとNaNになりやすいので素直に整数化
+                t = re.sub(r"[^\d]", "", z2h_digits(h))
+                n = float(t) if t else float("nan")
+            if n != n or not (0 < n < 10_000_000):
                 continue
-           v = int(n)
+            v = int(n)
 
-           # 404/200/302などのHTTPコードやエラーコードっぽい数字は除外（通貨記号や円が近傍にない場合）
-           if v in (100,101,200,201,202,204,301,302,303,304,307,308,400,401,403,404,408,500,502,503,504) and not PRICE_KEY.search(ctx):
-               continue
+            # HTTPコード等は、通貨/円の文脈が無ければ除外
+            if v in (100,101,200,201,202,204,301,302,303,304,307,308,400,401,403,404,408,500,502,503,504) and not PRICE_KEY.search(ctx):
+                continue
+            # ノイズ語・単位の近傍は除外
+            if STOP.search(ctx) or UNIT_NOISE.search(ctx):
+                continue
 
-           # ノイズ（ポイント・単位・送料表現など）の近傍は除外
-           if STOP.search(ctx) or UNIT_NOISE.search(ctx):
-               continue
+            # スコアリング
+            score = 0
+            if re.search(r"[¥￥]|円", h) or re.search(r"[¥￥]|円", ctx):
+                score += 3  # 通貨記号/円
+            if PRICE_KEY.search(ctx):
+                score += 2  # 価格キーワード
+            if re.search(r"\d{1,3}(?:[,，]\d{3})+", h):
+                score += 1  # カンマ区切り
 
-           # スコアリング
-           score = 0
-           # 通貨記号/円の明示 → 強く加点
-           if re.search(r"[¥￥]|円", h) or re.search(r"[¥￥]|円", ctx):
-               score += 3
-           # 価格キーワード近傍
-           if PRICE_KEY.search(ctx):
-               score += 2
-           # カンマフォーマット（12,345）っぽい → 価格らしさ+1
-           if re.search(r"\d{1,3}(?:[,，]\d{3})+", h):
-               score += 1
-           # 3桁は誤検出が多いので、通貨/価格キーワードの裏付けが無ければ減点
-           if re.fullmatch(r"\d{3}", re.sub(r"[^\d]", "", h)) and score < 3:
-               continue
+            # 3桁は文脈弱いと除外
+            if re.fullmatch(r"\d{3}", re.sub(r"[^\d]", "", h)) and score < 3:
+                continue
 
-           price_cands.append((score, v))
+            price_cands.append((score, v))
 
-    if price_cands:
-        best_score = max(s for s, _ in price_cands)
-        price = min(v for s, v in price_cands if s == best_score)
+        if price_cands:
+            best_score = max(s for s, _ in price_cands)
+            price = min(v for s, v in price_cands if s == best_score)
 
     out = {"stock": stock, "qty": qty, "price": price}
     if debug:
         out["_debug"] = {"host": host, "text_snippet": text[:200]}
     return out
+
 
 # ========== キャッシュ付き ==========
 @functools.lru_cache(maxsize=256)
