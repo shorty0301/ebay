@@ -142,58 +142,66 @@ def price_from_offmall(html: str, text: str) -> int | None:
 
 def price_from_rakuma(html: str, text: str) -> int | None:
     """
-    Rakuma/Fril 価格抽出
-    - JSON/LD, meta の price を最優先
-    - テキストは 円/¥ と価格語の近傍を優先、ポイント/倍/還元などは除外
-    - ページ上部（タイトル付近）の金額をボーナス加点
+    Rakuma/Fril 価格抽出（強化版）
+    - JSON/LD・meta の price を最優先
+    - テキストは「円/¥が数値そのものに付いている」ものだけ採用
+    - キャンペーン文（最大/円OFF/ポイント/倍/還元…）は徹底除外
+    - ページ上部（見出し付近）の金額にボーナス
     """
-    def add(lst, s, score):
+    def add(lst: list[tuple[int, int]], s: str, score: int):
         v = to_int_yen(s)
         if v and 0 < v < 10_000_000:
             lst.append((score, v))
 
     cands: list[tuple[int, int]] = []
 
-    # 1) 構造化データ・埋め込みJSONを強く採用
+    # 1) 構造化データ・埋め込みJSON・meta を強く採用
     for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
         add(cands, m.group(1), 9)
-    for m in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})', html):
+    for m in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})', html, re.I):
         add(cands, m.group(1), 9)
     for m in re.finditer(r'(?:product:price:amount|og:price:amount)"?\s*content=["\']?(\d{3,7})', html, re.I):
         add(cands, m.group(1), 9)
 
-    # 2) テキストから抽出（ノイズ除外＋文脈スコア）
-    STOP = re.compile(r"(ポイント|pt|還元|倍|クーポン|割引|OFF|％|%|上限|相場|参考|手数料|手数|送料別)", re.I)
-    PRICE_WORD = re.compile(r"(価格|税込|税抜|販売|円|¥|￥|送料込)", re.I)
-    pat = re.compile(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})(?:\s*円)?")
+    # 2) テキスト：通貨明示＋文脈スコア（裸数字は拾わない）
+    STOP = re.compile(
+        r"(最大|ポイント|pt|還元|倍|クーポン|割引|OFF|円OFF|％|%|上限|参考|相当|手数料|手数|送料別|キャンペーン)",
+        re.I,
+    )
+    PRICE_WORD = re.compile(r"(価格|税込|税抜|販売|円|¥|￥|送料込|送料込み)", re.I)
+
+    # 円/¥ が“数値そのもの”に付いている形のみ許可
+    pat = re.compile(
+        r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
+    )
 
     for m in pat.finditer(text):
-        s = m.group(1)
-        i = m.start(1)
-        ctx = text[max(0, i-40): i+len(s)+40]
+        s = m.group(0)
+        i = m.start()
+        ctx = text[max(0, i - 80): i + len(s) + 80]
 
         if STOP.search(ctx):
             continue
 
-        has_currency  = bool(re.search(r"[¥￥]|円", s) or re.search(r"[¥￥]|円", ctx))
-        has_priceword = bool(PRICE_WORD.search(ctx))
+        v = to_int_yen(s)
+        if not v:
+            continue
 
         score = 0
-        if has_priceword: score += 4
-        if has_currency:  score += 3
+        if PRICE_WORD.search(ctx): score += 4      # 価格語近傍
+        if re.search(r"[¥￥]|円", s): score += 3   # 通貨記号/円（本体に付与）
         if re.search(r"\d{1,3}(?:[,，]\d{3})+", s): score += 1
-        # タイトル直下など「上の方」に出る金額をボーナス（本体価格の可能性大）
-        if i < 800: score += 2
-        # 「送料込」近傍はさらに加点
-        if re.search(r"送料込", ctx): score += 1
+        if i < 1200: score += 2                    # ページ上部ボーナス
+        if re.search(r"送料込|送料込み", ctx): score += 1
 
-        add(cands, s, score)
+        cands.append((score, v))
 
     if not cands:
         return None
 
     best = max(s for s, _ in cands)
     return min(v for s, v in cands if s == best)
+
 
 
 
@@ -394,6 +402,9 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         if price_cands:
             best_score = max(s for s, _ in price_cands)
             price = min(v for s, v in price_cands if s == best_score)
+        # プラグイン補完（既存ロジックの結果を壊さない）
+    
+    stock, price = _apply_plugins(url, html, text, stock, price)
 
     out = {"stock": stock, "qty": qty, "price": price}
     if debug:
@@ -405,3 +416,286 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
 @functools.lru_cache(maxsize=256)
 def fetch_and_extract(url: str) -> Dict[str, Any]:
     return extract_supplier_info(url, fetch_html(url))
+
+# ==================== BEGIN: 非破壊プラグイン仕組み＋メルカリ補完 ====================
+# 既存ロジックを壊さず、必要時のみ“補完”するための内蔵スロット
+# ・price は既存が None のときだけ補完（override=False）
+# ・stock は既存が UNKNOWN のときだけ補完（今回は未使用）
+# ・Playwright 未導入でも例外にせずスキップ（挙動不変）
+
+from dataclasses import dataclass
+from typing import Callable, Optional, Pattern, List, Any as _Any
+
+@dataclass
+class _SitePlugin:
+    name: str
+    host_patterns: List[Pattern[str]]
+    price_fn: Optional[Callable[[str, str, str], Optional[int]]] = None
+    stock_fn: Optional[Callable[[str, str, str], Optional[str]]] = None
+    override: bool = False
+    priority: int = 0
+
+_PLUGINS: List[_SitePlugin] = []
+
+def register_plugin(plugin: _SitePlugin) -> None:
+    if any(p.name == plugin.name for p in _PLUGINS):
+        return
+    _PLUGINS.append(plugin)
+    _PLUGINS.sort(key=lambda p: p.priority, reverse=True)
+
+def register_simple_plugin(
+    name: str,
+    host_regexes: List[str],
+    price_fn: Optional[Callable[[str, str, str], Optional[int]]] = None,
+    stock_fn: Optional[Callable[[str, str, str], Optional[str]]] = None,
+    override: bool = False,
+    priority: int = 0,
+) -> None:
+    pats = [re.compile(rx, re.I) for rx in host_regexes]
+    register_plugin(_SitePlugin(
+        name=name,
+        host_patterns=pats,
+        price_fn=price_fn,
+        stock_fn=stock_fn,
+        override=override,
+        priority=priority,
+    ))
+
+def _apply_plugins(url: str, html: str, text: str,
+                   current_stock: str, current_price: _Any) -> tuple[str, _Any]:
+    try:
+        host = re.findall(r"https?://([^/]+)/?", url)[0].lower()
+    except Exception:
+        host = ""
+
+    for p in _PLUGINS:
+        if not any(rx.search(host) or rx.search(url) for rx in p.host_patterns):
+            continue
+
+        # stock 補完
+        if p.stock_fn:
+            try:
+                s = p.stock_fn(url, html, text)
+                if s in ("IN_STOCK", "OUT_OF_STOCK", "LAST_ONE"):
+                    if p.override or current_stock in (None, "", "UNKNOWN"):
+                        current_stock = s
+            except Exception:
+                pass
+
+        # price 補完
+        if p.price_fn:
+            try:
+                v = p.price_fn(url, html, text)
+                if isinstance(v, int) and 0 < v < 10_000_000:
+                    if p.override or (current_price is None):
+                        current_price = v
+            except Exception:
+                pass
+
+    return current_stock, current_price
+
+
+# ---------- メルカリ: Playwrightで価格を“補完” ----------
+# オプション：TrueにするとPlaywright補完を有効化（未導入でも自動スキップ）
+ENABLE_MERCARI_PLAYWRIGHT = True
+
+# 安全な遅延インポート（未導入でも落とさない）
+try:
+    import asyncio  # noqa: F401
+except Exception:
+    asyncio = None
+
+try:
+    import nest_asyncio  # noqa: F401
+    if asyncio is not None:
+        try:
+            nest_asyncio.apply()
+        except Exception:
+            pass
+except Exception:
+    pass
+
+try:
+    from bs4 import BeautifulSoup as _BS  # noqa: F401
+except Exception:
+    _BS = None
+
+try:
+    from playwright.async_api import async_playwright, TimeoutError as _PWTimeout
+except Exception:
+    async_playwright = None
+    class _PWTimeout(Exception): ...
+    
+_YEN_RE = re.compile(r"(?:￥|¥)\s*([0-9０-９][0-9０-９,，]{2,})")
+_LABEL_WORDS = ("税込", "送料込", "送料込み")
+
+def _to_int_digits_(s: str) -> Optional[int]:
+    s = (s or "").replace("，", ",")
+    s = re.sub(r"[^\d]", "", s)
+    return int(s) if s.isdigit() else None
+
+async def _mercari_fetch_price_async(url: str, headless: bool = True, timeout_ms: int = 60000, retries: int = 2):
+    if async_playwright is None:
+        return {"status": "playwright_not_available"}
+
+    async with async_playwright() as pw:
+        for attempt in range(1, retries + 1):
+            browser = await pw.chromium.launch(headless=headless)
+            ctx = await browser.new_context(
+                locale="ja-JP",
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0 Safari/537.36"),
+                extra_http_headers={"Accept-Language": "ja,en;q=0.8"}
+            )
+            page = await ctx.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                await page.wait_for_timeout(700)
+                await page.wait_for_selector(
+                    "xpath=(//button[contains(., '購入手続き')] | //a[contains(., '購入手続き')])[1]",
+                    timeout=8000
+                )
+            except _PWTimeout:
+                await browser.close()
+                if attempt < retries:
+                    continue
+                return {"status": "timeout_goto"}
+
+            # 1) 「購入手続き」近傍の “¥…”
+            btn = page.locator("xpath=(//button[contains(., '購入手続き')] | //a[contains(., '購入手続き')])[1]")
+            if await btn.count() > 0:
+                lab = page.locator(
+                    "xpath=(//*[contains(., '¥') and (contains(., '税込') or contains(., '送料込') or contains(., '送料込み')) "
+                    " and preceding::*[(self::button or self::a) and contains(., '購入手続き')]][last()])"
+                )
+                if await lab.count() > 0:
+                    txt = await lab.inner_text()
+                    m = _YEN_RE.search(txt or "")
+                    if m:
+                        n = _to_int_digits_(m.group(1))
+                        if n:
+                            await browser.close()
+                            return {"price": n, "source": "dom:near_buy+labeled"}
+
+                near = page.locator(
+                    "xpath=(//*[contains(., '¥') and preceding::*[(self::button or self::a) and contains(., '購入手続き')]][last()])"
+                )
+                if await near.count() > 0:
+                    txt = await near.inner_text()
+                    m = _YEN_RE.search(txt or "")
+                    if m:
+                        n = _to_int_digits_(m.group(1))
+                        if n:
+                            await browser.close()
+                            return {"price": n, "source": "dom:near_buy"}
+
+            # 2) JSON-LD / meta
+            html = await page.content()
+            soup = _BS(html, "lxml") if _BS else None
+            if soup:
+                import json as _json
+                for tag in soup.find_all("script", {"type": "application/ld+json"}):
+                    try:
+                        data = _json.loads(tag.string or "")
+                    except Exception:
+                        continue
+                    stack = [data]
+                    while stack:
+                        node = stack.pop()
+                        if isinstance(node, dict):
+                            t = str(node.get("@type", "")).lower()
+                            if t in ("offer", "aggregateoffer"):
+                                if "price" in node and _to_int_digits_(str(node["price"])) is not None:
+                                    await browser.close()
+                                    return {"price": _to_int_digits_(str(node["price"])), "source": "jsonld:price"}
+                                if "lowPrice" in node and _to_int_digits_(str(node["lowPrice"])) is not None:
+                                    await browser.close()
+                                    return {"price": _to_int_digits_(str(node["lowPrice"])), "source": "jsonld:lowPrice"}
+                            stack.extend(node.values())
+                        elif isinstance(node, list):
+                            stack.extend(node)
+
+                tag = soup.find("meta", attrs={"name": "product:price:amount"}) if soup else None
+                if tag and tag.get("content"):
+                    n = _to_int_digits_(tag["content"])
+                    if n:
+                        await browser.close()
+                        return {"price": n, "source": "meta:product:price:amount"}
+
+                # 3) 可視テキスト保険
+                visible = soup.get_text(" ", strip=True)
+                best = None
+                for m in _YEN_RE.finditer(visible):
+                    seg = visible[max(0, m.start() - 20): m.end() + 20]
+                    if any(w in seg for w in _LABEL_WORDS):
+                        best = _to_int_digits_(m.group(1))
+                        if best:
+                            break
+                if best is None:
+                    nums = [_to_int_digits_(m.group(1)) for m in _YEN_RE.finditer(visible)]
+                    nums = [n for n in nums if n and 100 <= n <= 3_000_000]
+                    if nums:
+                        from collections import Counter as _Counter
+                        best = _Counter(nums).most_common(1)[0][0]
+
+                await browser.close()
+                return {"price": best, "source": "visible_text"} if best else {"status": "price_not_found"}
+
+            await browser.close()
+            return {"status": "price_not_found"}
+
+def _mercari_price_sync(url: str) -> Optional[int]:
+    if not ENABLE_MERCARI_PLAYWRIGHT or asyncio is None or async_playwright is None:
+        return None
+    try:
+        loop = asyncio.get_event_loop()
+    except Exception:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+        except Exception:
+            pass
+
+    try:
+        result = loop.run_until_complete(_mercari_fetch_price_async(url))
+    except RuntimeError:
+        # 既存ループ稼働中（Jupyter等）
+        coro = _mercari_fetch_price_async(url)
+        task = asyncio.ensure_future(coro)
+        loop.run_until_complete(task)
+        result = task.result()
+    except Exception:
+        return None
+
+    if isinstance(result, dict) and isinstance(result.get("price"), int):
+        v = to_int_yen(str(result["price"]))
+        return v
+    return None
+
+def _mercari_price_fn(url: str, html: str, text: str) -> Optional[int]:
+    # 既存 price が None のときだけ採用される（override=False）
+    try:
+        # メルカリのみ Playwright で直接取得（HTMLは使わない）
+        return _mercari_price_sync(url)
+    except Exception:
+        return None
+
+# メルカリ対象ホスト
+_MERCARI_HOSTS = [
+    r"\bmercari\.com\b",
+    r"\bjp\.mercari\.com\b",
+    r"\bmercari\.jp\b",
+]
+
+# 登録（上書きしない補完・優先度高め）
+register_simple_plugin(
+    name="mercari_playwright_price_inline",
+    host_regexes=_MERCARI_HOSTS,
+    price_fn=_mercari_price_fn,
+    stock_fn=None,
+    override=False,
+    priority=20
+)
+
+
