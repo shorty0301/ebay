@@ -143,8 +143,9 @@ def price_from_offmall(html: str, text: str) -> int | None:
 def price_from_rakuma(html: str, text: str) -> int | None:
     """
     Rakuma/Fril 価格抽出
-    - JSON/LD や埋め込みJSONの "price" を最優先
-    - テキストは ¥ / 円 近傍を優先
+    - JSON/LD, meta の price を最優先
+    - テキストは 円/¥ と価格語の近傍を優先、ポイント/倍/還元などは除外
+    - ページ上部（タイトル付近）の金額をボーナス加点
     """
     def add(lst, s, score):
         v = to_int_yen(s)
@@ -153,29 +154,47 @@ def price_from_rakuma(html: str, text: str) -> int | None:
 
     cands: list[tuple[int, int]] = []
 
-    # 1) 構造化データ / 埋め込みJSON
+    # 1) 構造化データ・埋め込みJSONを強く採用
     for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
-        add(cands, m.group(1), 8)
+        add(cands, m.group(1), 9)
     for m in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})', html):
-        add(cands, m.group(1), 8)
+        add(cands, m.group(1), 9)
+    for m in re.finditer(r'(?:product:price:amount|og:price:amount)"?\s*content=["\']?(\d{3,7})', html, re.I):
+        add(cands, m.group(1), 9)
 
-    # 2) 画面テキスト（¥/円 近傍を優先）
-    PRICE_WORD = re.compile(r"(価格|税込|税抜|販売|円|¥|￥)", re.I)
+    # 2) テキストから抽出（ノイズ除外＋文脈スコア）
+    STOP = re.compile(r"(ポイント|pt|還元|倍|クーポン|割引|OFF|％|%|上限|相場|参考|手数料|手数|送料別)", re.I)
+    PRICE_WORD = re.compile(r"(価格|税込|税抜|販売|円|¥|￥|送料込)", re.I)
     pat = re.compile(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})(?:\s*円)?")
+
     for m in pat.finditer(text):
         s = m.group(1)
         i = m.start(1)
-        ctx = text[max(0, i-32): i+len(s)+32]
+        ctx = text[max(0, i-40): i+len(s)+40]
+
+        if STOP.search(ctx):
+            continue
+
+        has_currency  = bool(re.search(r"[¥￥]|円", s) or re.search(r"[¥￥]|円", ctx))
+        has_priceword = bool(PRICE_WORD.search(ctx))
+
         score = 0
-        if re.search(r"[¥￥]|円", s) or re.search(r"[¥￥]|円", ctx): score += 3
-        if PRICE_WORD.search(ctx): score += 2
+        if has_priceword: score += 4
+        if has_currency:  score += 3
         if re.search(r"\d{1,3}(?:[,，]\d{3})+", s): score += 1
+        # タイトル直下など「上の方」に出る金額をボーナス（本体価格の可能性大）
+        if i < 800: score += 2
+        # 「送料込」近傍はさらに加点
+        if re.search(r"送料込", ctx): score += 1
+
         add(cands, s, score)
 
     if not cands:
         return None
+
     best = max(s for s, _ in cands)
     return min(v for s, v in cands if s == best)
+
 
 
 def price_from_surugaya(html: str, text: str) -> int | None:
