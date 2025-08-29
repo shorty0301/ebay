@@ -658,13 +658,14 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         r'id=["\']priceToPay["\'][\s\S]{0,800}?class=["\']a-offscreen["\']\s*>\s*[¥￥]\s*([\d,，]{3,10})<',
         H, re.I)
     if m:
-        v = to_v(m.group(1));  return v if v else None
+        v = to_v(m.group(1))
+        return v if v else None
 
     # 古いID保険
     for id_ in ("priceblock_dealprice", "priceblock_ourprice", "price_inside_buybox"):
         m = re.search(r'id=["\']%s["\'][\s\S]{0,300}?[¥￥]\s*([\d,，]{3,10})' % id_, H, re.I)
         if m:
-            v = to_v(m.group(1));  
+            v = to_v(m.group(1)) 
             if v: 
                 return v
 
@@ -677,7 +678,9 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     ]:
         m = re.search(rx, H, re.I)
         if m:
-            v = to_v(m.group(1));  if v: return v
+            v = to_v(m.group(1))
+            if v: 
+                return v
 
     # テキスト保険（STOP/単価の近傍は除外）
     for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円", T[:40000]):
