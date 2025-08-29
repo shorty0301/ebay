@@ -1028,10 +1028,23 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         if s: stock = s
         price = price_from_surugaya(html, text)
     # Amazon.co.jp
-    elif ("amazon.co.jp" in host) or ("www.amazon.co.jp" in host):
-        s = stock_from_amazon_jp(html, text)
-        if s: stock = s
-        price = price_from_amazon_jp(html, text)
+    elif ("amazon.co.jp" in host) or (host.endswith(".amazon.co.jp")):
+    if debug:
+        H = html or ""
+        T = text or ""
+        print("[AMZ] len(html)=", len(H))
+        print("[AMZ] markers:", {
+            "priceToPay": bool(re.search(r'id=["\']priceToPay["\']', H, re.I)),
+            "corePrice":  bool(re.search(r'id=["\']corePrice_feature_div["\']', H, re.I)),
+            "aOffscreen": bool(re.search(r'class=["\']a-offscreen["\']', H, re.I)),
+            "buyNow":     bool(re.search(r"(今すぐ買う|Buy Now)", T)),
+            "addCart":    bool(re.search(r"(カートに入れる|Add to Cart)", T)),
+            "unavail":    bool(re.search(r"(現在お取り扱いできません|Currently unavailable)", T, re.I)),
+            "robot":      bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", H, re.I)),
+        })
+    s = stock_from_amazon_jp(html, text)
+    if s: stock = s
+    price = price_from_amazon_jp(html, text)
 
     # Mercari 
     elif ("mercari" in host) or ("jp.mercari.com" in host):
