@@ -142,55 +142,69 @@ def price_from_offmall(html: str, text: str) -> int | None:
 
 def price_from_rakuma(html: str, text: str) -> int | None:
     """
-    Rakuma/Fril 価格抽出（誤検出対策強化版）
-    - JSONやmetaは無視（誤検出が多いため）
-    - ページ冒頭（〜2000文字）の ¥付き金額を最優先
-    - 「送料込/税込/販売価格」近傍を強く採用
-    - 分割払いやOFF/還元などの文脈は除外
+    Rakuma/Fril 価格抽出（見出しの実価格を最優先・決め打ち）
+    1) ページ先頭〜3000文字だけを見る
+    2) 「¥2,500 送料込/送料込み/税込」など “価格の直近に送料/税込” があるパターンを最優先
+    3) それが無ければ、先頭付近(〜1200字)で最初に出る「¥付き価格」を採用
+    ※ キャンペーン語(OFF/最大/還元/ポイント/以上/まで etc.)の近傍は除外
     """
-    head = text[:2000]
+    head = text[:3000]
 
-    # --- 正規表現 ---
-    yen_pat = re.compile(r"[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}")
-    stop_pat = re.compile(r"(OFF|割引|クーポン|ポイント|pt|還元|相当|分割|月|ローン|最大|上限)", re.I)
-    ok_pat   = re.compile(r"(送料込|送料込み|税込|販売価格|商品価格|価格)", re.I)
+    def to_v(s: str) -> int | None:
+        return to_int_yen(s)
 
-    cands: list[tuple[int, int]] = []
+    # ノイズ（キャンペーン・条件）
+    STOP = re.compile(
+        r"(最大|OFF|円OFF|割引|クーポン|ポイント|pt|還元|相当|円相当|"
+        r"上限|参考|キャンペーン|セール|特典|抽選|進呈|付与|"
+        r"以上|以下|未満|超|から|〜|~|まで|条件|対象|合計|総額|合算|月|分割|ローン)",
+        re.I,
+    )
 
-    def add(val: int | None, score: int):
-        if val and 0 < val < 10_000_000:
-            cands.append((score, val))
-
-    # --- 1) 冒頭の ¥付き表記を拾う ---
-    for m in yen_pat.finditer(head):
-        s = m.group(0)
+    # 1) 「価格の直近に 送料/税込」パターン（最優先）
+    p1 = re.compile(
+        r"[¥￥]\s*(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*(?:円)?\s*(?:送料込|送料込み|税込)",
+        re.I,
+    )
+    for m in p1.finditer(head[:1800]):               # まずは見出しエリア
+        s = m.group(1)
         i = m.start()
-        ctx = head[max(0, i-40): i+len(s)+40]
-
-        if stop_pat.search(ctx):
+        ctx = head[max(0, i-80): i+80]
+        if STOP.search(ctx): 
             continue
+        v = to_v(s)
+        if v: 
+            return v
 
-        v = to_int_yen(s)
-        if not v:
+    # 2) 「送料/税込 の直後に価格」パターン（語→価格）
+    p2 = re.compile(
+        r"(?:送料込|送料込み|税込)[^\d]{0,12}[¥￥]?\s*(\d{1,3}(?:[,，]\d{3})+|\d{3,7})",
+        re.I,
+    )
+    for m in p2.finditer(head[:1800]):
+        s = m.group(1)
+        i = m.start()
+        ctx = head[max(0, i-80): i+80]
+        if STOP.search(ctx):
             continue
+        v = to_v(s)
+        if v:
+            return v
 
-        score = 0
-        if ok_pat.search(ctx):
-            score += 5
-        if re.match(r"^[¥￥]", s):
-            score += 4  # 行頭¥つきは本体価格っぽい
-        if i < 500:
-            score += 3  # ページ上部にあるなら強く加点
-        if v < 1000:
-            score -= 2  # 3桁はノイズになりやすい
+    # 3) フォールバック：先頭〜1200字で “最初の” ¥付き価格（ノイズ文脈は除外）
+    p3 = re.compile(r"[¥￥]\s*(\d{1,3}(?:[,，]\d{3})+|\d{3,7})", re.I)
+    for m in p3.finditer(head[:1200]):
+        s = m.group(1)
+        i = m.start()
+        ctx = head[max(0, i-80): i+80]
+        if STOP.search(ctx):
+            continue
+        v = to_v(s)
+        if v:
+            return v
 
-        add(v, score)
+    return None
 
-    if not cands:
-        return None
-
-    best = max(s for s, _ in cands)
-    return min(v for s, v in cands if s == best)
 
 
 def price_from_surugaya(html: str, text: str) -> int | None:
