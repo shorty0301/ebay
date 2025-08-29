@@ -421,8 +421,6 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
             best_score = max(s for s, _ in price_cands)
             price = min(v for s, v in price_cands if s == best_score)
         # プラグイン補完（既存ロジックの結果を壊さない）
-    
-    stock, price = _apply_plugins(url, html, text, stock, price)
 
     out = {"stock": stock, "qty": qty, "price": price}
     if debug:
