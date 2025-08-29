@@ -574,33 +574,30 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     H = str(html or "")
     T = str(text or "")
 
-    # ===== 追加：トレース用 =====
-    trace = {"hits": [], "picked": None}   # hits: 各候補の履歴、picked: 最終採用
+    trace = {"hits": [], "picked": None}
     def log_hit(kind: str, val: int | None, ctx: str, action: str, reason: str = "", extra: dict | None = None):
         item = {
-            "kind": kind,               # 例: offscreen / whole / priceToPay / struct
+            "kind": kind,
             "val": val,
-            "action": action,           # kept / dropped
-            "reason": reason,           # dropped理由やkeptの根拠
-            "ctx": re.sub(r"\s+", " ", ctx)[:220],  # 近傍テキストの一部
+            "action": action,
+            "reason": reason,
+            "ctx": re.sub(r"\s+", " ", ctx)[:220],
         }
-        if extra:
-            item.update(extra)
+        if extra: item.update(extra)
         trace["hits"].append(item)
-    # ==========================
 
     def to_v(s: str) -> int | None:
         return to_int_yen(s)
 
-    # 単価・打消しなどの判定（いま使っているロジックそのまま）
     BAD_NEAR = re.compile(r'(a-text-price|a-text-strike|priceBlockStrikePriceString|basisPrice|listPrice|希望小売価格|定価|旧価格)', re.I)
-    STOP     = re.compile(r'(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券)', re.I)
+    STOP     = re.compile(r'(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|配送料|送料無料|通常配送無料|以上で)', re.I)
+    # ↑ 「配送料」「送料無料」「通常配送無料」「以上で」を追加
 
     def is_unit_price(ctx: str, val: int | None) -> bool:
         return (val is not None and val <= 999 and
                 re.search(r'[\/／]\s*(袋|個|枚|本|set|セット|ml|mL|L|g|kg|mm|cm|GB|MB|TB)', ctx))
 
-    # 価格箱ブロックを拾う
+    # 価格箱ブロックを拾う（従来どおり）
     blk = ""
     for bid, span in (("apex_desktop", 20000),
                       ("corePriceDisplay_desktop_feature_div", 20000),
@@ -610,11 +607,27 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             blk = m.group(1)
             break
     if not blk:
-        blk = H  # 保険
+        blk = H
 
-    # --- 候補収集 ---
-    cands: list[tuple[int, int, int, str]] = []  # (score, val, pos, kind)
+    # priceToPay の位置（距離スコア用）
+    p2p_pos = -1
+    m_p2p = re.search(r'(id=["\']priceToPay["\']|class=["\'][^"\']*\bpriceToPay\b)', H, re.I)
+    if m_p2p:
+        p2p_pos = m_p2p.start()
 
+    cands: list[tuple[int, int, int, str, int]] = []  # (score, val, pos, kind, dist)
+
+    def boost_by_distance(pos: int) -> int:
+        if p2p_pos < 0:
+            return 0
+        d = abs(pos - p2p_pos)
+        # 近いほど加点（~800字以内なら+3、~1600で+2、~3000で+1）
+        if d <= 800: return 3
+        if d <= 1600: return 2
+        if d <= 3000: return 1
+        return 0
+
+    # a-offscreen
     for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*[¥￥]?\s*([\d,，]{1,10})<', blk, re.I):
         val = to_v(m.group(1)); i = m.start()
         ctx = blk[max(0, i-300): m.end()+300]
@@ -630,9 +643,11 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         score = 1
         if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', ctx, re.I):
             score += 2
-        log_hit("offscreen", val, ctx, "kept", f"score={score}")
-        cands.append((score, val, i, "offscreen"))
+        score += boost_by_distance(i)
+        log_hit("offscreen", val, ctx, "kept", f"score={score}", {"dist": abs(i - p2p_pos)})
+        cands.append((score, val, i, "offscreen", abs(i - p2p_pos) if p2p_pos>=0 else 10**9))
 
+    # a-price-whole
     for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
         val = to_v(m.group(1)); i = m.start()
         ctx = blk[max(0, i-200): m.end()+200]
@@ -648,19 +663,22 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         score = 1
         if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', ctx, re.I):
             score += 2
-        log_hit("whole", val, ctx, "kept", f"score={score}")
-        cands.append((score, val, i, "whole"))
+        score += boost_by_distance(i)
+        log_hit("whole", val, ctx, "kept", f"score={score}", {"dist": abs(i - p2p_pos)})
+        cands.append((score, val, i, "whole", abs(i - p2p_pos) if p2p_pos>=0 else 10**9))
 
-    # 採用
+    # 採用ルール（同点時は priceToPay に近い方を優先。そのうえで値が小さい方）
     if cands:
-        best_score = max(s for s,_,_,_ in cands)
-        vals = sorted([v for s,v,_,_ in cands if s == best_score])
-        picked = vals[0]
-        trace["picked"] = {"val": picked, "how": "min_in_top_score", "top_score": best_score}
-        globals()['__amz_trace__'] = trace  # ← 外から読めるように保存
+        best_score = max(s for s,_,_,_,_ in cands)
+        top = [(s,v,pos,kind,dist) for (s,v,pos,kind,dist) in cands if s==best_score]
+        # 1) dist（近い方） 2) 価格（小さい方） 3) 出現位置（早い方）
+        top.sort(key=lambda x: (x[4], x[1], x[2]))
+        picked = top[0][1]
+        trace["picked"] = {"val": picked, "how": "score_then_distance_then_min", "top_score": best_score}
+        globals()['__amz_trace__'] = trace
         return picked
 
-    # --- 最後の保険：テキスト側 ---
+    # テキスト側の保険（STOP 強化済み）
     for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{4,7})\s*円", T[:40000]):
         val = to_v(m.group(1)); i = m.start()
         if not val: 
