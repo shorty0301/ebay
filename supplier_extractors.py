@@ -433,48 +433,60 @@ def price_from_paypay_fleamarket(html: str, text: str) -> int | None:
 
 def stock_from_surugaya(html: str, text: str) -> str | None:
     """
-    駿河屋 在庫判定（画像アイコン/alt・購入UI対応）
+    駿河屋 在庫判定（カートUI最優先 + 否定の注意書き無視）
     優先度:
-      1) 強い否定語（売り切れ/販売終了）
-      2) 購入UI（カート/数量/購入手続き） or add-to-cart系HTML
-      3) 通販在庫（数値 or 記号 ○/△/×）/ 在庫：あり・なし
-      4) 残り数量
+      1) 強い否定語（ただし注意書き文脈は無視）
+      2) 購入UI（カート/数量/購入手続き/フォーム）→ IN_STOCK
+      3) 通販在庫（数値 / 記号 ○/△/×）
+      4) 一般在庫記号 / 残り数量
     """
+    # 正規化（全角空白→半角）
+    t = text.replace("\u3000", " ")
 
-    # 1) 強い否定（まず確定でOUT）
-    if re.search(r"(売り切れ|在庫切れ|在庫なし|品切れ|販売終了|取扱い終了|お取り扱いできません)", text):
-        return "OUT_OF_STOCK"
+    # 否定語の注意書き除外フィルタ
+    NEG = re.compile(r"(売り切れ|在庫切れ|在庫なし|品切れ|販売終了|取扱い終了)", re.I)
+    NEG_STOP = re.compile(r"(場合|際|ことがあります|可能性|恐れ|注意|ご了承ください|お問い合わせ)", re.I)
 
-    # 2) 購入UIが見えていれば在庫あり
-    if (re.search(r"(カートに入れる|今すぐ購入|購入手続き|ご注文|注文手続き)", text) or
-        re.search(r"\b数量\b", text) or
-        re.search(r'(add[-\s]?to[-\s]?cart|id=["\']addToCart["\']|name=["\']addToCart["\']|class=["\'][^"\']*add-to-cart)', html, re.I)):
+    for m in NEG.finditer(t):
+        i = m.start()
+        ctx = t[max(0, i-30): i+len(m.group(0))+30]
+        # 「売り切れの際は〜」のような注意書きは無視
+        if not NEG_STOP.search(ctx):
+            return "OUT_OF_STOCK"
+
+    # 購入UIが見えていれば確定で在庫あり
+    if (re.search(r"(カートに入れる|今すぐ購入|購入手続き|ご注文|注文手続き|お買い物かご)", t) or
+        re.search(r"\b数量\b", t) or
+        re.search(r'<(form|button|input)[^>]*(add[-_\s]?to[-_\s]?cart|cart|buy|購入)[^>]*>', html, re.I) or
+        re.search(r'(id|name|class)=["\'][^"\']*(add[-_\s]?to[-_\s]?cart|cartButton|cart-submit|buyNow|purchase)["\']', html, re.I)):
         return "IN_STOCK"
 
-    # 3-a) 通販在庫：数値
-    m = re.search(r"(通販在庫|ネット在庫)\s*(?:数|：|:)?\s*([0-9０-９]+)", text)
+    # 通販在庫：数（最優先で評価）
+    m = re.search(r"(通販在庫|ネット在庫)\s*(?:数|：|:)?\s*([0-9０-９]+)", t)
     if m:
         n = int(z2h_digits(m.group(2)))
         if n <= 0:
             return "OUT_OF_STOCK"
         return "LAST_ONE" if n == 1 else "IN_STOCK"
 
-    # 3-b) 在庫：あり/なし（テキスト or alt で入ってくる想定）
-    if re.search(r"(在庫|通販在庫|ネット在庫)\s*[:：]?\s*あり", text):
-        return "IN_STOCK"
-    if re.search(r"(在庫|通販在庫|ネット在庫)\s*[:：]?\s*なし", text):
+    # 通販在庫：記号
+    if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[×✕ｘX]", t):
         return "OUT_OF_STOCK"
-
-    # 3-c) 記号（○/△/×）— alt 化で text に入ってくる
-    if re.search(r"(通販在庫|ネット在庫|在庫)\s*[:：]?\s*[×✕ｘX]", text):
-        return "OUT_OF_STOCK"
-    if re.search(r"(通販在庫|ネット在庫|在庫)\s*[:：]?\s*[○〇◯]", text):
+    if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[○〇◯]", t):
         return "IN_STOCK"
-    if re.search(r"(通販在庫|ネット在庫|在庫)\s*[:：]?\s*[△▲]", text):
+    if re.search(r"(通販在庫|ネット在庫)\s*[:：]?\s*[△▲]", t):
         return "LAST_ONE"
 
-    # 4) 残り数量
-    m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", text)
+    # 一般在庫表現（記号）
+    if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[×✕ｘX]", t):
+        return "OUT_OF_STOCK"
+    if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[○〇◯]", t):
+        return "IN_STOCK"
+    if re.search(r"(在庫|在庫状況|在庫数)\s*[:：]?\s*[△▲]", t):
+        return "LAST_ONE"
+
+    # 残り数量
+    m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", t)
     if m:
         n = int(z2h_digits(m.group(1)))
         return "LAST_ONE" if n == 1 else "IN_STOCK"
