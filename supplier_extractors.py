@@ -142,63 +142,58 @@ def price_from_offmall(html: str, text: str) -> int | None:
 
 def price_from_rakuma(html: str, text: str) -> int | None:
     """
-    Rakuma/Fril 価格抽出
-    - SOLDOUT があれば、その近傍の金額を最優先で取得
-    - それ以外は見出し直下の「¥xxxx (円) + 送料込」を優先
-    - 最後に JSON/LD, meta, 一般抽出でフォールバック
+    Rakuma/Fril 価格抽出（キャンペーン価格排除・見出し最優先）
+    - ページ上部(〜2500文字)のみを見る
+    - 円/¥が数値に付いた候補から、OFF/割引/最大/還元/ポイント 等を含む文脈は除外
+    - 「送料込/送料込み/税込/販売価格/商品価格」近傍のものを優先採用
+    - それでも無ければ上部候補の最小値でフォールバック
     """
+    head = text[:2500]
+
+    # 円/¥ が数値“本体”に付いているパターンのみ
+    YEN = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
+    pat = re.compile(YEN)
+
+    # キャンペーン/条件語（これが近傍にある金額は捨てる）
+    STOP = re.compile(
+        r"(最大|OFF|円OFF|割引|クーポン|ポイント|pt|倍|還元|相当|円相当|"
+        r"上限|参考|キャンペーン|セール|特典|抽選|進呈|付与|"
+        r"以上|以下|未満|超|から|〜|~|まで|条件|対象|合計|総額|合算|値下げ前|通常価格)",
+        re.I,
+    )
+
+    # 本体価格らしい語
+    PRICE_OK = re.compile(r"(送料込|送料込み|税込|商品価格|販売価格|価格|円|¥|￥)", re.I)
+
     def to_v(s: str) -> int | None:
         return to_int_yen(s)
 
-    # 0) 共通パターン
-    YEN_PAT = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})+\s*円|\d{3,7}\s*円)"
+    strong: list[int] = []  # 必須語(送料込/税込/販売価格…)あり
+    weak:   list[int] = []  # 必須語なし（保険）
 
-    # --- A) SOLDOUT 近傍（売り切れページの定型）
-    m_sold = re.search(r"(SOLD\s*OUT|SOLDOUT)", text, re.I)
-    if m_sold:
-        i = m_sold.start()
-        # SOLDOUT の前後120文字だけを対象にして、最初に出る金額を採用
-        ctx = text[max(0, i-120): i+120]
-        m_price = re.search(YEN_PAT, ctx)
-        if m_price:
-            v = to_v(m_price.group(0))
-            if v: return v
-
-    # --- B) 見出し直下（在庫ありの定型：¥xxxx 送料込）
-    head = text[:2000]
-    mlist = list(re.finditer(rf"{YEN_PAT}\s*(?:送料込|送料込み)", head))
-    if mlist:
-        vals = [to_v(m.group(0)) for m in mlist]
-        vals = [v for v in vals if v and 0 < v < 10_000_000]
-        if vals:
-            return min(vals)
-
-    # --- C) 構造化データ / meta
-    for rx in [
-        r'"price"\s*:\s*"?(\d{3,7})"?',
-        r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})',
-        r'(?:product:price:amount|og:price:amount)"?\s*content=["\']?(\d{3,7})',
-    ]:
-        m = re.search(rx, html, re.I)
-        if m:
-            v = to_v(m.group(1))
-            if v: return v
-
-    # --- D) 最後の保険：ページ上部優先で円/¥付き
-    cands: list[tuple[int, int, int]] = []  # (score, value, index)
-    for m in re.finditer(YEN_PAT, text):
+    for m in pat.finditer(head):
         s = m.group(0)
         i = m.start()
+        ctx = head[max(0, i-120): i+len(s)+120]
+
+        # キャンペーン・条件語が近いなら除外（← 11,000円OFF を落とす）
+        if STOP.search(ctx):
+            continue
+
         v = to_v(s)
-        if not v: continue
-        # 上部ボーナス + 送料込ボーナス
-        score = (2 if i < 1500 else 0) + (1 if re.search(r"(送料込|送料込み)", text[max(0,i-40): i+len(s)+40]) else 0)
-        cands.append((score, v, i))
-    if cands:
-        best = max(s for s, _, _ in cands)
-        top = [(v, idx) for s, v, idx in cands if s == best]
-        first_idx = min(idx for v, idx in top)
-        return min(v for v, idx in top if idx == first_idx)
+        if not v or not (0 < v < 10_000_000):
+            continue
+
+        # 本体価格らしい語が近いなら強候補
+        if PRICE_OK.search(ctx):
+            strong.append(v)
+        else:
+            weak.append(v)
+
+    if strong:
+        return min(strong)   # セール価格があれば最小を採用（2,500など）
+    if weak:
+        return min(weak)
 
     return None
 
