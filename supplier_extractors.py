@@ -73,33 +73,55 @@ def fetch_html(url: str) -> str:
 
 # ========== サイト別価格抽出 ==========
 def price_from_offmall(html: str, text: str) -> int | None:
-    # HardOff NetMall（オフモール）
+    """
+    HardOff NetMall（オフモール）
+    販売価格/税込/価格 の近傍を最優先。送料/ポイント等は除外。
+    """
     STOP = re.compile(r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計|%|％)", re.I)
-    cands = []
+    PRICE_WORD = re.compile(r"(販売価格|税込|税抜|価格|本体価格|販売金額)", re.I)
 
-    # 「販売価格/税込/価格」の近傍（カンマあり/なし両対応）
-    pat_ctx = re.compile(r"(?:販売価格|税込|税抜|価格)[^0-9¥￥]{0,10}([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})", re.I)
-    for m in pat_ctx.finditer(text):
-        s = m.group(1); i = m.start(1)
-        ctx = text[max(0, i-24): i+len(s)+24]
-        if STOP.search(ctx): continue
+    cands: list[tuple[int, int]] = []
+
+    # 1) 画面テキストから候補を収集（カンマあり/なし・円/¥ 近傍）
+    pat = re.compile(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})(?:\s*円)?")
+    for m in pat.finditer(text):
+        s = m.group(1)
+        i = m.start(1)
+        ctx = text[max(0, i-30): i+len(s)+30]
+
+        if STOP.search(ctx):
+            continue
         v = to_int_yen(s)
-        if v: cands.append(v)
+        if not v or not (0 < v < 10_000_000):
+            continue
 
-    # JSON内の "price": 22000 など
+        # スコアリング：価格ワード>通貨記号>カンマ>桁
+        score = 0
+        if PRICE_WORD.search(ctx):
+            score += 5
+        if re.search(r"[¥￥]|円", s) or re.search(r"[¥￥]|円", ctx):
+            score += 3
+        if re.search(r"\d{1,3}(?:[,，]\d{3})+", s):
+            score += 1
+        if v >= 10000:
+            score += 1    # 5桁は本体価格っぽい
+        if v < 1000:
+            score -= 2    # 3桁のノイズは減点
+
+        cands.append((score, v))
+
+    # 2) HTML内の JSON/LD の "price"
     for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
         v = to_int_yen(m.group(1))
-        if v: cands.append(v)
+        if v:
+            cands.append((6, v))  # JSON price は強めに採用
 
-    # 「円」付き（保険）
-    for m in re.finditer(r'(\d{1,3}(?:[,，]\d{3})+|\d{3,7})\s*円', text):
-        s = m.group(1); i = m.start(1)
-        ctx = text[max(0, i-24): i+len(s)+24]
-        if STOP.search(ctx): continue
-        v = to_int_yen(s)
-        if v: cands.append(v)
+    if not cands:
+        return None
 
-    return min(cands) if cands else None
+    best = max(s for s, _ in cands)
+    return min(v for s, v in cands if s == best)
+
 
 
 def price_from_rakuma(html: str, text: str) -> int | None:
