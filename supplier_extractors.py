@@ -107,5 +107,5 @@ def extract_supplier_info(url: str, html: str, debug: bool = False):
         "_debug": {
             "host": host,
             "text_snippet": text[:200]
-            }
-    }
+        }
+ }
