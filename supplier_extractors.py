@@ -100,12 +100,12 @@ def extract_supplier_info(url: str, html: str, debug: bool = False):
     # …既存処理…
     if debug:
         print(f"[DEBUG] Extracting {url} ...")
- return {
-        "stock": stock,
-        "qty": qty,
-        "price": price,
-        "_debug": {
-            "host": host,
-            "text_snippet": text[:200]
-        }
- }
+    return {
+            "stock": stock,
+            "qty": qty,
+            "price": price,
+            "_debug": {
+                "host": host,
+                "text_snippet": text[:200]
+            }
+     }
