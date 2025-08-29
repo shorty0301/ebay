@@ -22,6 +22,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          
+      - name: Sanity check: show supplier_extractors.py actually used
+        run: |
+          echo "=== ls ==="
+          ls -la
+          echo "=== print module path & function source ==="
+          python - <<'PY'
+          import inspect
+          import supplier_extractors as se
+          print("MODULE FILE:", se.__file__)
+          src = inspect.getsource(se.extract_supplier_info)
+          print(src)
+          assert 'stock = "UNKNOWN"' in src, "This is not the new function (no init of stock)."
+          PY
 
       - name: Run extractor smoke test
         env:
