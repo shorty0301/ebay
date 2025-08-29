@@ -76,9 +76,8 @@ def price_from_offmall(html: str, text: str) -> int | None:
     """
     HardOff NetMall（オフモール）価格抽出
     - 「販売価格 / 税込 / 価格」近傍を最優先
-    - 送料・ポイント等は除外
     - JSON/LD の "price" があれば強く採用
-    - カンマ有無／円・¥ いずれにも対応
+    - 3桁もふつうに採用（送料表記が出ない前提）
     """
     STOP = re.compile(
         r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計|参考価格|相場|%|％)",
@@ -88,7 +87,6 @@ def price_from_offmall(html: str, text: str) -> int | None:
         r"(販売価格|税込|税抜|価格|本体価格|販売金額|セール価格|特価)",
         re.I,
     )
-    # 旧価格・定価など“高い方になりがち”な語（発見しても除外はしないが減点）
     OLD_PRICE_WORD = re.compile(r"(通常価格|定価|旧価格|値下げ前|参考価格)", re.I)
 
     def add(cands, val: int | None, score: int):
@@ -97,21 +95,20 @@ def price_from_offmall(html: str, text: str) -> int | None:
 
     cands: list[tuple[int, int]] = []
 
-    # --- 1) HTMLの構造化データ（price）を強く採用 ---
+    # 1) 構造化データ
     for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
         add(cands, to_int_yen(m.group(1)), 8)
     for m in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})', html):
         add(cands, to_int_yen(m.group(1)), 8)
-    # data-属性に埋まっている場合
     for m in re.finditer(r'data-(?:price|amount)\s*=\s*["\']?(\d{3,7})', html, re.I):
         add(cands, to_int_yen(m.group(1)), 7)
 
-    # --- 2) 画面テキスト：金額候補を拾い、文脈でスコア ---
+    # 2) 画面テキスト
     pat_money = re.compile(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})(?:\s*円)?")
     for m in pat_money.finditer(text):
         s = m.group(1)
         i = m.start(1)
-        ctx = text[max(0, i - 40) : i + len(s) + 40]
+        ctx = text[max(0, i - 40): i + len(s) + 40]
 
         if STOP.search(ctx):
             continue
@@ -120,23 +117,18 @@ def price_from_offmall(html: str, text: str) -> int | None:
         if not v:
             continue
 
+        has_currency  = bool(re.search(r"[¥￥]|円", s) or re.search(r"[¥￥]|円", ctx))
+        has_priceword = bool(PRICE_WORD.search(ctx))
+
         score = 0
-        # 価格語が近いほど強く加点
-        if PRICE_WORD.search(ctx):
+        if has_priceword:
             score += 5
-        # 通貨記号・円
-        if re.search(r"[¥￥]|円", s) or re.search(r"[¥￥]|円", ctx):
+        if has_currency:
             score += 3
-        # カンマ区切り
         if re.search(r"\d{1,3}(?:[,，]\d{3})+", s):
             score += 1
-        # 5桁以上（本体価格らしさ）
         if v >= 10_000:
             score += 1
-        # 3桁はノイズになりやすい
-        if v < 1_000:
-            score -= 2
-        # 旧価格ワードが近いときは微減点（現価格優先へ）
         if OLD_PRICE_WORD.search(ctx):
             score -= 1
 
@@ -146,7 +138,6 @@ def price_from_offmall(html: str, text: str) -> int | None:
         return None
 
     best = max(s for s, _ in cands)
-    # 同点が複数なら最小値（セール価格を選びやすく）
     return min(v for s, v in cands if s == best)
 
 
@@ -210,7 +201,11 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         qty = str(n)
         stock = "LAST_ONE" if n == 1 else "IN_STOCK"
 
-    # --- 在庫判定（スコア方式、誤検出を抑制） ---
+        # --- 在庫判定（共通・スコア方式＋soldout強制） ---
+
+    # HTMLに soldout/sold-out/sold_out があれば強制的に在庫なし寄り
+    SOLDOUT_HTML = bool(re.search(r"(sold[\s_\-]?out)", html, re.I))
+
     # 0個系は最優先で在庫なし
     if re.search(r"(残り|在庫)\s*0\s*(?:点|個|枚|本)?", text):
         stock = "OUT_OF_STOCK"
@@ -219,16 +214,16 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     if re.search(r"(残り\s*1\s*(?:点|個|枚|本)|ラスト\s*1)", text):
         stock = "LAST_ONE"
 
-    # 近傍に否定/注意語がある「売り切れ」はノーカウントにする
+    # 近傍に否定/注意語がある「売り切れ」は除外して集計
     NEG_STOP = re.compile(r"(場合|こと|可能性|恐れ|注意|お問い合わせ|ご了承ください)")
     POS_WORD = re.compile(r"(在庫あり|購入手続き|今すぐ購入|カートに入れる|ご購入|購入する|注文手続き|お買い物かご)", re.I)
-    NEG_WORD = re.compile(r"(売り切れ|在庫切れ|完売|販売終了|取扱(?:い)?終了|SOLD\s*OUT)", re.I)
+    NEG_WORD = re.compile(r"(売り切れ|在庫なし|在庫切れ|完売|販売終了|取扱(?:い)?終了|SOLD\s*OUT)", re.I)
 
     pos_score = 0
     for m in POS_WORD.finditer(text):
         i = m.start()
         ctx = text[max(0, i-25): i+len(m.group(0))+25]
-        # 「できません/不可」みたいな否定の近傍は無効化
+        # 「できません/不可」などの否定近傍は無効化
         if re.search(r"(できません|不可|入れられない|品切)", ctx):
             continue
         pos_score += 3
@@ -237,18 +232,25 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     for m in NEG_WORD.finditer(text):
         i = m.start()
         ctx = text[max(0, i-20): i+len(m.group(0))+20]
-        # 注意書きっぽい文は除外
-        if NEG_STOP.search(ctx):
+        if NEG_STOP.search(ctx):  # 注意書きはスキップ
             continue
         neg_score += 4
 
-    # 量情報があれば上書き（LAST_ONE優先）
-    if stock == "UNKNOWN":
-        if pos_score >= 3 and neg_score < 4:
-            stock = "IN_STOCK"
-        elif neg_score >= 4 and pos_score < 3:
+    # soldout がHTMLにあれば強めに加点（事実上OUT優先）
+    if SOLDOUT_HTML:
+        neg_score += 6
+
+    # 決定ロジック（LAST_ONEが最優先）
+    if stock != "LAST_ONE":
+        if neg_score >= 5 and pos_score < 3:
             stock = "OUT_OF_STOCK"
-        # どちらも強ければ未知のままにしておく（誤判定を避ける）
+        elif pos_score >= 3 and neg_score < 5:
+            stock = "IN_STOCK"
+        else:
+            # 強弱が拮抗 or どちらも弱い → 既定を維持
+            if stock == "UNKNOWN" and SOLDOUT_HTML:
+                stock = "OUT_OF_STOCK"
+
 
 
     # 価格抽出（まずサイト別 → なければ汎用）
