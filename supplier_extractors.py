@@ -64,7 +64,10 @@ def price_from_surugaya(html, text): return pick_best_price(re.findall(r"[¥￥]
 def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str, Any]:
     host = re.sub(r"^www\.", "", re.findall(r"https?://([^/]+)/?", url)[0].lower())
     text = strip_tags(html)
-    stock="UNKNOWN"; qty=""; price=float("nan")
+    # デフォルト値を最初に定義しておく
+    stock = "UNKNOWN"
+    qty   = ""
+    price = None
 
     if debug:
         print(f"[DEBUG] host={host}")
