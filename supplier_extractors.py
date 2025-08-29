@@ -74,53 +74,81 @@ def fetch_html(url: str) -> str:
 # ========== サイト別価格抽出 ==========
 def price_from_offmall(html: str, text: str) -> int | None:
     """
-    HardOff NetMall（オフモール）
-    販売価格/税込/価格 の近傍を最優先。送料/ポイント等は除外。
+    HardOff NetMall（オフモール）価格抽出
+    - 「販売価格 / 税込 / 価格」近傍を最優先
+    - 送料・ポイント等は除外
+    - JSON/LD の "price" があれば強く採用
+    - カンマ有無／円・¥ いずれにも対応
     """
-    STOP = re.compile(r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計|%|％)", re.I)
-    PRICE_WORD = re.compile(r"(販売価格|税込|税抜|価格|本体価格|販売金額)", re.I)
+    STOP = re.compile(
+        r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計|参考価格|相場|%|％)",
+        re.I,
+    )
+    PRICE_WORD = re.compile(
+        r"(販売価格|税込|税抜|価格|本体価格|販売金額|セール価格|特価)",
+        re.I,
+    )
+    # 旧価格・定価など“高い方になりがち”な語（発見しても除外はしないが減点）
+    OLD_PRICE_WORD = re.compile(r"(通常価格|定価|旧価格|値下げ前|参考価格)", re.I)
+
+    def add(cands, val: int | None, score: int):
+        if val and 0 < val < 10_000_000:
+            cands.append((score, val))
 
     cands: list[tuple[int, int]] = []
 
-    # 1) 画面テキストから候補を収集（カンマあり/なし・円/¥ 近傍）
-    pat = re.compile(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})(?:\s*円)?")
-    for m in pat.finditer(text):
+    # --- 1) HTMLの構造化データ（price）を強く採用 ---
+    for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
+        add(cands, to_int_yen(m.group(1)), 8)
+    for m in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']?(\d{3,7})', html):
+        add(cands, to_int_yen(m.group(1)), 8)
+    # data-属性に埋まっている場合
+    for m in re.finditer(r'data-(?:price|amount)\s*=\s*["\']?(\d{3,7})', html, re.I):
+        add(cands, to_int_yen(m.group(1)), 7)
+
+    # --- 2) 画面テキスト：金額候補を拾い、文脈でスコア ---
+    pat_money = re.compile(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})(?:\s*円)?")
+    for m in pat_money.finditer(text):
         s = m.group(1)
         i = m.start(1)
-        ctx = text[max(0, i-30): i+len(s)+30]
+        ctx = text[max(0, i - 40) : i + len(s) + 40]
 
         if STOP.search(ctx):
             continue
+
         v = to_int_yen(s)
-        if not v or not (0 < v < 10_000_000):
+        if not v:
             continue
 
-        # スコアリング：価格ワード>通貨記号>カンマ>桁
         score = 0
+        # 価格語が近いほど強く加点
         if PRICE_WORD.search(ctx):
             score += 5
+        # 通貨記号・円
         if re.search(r"[¥￥]|円", s) or re.search(r"[¥￥]|円", ctx):
             score += 3
+        # カンマ区切り
         if re.search(r"\d{1,3}(?:[,，]\d{3})+", s):
             score += 1
-        if v >= 10000:
-            score += 1    # 5桁は本体価格っぽい
-        if v < 1000:
-            score -= 2    # 3桁のノイズは減点
+        # 5桁以上（本体価格らしさ）
+        if v >= 10_000:
+            score += 1
+        # 3桁はノイズになりやすい
+        if v < 1_000:
+            score -= 2
+        # 旧価格ワードが近いときは微減点（現価格優先へ）
+        if OLD_PRICE_WORD.search(ctx):
+            score -= 1
 
-        cands.append((score, v))
-
-    # 2) HTML内の JSON/LD の "price"
-    for m in re.finditer(r'"price"\s*:\s*"?(\d{3,7})"?', html):
-        v = to_int_yen(m.group(1))
-        if v:
-            cands.append((6, v))  # JSON price は強めに採用
+        add(cands, v, score)
 
     if not cands:
         return None
 
     best = max(s for s, _ in cands)
+    # 同点が複数なら最小値（セール価格を選びやすく）
     return min(v for s, v in cands if s == best)
+
 
 
 
