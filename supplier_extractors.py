@@ -91,66 +91,20 @@ def fetch_html(url: str) -> str:
     return (html_pc or "") + "\n<!-- MOBILE MERGE -->\n" + (html_mb or "")
 
 # ======== 強い取得（対象3サイト専用） =========
-def _strong_get_html(url: str) -> str:
-    """
-    Amazon/Rakuten/Mercari専用の強化GET。
-    - Google参照元/各種 sec-ch ヘッダを付与
-    - PC/MB で取得、短小HTMLやブロック文言なら別UAに再試行
-    戻りは旧fetch_htmlと同じPC+MB連結
-    """
-    import requests, re
-
-    def blocked(s: str) -> bool:
-        if not s or len(s) < 800:
-            return True
-        t = s.lower()
-        return bool(re.search(
-            r"(captcha|robot|are you a robot|enable cookies|javascriptを有効|cookie|アクセスが集中|ただいまアクセス|redirecting\.\.\.)",
-            t))
-
-    UA_PC = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-    UA_MB = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
-
-    BASE = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Referer": "https://www.google.com/",
-        # ここから “それっぽさ” を追加（無くても他サイトに影響なし）
-        "sec-fetch-dest": "document",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-site": "none",
-        "sec-fetch-user": "?1",
-    }
-
-    def try_get(ua: str) -> str:
-        h = dict(BASE); h["User-Agent"] = ua
-        try:
-            with requests.Session() as s:
-                s.headers.update(h)
-                r = s.get(url, timeout=25, allow_redirects=True)
-                if r.status_code == 200 and r.text:
-                    return r.text
-        except Exception:
-            return ""
-        return ""
-
-    pc = try_get(UA_PC)
-    if blocked(pc):
-        mb = try_get(UA_MB)
-        if blocked(pc):
-            pc = try_get(UA_PC)
-    else:
-        mb = try_get(UA_MB)
-        if blocked(mb):
-            mb = try_get(UA_MB)
-
-    return (pc or "") + "\n<!-- MOBILE MERGE -->\n" + (mb or "")
+if price is None or stock == "UNKNOWN":
+    rhtml = _render_html(url)
+    if rhtml:
+        rtext = strip_tags(rhtml).replace("\u3000"," ").replace("\u00A0"," ")
+        # 既存の各サイト関数で再判定
+        if "rakuten.co.jp" in host:
+            stock = stock_from_rakuten_ichiba(rhtml, rtext) or stock
+            price = price_from_rakuten_ichiba(rhtml, rtext) or price
+        elif "amazon.co.jp" in host:
+            stock = stock_from_amazon_jp(rhtml, rtext) or stock
+            price = price_from_amazon_jp(rhtml, rtext) or price
+        elif "mercari.com" in host or "jp.mercari.com" in host:
+            stock = stock_from_mercari(rhtml, rtext) or stock
+            price = price_from_mercari(rhtml, rtext) or price
 
 # ========== サイト別価格抽出 ==========
 def price_from_offmall(html: str, text: str) -> int | None:
