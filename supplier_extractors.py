@@ -872,58 +872,70 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
+    """
+    Amazon.co.jp 価格抽出（“税込” 近傍のみ、年号ガード付き）
+    - 金額は「¥…」または「…円」だけを許可（裸の数字は不許可）
+    - “税込” の近傍(±80文字)にある金額のみ採用
+    - 500円未満は除外（単価/袋・枚など対策）
+    - 1900〜2100の数字は、通貨記号/円が無い or “年” 近傍なら除外
+    """
     import re
-    t = str(text or "")
+    t = (text or "")
     if not t:
         return None
-    # 正規化
     t = t.replace("\u3000", " ").replace("\u00A0", " ")
     t = re.sub(r"\s+", " ", t)
 
-    # 金額パターン（全角対応）
-    YEN = (
-        r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'
-        r'[¥￥]?\s*[0-9０-９]{3,7}|'
-        r'[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|'
-        r'[0-9０-９]{3,7}\s*円)'
+    # 金額（“¥1,234” / “1,234円” / “¥1234” / “1234円”）
+    MONEY = re.compile(
+        r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'      # ¥1,234
+        r'[¥￥]\s*[0-9０-９]{3,7}|'                               # ¥1234
+        r'[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|'            # 1,234円
+        r'[0-9０-９]{3,7}\s*円)'                                  # 1234円
     )
     STOP = re.compile(r"(ポイント|pt|還元|%|％|OFF|円OFF|クーポン|相当|円相当|以上|超|から|最大|上限|送料|配送料)", re.I)
     UNIT = re.compile(r"(/|あたり|当たり|/袋|/個|/枚|/本|/台|/kg|/g|/ml|/mL)", re.I)
+    YEAR_NEAR = re.compile(r"(?:19|20)\d{2}\s*年")
 
-    def _to_int(s: str) -> int | None:
-        z2h = str.maketrans("０１２３４５６７８９，", "0123456789,")
-        t2 = re.sub(r"[^\d]", "", (s or "").translate(z2h))
-        if not t2:
+    Z2H = str.maketrans("０１２３４５６７８９，", "0123456789,")
+
+    def _to_int(tok: str, ctx: str = "") -> int | None:
+        s = re.sub(r"[^\d]", "", (tok or "").translate(Z2H))
+        if not s:
             return None
-        v = int(t2)
-        return v if 500 <= v <= 3_000_000 else None
+        v = int(s)
+        # 単価つぶし
+        if v < 500 or v > 3_000_000:
+            return None
+        # 年号つぶし（通貨/円が無い or “年” 近傍なら拒否）
+        if 1900 <= v <= 2100:
+            if not re.search(r"[¥￥]|円", tok) or YEAR_NEAR.search(ctx):
+                return None
+        return v
 
     def _pick_around_tax(body: str) -> int | None:
-        """『税込』の近傍±20文字にある金額のみ採用"""
         cands: list[int] = []
         for m in re.finditer(r"税込", body):
             seg = body[max(0, m.start()-80): m.end()+80]
-            for n in re.finditer(YEN, seg):
+            for n in MONEY.finditer(seg):
                 win = seg[max(0, n.start()-60): n.end()+60]
                 if STOP.search(win) or UNIT.search(win):
                     continue
-                v = _to_int(n.group(0))
+                v = _to_int(n.group(0), win)
                 if v is not None:
                     cands.append(v)
-        if cands:
-            # 同値多数→最頻値、なければ最小値
-            from collections import Counter
-            cnt = Counter(cands)
-            top = cnt.most_common(1)[0]
-            return top[0] if top[1] >= 2 else min(cands)
-        return None
+        if not cands:
+            return None
+        from collections import Counter
+        freq = Counter(cands).most_common(1)[0]
+        return freq[0] if freq[1] >= 2 else min(cands)
 
-    # 1) 『税込』近傍（ページ本文）
+    # 1) “税込” 近傍（全体）
     v = _pick_around_tax(t)
     if isinstance(v, int):
         return v
 
-    # 2) 『通常の注文』ブロック内で『税込』近傍
+    # 2) “通常の注文” 周辺だけで再トライ
     i = t.find("通常の注文")
     if i != -1:
         seg = t[max(0, i-300): i+1500]
@@ -931,24 +943,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if isinstance(v, int):
             return v
 
-    # 3) フォールバック：ページ上部から候補抽出（STOP/UNIT除外）
-    head = t[:20000]
-    vals: list[int] = []
-    for m in re.finditer(YEN, head):
-        win = head[max(0, m.start()-80): m.end()+80]
-        if STOP.search(win) or UNIT.search(win):
-            continue
-        v = _to_int(m.group(0))
-        if v is not None:
-            vals.append(v)
-    if vals:
-        from collections import Counter
-        cnt = Counter(vals).most_common(1)[0]
-        return cnt[0] if cnt[1] >= 2 else min(vals)
-
     return None
-
-
 
 
 
