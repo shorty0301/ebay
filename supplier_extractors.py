@@ -117,17 +117,7 @@ async def fetch_price_playwright(
     label_words: tuple[str, ...] = _DEFAULT_LABEL_WORDS,
     return_extra: bool = False,
 ) -> Dict[str, Any]:
-    """
-    EC商品ページから日本円価格を抽出（Playwright使用）。
-    戻り値:
-      成功: {"price": int, "source": str, ...(return_extra時に title/brand)}
-      失敗: {"status": "price_not_found"} / {"status": "timeout_goto"}
-    抽出優先度:
-      1) 購入ボタン直前近傍の ¥（'税込/送料込/送料込み' を含むなら最優先）
-      2) JSON-LD (Offer/AggregateOffer) の price/lowPrice
-      3) <meta name="product:price:amount" content="...">
-      4) 可視テキスト全体（ラベル近傍優先 → 最頻値 → 範囲フィルタ）
-    """
+    
     try:
         from playwright.async_api import async_playwright, Error as PWError, TimeoutError as PWTimeout
         from lxml import html as LH
@@ -1078,25 +1068,119 @@ def price_from_mercari(html: str, text: str) -> int | None:
         if v: 
             return v
     return None
+    
+# ==== Mercari 専用：最初から Playwright で price/stock を取る（同期） ====
+def mercari_via_playwright_sync(url: str, timeout_ms: int = 90000, headless: bool = False) -> dict | None:
+    """
+    返り値: {"price": int | None, "stock": "IN_STOCK|OUT_OF_STOCK|LAST_ONE|UNKNOWN"}
+    - Playwrightが未インストールなら None を返すだけ（他サイトに影響なし）
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except Exception:
+        return None
 
-def mercari_price_simple(url: str, headless: bool = False) -> int | None:
+    import re
+
+    YEN_MARK = re.compile(r"(?:￥|¥)\s*([0-9０-９,，]{3,})")
+    LABEL_HIT = re.compile(r"(税込|送料込|送料込み)")
+    SOLD = re.compile(r"(SOLD\s*OUT|売り切れ|売り切れました)", re.I)
+    BUY  = re.compile(r"(購入手続きへ|購入に進む|カートに入れる|今すぐ購入)")
+    LAST1 = re.compile(r"(残り\s*1\s*(?:点|個|枚|本)|ラスト\s*1)")
+
+    def _to_int_yen_fast(s: str) -> int | None:
+        t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
+        if not t: return None
+        try:
+            v = int(t)
+            return v if 100 <= v <= 3_000_000 else None
+        except:  # noqa
+            return None
+
+    price: int | None = None
+    stock: str = "UNKNOWN"
+
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        page = browser.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2000)  # JS描画待ち
+        ctx = browser.new_context(
+            user_agent=UA,
+            locale="ja-JP",
+            extra_http_headers={"Accept-Language": "ja,en;q=0.8"},
+            viewport={"width": 1400, "height": 900},
+        )
+        page = ctx.new_page()
 
-        # 価格要素のテキストを直接探す（円 or ¥）
-        txt = page.inner_text("body")
-        import re
-        m = re.search(r"(?:￥|¥)\s*([0-9,]+)\s*円?", txt)
-        if m:
-            price = int(m.group(1).replace(",", ""))
-            browser.close()
-            return price
+        # ネットワークJSONから price を拾う（一番確実）
+        def _on_response(resp):
+            nonlocal price
+            if price is not None:
+                return
+            try:
+                ct = (resp.headers or {}).get("content-type", "")
+                if "json" in ct.lower():
+                    body = resp.text()
+                    m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', body)
+                    if m:
+                        v = _to_int_yen_fast(m.group(1))
+                        if v: price = v
+            except Exception:
+                pass
 
-        browser.close()
-        return None
+        page.on("response", _on_response)
+
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except PWTimeout:
+            ctx.close(); browser.close()
+            return {"price": None, "stock": "UNKNOWN"}
+
+        page.wait_for_timeout(1500)  # JS描画待ち（短め）
+
+        # 画面テキストで在庫を判定
+        try:
+            body = page.inner_text("body")
+        except Exception:
+            body = ""
+
+        if SOLD.search(body):
+            stock = "OUT_OF_STOCK"
+        elif LAST1.search(body):
+            stock = "LAST_ONE"
+        elif BUY.search(body):
+            stock = "IN_STOCK"
+
+        # price がまだ無ければテキストから拾う（税込/送料込が近ければ最優先）
+        if price is None:
+            # ラベル付き優先
+            for block in body.splitlines():
+                if LABEL_HIT.search(block):
+                    m = YEN_MARK.search(block)
+                    if m:
+                        v = _to_int_yen_fast(m.group(1))
+                        if v: price = v; break
+            # それでも無ければ全文から
+            if price is None:
+                m = YEN_MARK.search(body)
+                if m:
+                    v = _to_int_yen_fast(m.group(1))
+                    if v: price = v
+
+        # さらに最後の保険：DOM HTML に埋め込まれた JSON
+        if price is None:
+            html = page.content()
+            m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', html)
+            if m:
+                v = _to_int_yen_fast(m.group(1))
+                if v: price = v
+
+        ctx.close(); browser.close()
+
+    return {"price": price, "stock": stock}
+
+
 
 # ======== Rakuten helpers (GAS移植) =========
 def _availability_from_meta_or_ld(html: str) -> str | None:
@@ -1501,22 +1585,27 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
                     pass
 
 
+    # Mercari（最初から Playwright）
     elif ("mercari" in host) or ("jp.mercari.com" in host):
-        s = stock_from_mercari(html, text)
-        if s: stock = s
-        price = price_from_mercari(html, text)
-
-        # --- 一時的な強制呼び出し＆ログ ---
         try:
-            print("[DBG] calling PW fallback…")
-            v = mercari_price_via_playwright_sync(
-                url, timeout_ms=90_000, headless=False, retries=1
-            )
-            print("[DBG] PW returned:", v)
-            if isinstance(v, int):
-                price = v
-        except Exception as e:
-            print("[DBG] PW error:", e)
+           res = mercari_via_playwright_sync(url, timeout_ms=90_000, headless=False)
+        except Exception:
+            res = None
+
+        if isinstance(res, dict):
+            if res.get("stock"):
+                stock = res["stock"]
+            if isinstance(res.get("price"), int):
+                price = res["price"]
+
+        # それでも price が取れていない時だけ旧ロジックにフォールバック（任意）
+        if price is None:
+            s = stock_from_mercari(html, text)
+            if s: stock = s
+            p2 = price_from_mercari(html, text)
+            if p2 is not None:
+                price = p2
+
 
         
     elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp")) or ("rakuten.co.jp" in host):
