@@ -968,7 +968,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             if m:
                 blk = m.group(1); break
         if not blk:
-                # ---- 最終保険：上部テキストのラベル近傍（フッター年号は見ない） ----
+        # ---- 最終保険：上部テキストのラベル近傍（フッター年号は見ない） ----
         try:
             T = strip_tags(H).replace("\u3000", " ").replace("\u00A0", " ")
         except Exception:
