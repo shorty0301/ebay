@@ -871,23 +871,40 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    import re
-    H_all = str(html or "")
-    if not H_all:
-        return None
+    """
+    Amazon.co.jp 価格抽出（PC/MOBILE統合HTMLを想定）
+    - まず lxml があれば価格箱DOMから取得
+    - ダメなら価格箱だけを regex で抽出
+    - さらにダメならページ上部テキストの「ラベル↔金額」近傍と多数決で保険
+    """
+    import re, os
 
+    # === DEBUGフック（AMZ_PRICE_DEBUG=1 でログ出力） ===
+    AMZ_DBG = bool(os.getenv("AMZ_PRICE_DEBUG"))
+    def _emit(v, src, tok=""):
+        if AMZ_DBG:
+            t = (tok or "").strip().replace("\n", " ")[:120]
+            print(f"[AMZ price] {v}  src={src}  tok='{t}'")
+
+    H_all = str(html or "")
+
+    # fetch_html() は PC+MOBILE を <!-- MOBILE MERGE --> で繋いで返す仕様
     parts = (
         re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I)
-        if "<!-- MOBILE MERGE -->" in H_all else [H_all]
+        if "<!-- MOBILE MERGE -->" in H_all else
+        [H_all]
     )
 
+    # --- 共通ヘルパ ---
     def _to(token: str) -> int | None:
+        # まず既存ヘルパ to_int_yen を試す（外部定義）
         v = to_int_yen(token)
         if v is not None and 100 <= v <= 3_000_000:
-            # 小額の裸数字は捨てる
+            # 500未満の“裸数字”は誤検出（サイズ/型番/送料閾値など）を弾く
             if v < 500 and not re.search(r"[¥￥]|円", token):
                 return None
             return v
+        # 素の数字も一応拾う（全角・カンマ除去）
         t = re.sub(r"[^\d]", "", token or "")
         if not t:
             return None
@@ -898,17 +915,22 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                     return None
                 return v
         except Exception:
-            return None
+            pass
+        return None
 
-    YEN_TXT = re.compile(
-        r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|'
-        r'[¥￥]?\s*\d{3,7}|'
-        r'\d{1,3}(?:[,，]\d{3})\s*円|'
-        r'\d{3,7}\s*円)'
-    )
+    # ラベル近傍のノイズ/しきい値判定
+    BAD   = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券)", re.I)
+    THNUM = re.compile(r'[¥￥]?\s*\d{3,5}\s*円?\s*(?:以上|超|から)', re.I)
+    FREE  = re.compile(r'(送料無料|通常配送無料|配送料無料|無料配送)', re.I)
+    YEN   = re.compile(r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)')
 
-    def _pick_from_one(H: str) -> int | None:
-        # 1) lxml があれば DOM から
+    def _is_threshold(s: str) -> bool:
+        # 「○○円以上で送料無料」みたいな送料閾値を除外
+        return bool(THNUM.search(s) and FREE.search(s))
+
+    # --- 単一HTMLを走査 ---
+    def _scan_single(H: str) -> int | None:
+        # 1) lxml で価格箱DOMを直読
         try:
             from lxml import html as LH
             doc = LH.fromstring(H)
@@ -917,115 +939,166 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 '@id="corePriceDisplay_desktop_feature_div" or '
                 '@id="corePrice_feature_div" or '
                 '@id="corePriceDisplay_mobile_feature_div" or '
-                '@id="apex_desktop" or '
-                '@id="apex_priceDisplay" or '
-                'contains(@class,"priceToPay")]'
+                '@id="apex_desktop"]'
             )
 
-            # a-offscreen
+            # (a-1) a-offscreen
             for r in roots:
                 for txt in r.xpath('.//span[contains(@class,"a-offscreen")]/text()'):
                     v = _to(txt)
-                    if v: return v
+                    if v:
+                        _emit(v, "dom:offscreen", txt)
+                        return v
 
-            # a-price-whole（小数分割の整数部）
+            # (a-2) a-price-whole（小数分割）
             for r in roots:
                 wholes = r.xpath('.//span[contains(@class,"a-price-whole")]/text()')
                 if wholes:
                     v = _to(wholes[0])
-                    if v: return v
+                    if v:
+                        _emit(v, "dom:whole", wholes[0])
+                        return v
 
-            # data-a-color="price" / class*="price"
+            # (a-3) data-a-color="price" 近傍の素テキスト
             for r in roots:
                 seg = " ".join(r.xpath('.//*[contains(@data-a-color,"price") or contains(@class,"price")]/text()'))
-                m = YEN_TXT.search(seg)
+                m = YEN.search(seg)
                 if m:
                     v = _to(m.group(0))
-                    if v: return v
+                    if v:
+                        _emit(v, "dom:data-a-color", m.group(0))
+                        return v
 
-            # 旧ID
-            for txt in doc.xpath('//*[@id="priceblock_ourprice" or @id="priceblock_dealprice" or @id="priceblock_saleprice" or @id="sns-base-price"]/text()'):
+            # (a-4) ラベル真横（±120文字）
+            LABELS = ("通常の注文", "税込", "価格", "販売価格", "お支払い金額", "支払金額")
+            for r in roots:
+                t = " ".join(r.xpath(".//text()"))
+                for lab in LABELS:
+                    for mm in re.finditer(re.escape(lab), t):
+                        win = t[max(0, mm.start()-120): mm.end()+120]
+                        if BAD.search(win) or _is_threshold(win):
+                            continue
+                        m2 = YEN.search(win)
+                        if m2:
+                            v = _to(m2.group(0))
+                            if v:
+                                _emit(v, "dom:label-near", m2.group(0))
+                                return v
+
+            # (a-5) 旧ID（ごく旧）
+            for txt in doc.xpath('//*[@id="priceblock_ourprice" or @id="priceblock_dealprice" or @id="sns-base-price"]/text()'):
                 v = _to(txt)
-                if v: return v
-        except Exception:
-            pass
-
-        # 2) regex: 価格箱ブロック（id / class 両対応）
-        blk = ""
-        targets = (
-            ("priceToPay", 8000),
-            ("corePriceDisplay_desktop_feature_div", 10000),
-            ("corePrice_feature_div", 10000),
-            ("corePriceDisplay_mobile_feature_div", 10000),
-            ("apex_desktop", 12000),
-            ("apex_priceDisplay", 12000),
-        )
-        for attr in ("id", "class"):
-            for bid, span in targets:
-                m = re.search(
-                    rf'{attr}=["\'][^"\']*\b{bid}\b[^"\']*["\']([\s\S]{{0,{span}}})',
-                    H, re.I
-                )
-                if m:
-                    blk = m.group(1); break
-            if blk: break
-
-        if blk:
-            # (b-1) a-offscreen in blk（近傍ノイズは無視）
-            for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]+)\s*<', blk, re.I):
-                v = _to(m.group(1))
-                if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", m.group(1))):
+                if v:
+                    _emit(v, "dom:legacy", txt)
                     return v
 
-            # (b-2) a-price-whole in blk
-            m = re.search(r'class=["\']a-price-whole["\'][^>]*>\s*([0-9０-９,，]+)\s*<', blk, re.I)
-            if m:
-                v = _to(m.group(1))
-                if v: return v
+        except Exception:
+            # lxml無し/失敗 → 次へ
+            pass
 
-            # (b-3) price系テキスト in blk
+        # 2) regex：価格箱ブロックだけ抽出して読む
+        blk = ""
+        for bid, span in (
+            ("priceToPay", 3000),
+            ("corePriceDisplay_desktop_feature_div", 6000),
+            ("corePrice_feature_div", 6000),
+            ("corePriceDisplay_mobile_feature_div", 6000),
+            ("apex_desktop", 8000),
+        ):
+            m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
+            if m:
+                blk = m.group(1)
+                break
+
+        if blk:
+            # (b-1) a-offscreen（￥/円 無くてもOK。ただし年号や小額ノイズ除外）
+            for mm in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I):
+                tok = mm.group(1)
+                v = _to(tok)
+                if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
+                    _emit(v, "blk:offscreen", tok)
+                    return v
+
+            # (b-2) ラベル近傍（±120） ※送料閾値/ノイズ除外
             sblk = re.sub(r"\s+", " ", blk)
-            m = re.search(YEN_TXT, sblk)
-            if m:
-                v = _to(m.group(0))
-                if v: return v
+            LABEL_NEAR = re.compile(
+                r'(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)[^¥￥\d]{0,40}'
+                r'((?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円))',
+                re.I
+            )
+            for mm in LABEL_NEAR.finditer(sblk):
+                win = mm.group(0)
+                if BAD.search(win) or _is_threshold(win):
+                    continue
+                tok = mm.group(2)
+                v = _to(tok)
+                if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
+                    _emit(v, "blk:label-near", tok)
+                    return v
 
-        # 2.5) グローバル a-offscreen（保険・ノイズ語は無視しない）
-        for m in re.finditer(r'<span[^>]+class=["\'][^"\']*a-offscreen[^"\']*["\'][^>]*>\s*([^<]+)\s*<', H, re.I):
-            v = _to(m.group(1))
-            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", m.group(1))):
-                return v
+            # (b-3) a-price-whole（小数分割のwhole）
+            for mm in re.finditer(r'class=["\'][^"\']*a-price-whole[^"\']*["\'][^>]*>\s*([\d,，]{1,10})\s*<', blk, re.I):
+                tok = mm.group(1)
+                v = _to(tok)
+                if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
+                    _emit(v, "blk:whole", tok)
+                    return v
 
-        # 2.6) グローバル a-price-whole（保険）
-        m = re.search(r'class=["\']a-price-whole["\'][^>]*>\s*([0-9０-９,，]+)\s*<', H, re.I)
-        if m:
-            v = _to(m.group(1))
-            if v: return v
-
-        # 3) テキスト上部から “出現多数（モード）”
+        # 3) ページ上部テキストの保険（ラベル↔金額 + 多数決）
         try:
             T = strip_tags(H).replace("\u3000", " ").replace("\u00A0", " ")
         except Exception:
             T = re.sub("<[^>]+>", " ", H)
         head = T[:15000]
 
+        STOP   = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|通常配送無料|配送料無料|送料無料|以上で)", re.I)
+        LABELS = r"(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)"
+        YEN_RX = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)"
+
+        # (c-1) ラベル → 金額
+        for mm in re.finditer(LABELS + r"[^\d¥￥]{0,20}" + YEN_RX, head, re.I):
+            tok = re.search(YEN_RX, mm.group(0), re.I).group(0)
+            ctx = head[max(0, mm.start()-60): mm.end()+60]
+            if STOP.search(ctx) or _is_threshold(ctx):
+                continue
+            v = _to(tok)
+            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
+                _emit(v, "txt:l2y", tok)
+                return v
+
+        # (c-2) 金額 → ラベル
+        for mm in re.finditer(YEN_RX + r"[^\d¥￥]{0,20}" + LABELS, head, re.I):
+            tok = re.search(YEN_RX, mm.group(0), re.I).group(0)
+            ctx = head[max(0, mm.start()-60): mm.end()+60]
+            if STOP.search(ctx) or _is_threshold(ctx):
+                continue
+            v = _to(tok)
+            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
+                _emit(v, "txt:y2l", tok)
+                return v
+
+        # (c-3) 出現多数（同額が2回以上）
         from collections import Counter
-        vals = []
-        for m in re.finditer(YEN_TXT, head):
-            v = _to(m.group(0))
-            if v: vals.append(v)
+        vals: list[int] = []
+        for mm in re.finditer(r"[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円", head):
+            v = _to(mm.group(0))
+            if v:
+                vals.append(v)
         if vals:
             v, cnt = Counter(vals).most_common(1)[0]
             if cnt >= 2 and not (1900 <= v <= 2100):
+                _emit(v, "txt:mode", f"count={cnt}")
                 return v
 
         return None
 
+    # PC/MOBILE どちらかで取れたら採用
     for H in parts:
-        v = _pick_from_one(H)
+        v = _scan_single(H)
         if isinstance(v, int):
             return v
     return None
+
 
 
     def _pick_from_single(H: str) -> int | None:
