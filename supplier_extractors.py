@@ -8,8 +8,14 @@ GAS版からPython移植
 import re, json, functools, requests
 from typing import Dict, Any
 from bs4 import BeautifulSoup
+import os
 
 # ======== 共通ユーティリティ ==========
+CI_MODE = bool(os.getenv("GITHUB_ACTIONS") or os.getenv("CI"))
+HTTP_TIMEOUT = 7 if CI_MODE else 20           # 20s → CIでは 7s
+AMZ_FOLLOW_ENABLED = not CI_MODE              # CI中は /dp/ 追撃取得しない
+PLAYWRIGHT_ENABLED = not CI_MODE              # CI中は Playwright 呼ばない
+
 def strip_tags(s: str) -> str:
     """HTMLからテキストを抽出（alt/title/aria-labelも補完）"""
     if not s:
@@ -28,7 +34,6 @@ def strip_tags(s: str) -> str:
         if texts:
             tag.append(" ".join(texts))
 
-    # テキスト化
     t = soup.get_text(" ", strip=True)
     return re.sub(r"\s+", " ",
                   t.replace("\u00A0", " ")
@@ -50,20 +55,10 @@ def parse_yen_strict(raw: str) -> float:
     return float("nan")
     
 def to_int_yen_fuzzy(s: str, lo: int = 1, hi: int = 10_000_000) -> int | None:
-    """
-    価格の“変な表記”もできるだけ円に正規化して整数で返す。
-    例:
-      - '1万2,345円' → 12345
-      - '1.2万' → 12000
-      - '12,000〜15,000円' / '12,000-15,000円' → 12000（下限を採用）
-      - '￥12,345-（税込）' / '約 12 345 円' → 12345
-      - 全角混在 / スペース混在 / 記号混在 も許容
-    """
     if not s:
         return None
     raw = str(s)
 
-    # 正規化（全角→半角、ノーブレークスペース/狭いスペース除去）
     x = z2h_digits(raw)
     x = (x.replace("\u00A0", " ")
            .replace("\u202F", " ")
@@ -71,17 +66,13 @@ def to_int_yen_fuzzy(s: str, lo: int = 1, hi: int = 10_000_000) -> int | None:
     x = re.sub(r"[ \t\r\n]", "", x)
     x = x.replace("円税込", "円").replace("税込", "").replace("税抜", "")
 
-    # 範囲（〜, ~, －, -）→ 下限を採用
     x = re.sub(r"[~〜\-ｰ－—–‒]+", "〜", x)  # 記号を統一
     if "〜" in x:
         x = x.split("〜", 1)[0]
 
-    # カッコ・ハイフン・末尾記号の除去
     x = re.sub(r"[()（）〔〕［］【】<>＜＞]", "", x)
     x = re.sub(r"[^\d万,，.¥￥円]", "", x)  # 記号を限定
 
-    # 「万」表記（'1.2万','12万3,456円' など）
-    # まず 'A万B' → A*10000 + B を優先（Bは3～4桁を想定）
     m = re.match(r"^(\d+(?:\.\d+)?)[万]\s*([¥￥]?\s*\d{1,4}(?:[,，]\d{3})*|[¥￥]?\s*\d+)?", x)
     if m:
         a = float(m.group(1))
@@ -94,15 +85,12 @@ def to_int_yen_fuzzy(s: str, lo: int = 1, hi: int = 10_000_000) -> int | None:
         if lo <= v <= hi:
             return v
 
-    # 単独「万」（'1.2万', '12万'）
     m = re.match(r"^(\d+(?:\.\d+)?)[万]", x)
     if m:
         v = int(float(m.group(1)) * 10000)
         if lo <= v <= hi:
             return v
 
-    # 通常（￥12,345円 / 12,345円 / ￥12345- など）
-    # 最初に現れる「数字群」を取る
     m = re.search(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d+)", x)
     if not m:
         return None
@@ -126,12 +114,6 @@ def pick_best_price(cands) -> float:
     return min(nums) if nums else float("nan")
 
 def to_int_yen(s: str) -> int | None:
-    """
-    金額文字列を整数（円）に変換。
-    ・全角→半角
-    ・カンマ/記号を除去
-    ・範囲: 1〜9,999,999
-    """
     t = re.sub(r"[^\d]", "", z2h_digits(str(s or "")))
     if not t:
         return None
@@ -140,11 +122,10 @@ def to_int_yen(s: str) -> int | None:
         return v if 0 < v < 10_000_000 else None
     except:
         return None
+        
 # ============================================================
 # Playwright版 価格抽出（任意利用・既存処理へは未接続：副作用なし）
 # ============================================================
-# 依存: playwright.async_api, bs4, lxml, re
-
 import asyncio as _asyncio
 import json as _json
 import re as _re
@@ -393,9 +374,10 @@ def fetch_html(url: str) -> str:
 
     def try_get(u, ua):
         try:
-            r=requests.get(u, headers=headers(ua), timeout=20)
+            r=requests.get(u, headers=headers(ua), timeout=HTTP_TIMEOUT)
             if r.status_code==200: return r.text
-        except: return ""
+        except requests.RequestException:
+            return ""
         return ""
 
     html_pc = try_get(url, ua_pc)
@@ -1700,6 +1682,15 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
             need_follow = True
         if re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", html or "", re.I):
             need_follow = True
+        if CI_MODE:
+            need_follow = False
+        if price is None and PLAYWRIGHT_ENABLED:
+            try:
+                p3 = amazon_price_via_playwright_sync(dp_url or url, headless=True)
+            except Exception:
+                p3 = None
+            if isinstance(p3, int):
+                price = p3
 
         # 2nd pass: HTMLから /dp/… を推定して一度だけ再取得（正規URLへ寄せる）
         dp_url = None
@@ -1856,25 +1847,15 @@ def _strong_get_html(url: str) -> str:
 
         import requests, re
         sess = requests.Session()
+
+        from requests.adapters import HTTPAdapter
+        sess.mount("https://", HTTPAdapter(max_retries=1))
+        sess.mount("http://",  HTTPAdapter(max_retries=1))
+        
         UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
         UA_MB = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-        H_PC = {
-            "User-Agent": UA_PC,
-            "Accept-Language": "ja,en;q=0.8",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Referer": "https://www.google.com/",
-            "Upgrade-Insecure-Requests": "1",
-        }
-        H_MB = {
-            "User-Agent": UA_MB,
-            "Accept-Language": "ja,en;q=0.8",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Referer": "https://www.google.com/",
-        }
+        H_PC = {"User-Agent": UA_PC, "Accept-Language": "ja,en;q=0.8", "Referer": "https://www.google.com/"}
+        H_MB = {"User-Agent": UA_MB, "Accept-Language": "ja,en;q=0.8", "Referer": "https://www.google.com/"}
 
         def _get(u, headers):
             try:
@@ -1882,35 +1863,27 @@ def _strong_get_html(url: str) -> str:
                 return r.status_code, (r.text or "")
             except Exception:
                 return 0, ""
-
+        if CI_MODE:
+            for hdr in (H_PC, H_MB):
+                sc, h = _get(url, hdr)
+                if sc == 200 and h:
+                    return h
+            return ""
         htmls: list[str] = []
+        sc1, h1 = _get(url, H_PC);  sc2, h2 = _get(url, H_MB)
+        if sc1 == 200 and h1: htmls.append(h1)
+        if sc2 == 200 and h2: htmls.append(h2)
 
-        # 1) 入力URL（そのまま）
-        sc1, h1 = _get(url, H_PC)
-        if sc1 == 200 and h1:
-            htmls.append(h1)
-        sc2, h2 = _get(url, H_MB)
-        if sc2 == 200 and h2:
-            htmls.append(h2)
-
-        # 2) URLに /dp/ASIN が含まれていれば、クエリを落として正規化
         m = re.search(r"(https?://[^/]*amazon\.co\.jp)/(?:.*?)(/(?:dp|gp/product)/[A-Z0-9]{10})", url, re.I)
         if m:
             canon = m.group(1).rstrip("/") + m.group(2)
-            sc3, h3 = _get(canon, H_PC)
-            if sc3 == 200 and h3:
-                htmls.append(h3)
-            sc4, h4 = _get(canon + "?psc=1", H_PC)
-            if sc4 == 200 and h4:
-                htmls.append(h4)
-                
-        # 3) 取れた中で最長のHTMLを返す（空なら空文字）
+            sc3, h3 = _get(canon, H_PC);  sc4, h4 = _get(canon + "?psc=1", H_PC)
+            if sc3 == 200 and h3: htmls.append(h3)
+            if sc4 == 200 and h4: htmls.append(h4)
+      
         def _is_robot(h: str) -> bool:
             return bool(re.search(r"(Robot Check|captcha|自動アクセス|ロボットによる|enable cookies)", h, re.I))
-
-        candidates = [h for h in htmls if h]
-        non_robot = [h for h in candidates if not _is_robot(h)]
-        pool = non_robot or candidates
+        pool = [h for h in htmls if h and not _is_robot(h)] or htmls
         return max(pool, key=len) if pool else ""
     except Exception:
         return ""
