@@ -872,95 +872,80 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """
-    Amazon.co.jp 価格抽出（強制的に「通常の注文」＞「税込の真横」）
-    優先順:
-      1) HTML内の「通常の注文」周辺 (±数千文字) で “税込 の直前/直後” の金額
-      2) 既知の価格箱 (priceToPay / corePrice* / apex_desktop) 内の a-offscreen / a-price-whole
-      3) 最後に HTML全体の “税込の真横”
-    500円未満はノイズとして破棄。
-    """
     import re
 
-    H = str(html or "")
-    parts = H.split("<!-- MOBILE MERGE -->") if "<!-- MOBILE MERGE -->" in H else [H]
+    T = str(text or "")
+    if not T:
+        return None
 
-    def _z2h(s: str) -> str:
-        return (s or "").translate(str.maketrans("０１２３４５６７８９，", "0123456789,"))
+    # 正規化
+    T = (T.replace("\u00A0", " ")
+           .replace("\u3000", " ")
+           .replace("\u202F", " ")
+           .replace("\u2009", " "))
 
-    def _to(tok: str) -> int | None:
-        t = re.sub(r"[^\d]", "", _z2h(tok))
+    # 金額パターン（全角数字/カンマ対応）
+    YEN = re.compile(
+        r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'
+        r'[¥￥]\s*[0-9０-９]{3,7}|'
+        r'[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|'
+        r'[0-9０-９]{3,7}\s*円)'
+    )
+
+    BAD_NEAR = re.compile(
+        r"(ポイント|pt|還元|%|％|OFF|円OFF|クーポン|相当|円相当|"
+        r"以上|超|から|送料|配送料|/袋|/個)", re.I
+    )
+
+    def _to_int(s: str) -> int | None:
+        t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
         if not t:
             return None
         v = int(t)
         return v if 500 <= v <= 3_000_000 else None
 
-    YEN = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})"
-    SEP = r"(?:[^0-9]{0,20}(?:<[^>]+>[^0-9]{0,20}){0,2})"
-    PAT_R = re.compile(rf"税込{SEP}({YEN})(?:\s*円)?", re.I)
-    PAT_L = re.compile(rf"({YEN})(?:\s*円)?{SEP}税込", re.I)
-    LABEL = re.compile(r"(通常の注文|通常注文|通常のご注文|一回限りの注文|1回の注文|１回の注文)")
+    def _pick_from_segment(seg: str, base_score: int) -> list[tuple[int, int]]:
+        """seg内から候補を拾って (score, value) を返す"""
+        out: list[tuple[int,int]] = []
+        for m in YEN.finditer(seg):
+            tok = m.group(0)
+            ctx = seg[max(0, m.start()-40): m.end()+40]
+            if BAD_NEAR.search(ctx):
+                continue
+            v = _to_int(tok)
+            if v is None:
+                continue
+            score = base_score
+            if "税込" in ctx:
+                score += 5
+            out.append((score, v))
+        return out
 
-    def _scan_html_block(block: str) -> int | None:
-        # “税込” の左右いずれかにある金額を優先
-        for rx in (PAT_L, PAT_R):
-            for m in rx.finditer(block):
-                v = _to(m.group(1))
-                if v is not None:
-                    return v
+    cands: list[tuple[int,int]] = []
 
-        # 価格箱の中身
-        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]+)<', block, re.I):
-            v = _to(m.group(1))
-            if v is not None:
-                return v
+    # 1) 「通常の注文」近傍（最優先）
+    for m in re.finditer(r"(通常の注文|通常のご注文|一回限りの注文|１回の注文|1回の注文)", T):
+        seg = T[max(0, m.start()-200): m.end()+800]
+        cands += _pick_from_segment(seg, 30)
+        break  # 最初のブロックで十分
 
-        m = re.search(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]+)\s*<', block, re.I)
-        if m:
-            v = _to(m.group(1))
-            if v is not None:
-                return v
+    # 2) 「税込」の周辺
+    for m in re.finditer(r"税込", T[:20000]):
+        seg = T[max(0, m.start()-80): m.end()+80]
+        cands += _pick_from_segment(seg, 20)
 
-        # 最後の保険：円付き
-        m = re.search(rf"{YEN}\s*円", block)
-        if m:
-            v = _to(m.group(0))
-            if v is not None:
-                return v
+    # 3) 購入ボタン近傍
+    for m in re.finditer(r"(カートに入れる|今すぐ買う|今すぐ購入)", T[:20000]):
+        seg = T[max(0, m.start()-400): m.end()+400]
+        cands += _pick_from_segment(seg, 15)
+
+    if not cands:
         return None
 
-    for Hpart in parts:
-        # 1) 「通常の注文」周辺（最優先）
-        m = LABEL.search(Hpart)
-        if m:
-            i = m.start()
-            win = Hpart[max(0, i - 3000): i + 12000]
-            v = _scan_html_block(win)
-            if v is not None:
-                return v
+    # 同点は最小値（通常価格）を採用
+    best = max(s for s, _ in cands)
+    return min(v for s, v in cands if s == best)
 
-        # 2) 既知の価格箱
-        for bid, span in (
-            ("priceToPay", 15000),
-            ("corePriceDisplay_desktop_feature_div", 15000),
-            ("corePrice_feature_div", 15000),
-            ("corePriceDisplay_mobile_feature_div", 15000),
-            ("apex_desktop", 20000),
-        ):
-            mm = re.search(rf'id=["\']{bid}["\'][\s\S]{{0,{span}}}', Hpart, re.I)
-            if not mm and bid == "priceToPay":
-                mm = re.search(rf'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\'][\s\S]{{0,{span}}}', Hpart, re.I)
-            if mm:
-                v = _scan_html_block(mm.group(0))
-                if v is not None:
-                    return v
-
-        # 3) 保険：ページ先頭側
-        v = _scan_html_block(Hpart[:40000])
-        if v is not None:
-            return v
-
-    return None
 
 
 
