@@ -964,10 +964,10 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                   ("corePrice_feature_div", 6000),
                   ("corePriceDisplay_mobile_feature_div", 6000),
                   ("apex_desktop", 8000)):
-    m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
-    if m:
-        blk = m.group(1)
-        break
+        m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
+        if m:
+            blk = m.group(1)
+            break
 
     if not blk:
         # ---- 最終保険：上部テキストのラベル近傍（フッター年号は見ない） ----
