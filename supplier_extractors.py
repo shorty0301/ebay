@@ -876,7 +876,6 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     Amazon.co.jp 価格抽出（強制的に「通常の注文」＞「税込の真横」）
     優先順:
       1) HTML内の「通常の注文」周辺 (±数千文字) で “税込 の直前/直後” の金額
-         ※ タグ挟み込みや全角/半角スペースも許容、近接は最大 ~20 文字まで
       2) 既知の価格箱 (priceToPay / corePrice* / apex_desktop) 内の a-offscreen / a-price-whole
       3) 最後に HTML全体の “税込の真横”
     500円未満はノイズとして破棄。
@@ -884,64 +883,63 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     import re
 
     H = str(html or "")
-
-    # MOBILE MERGE 対応
     parts = H.split("<!-- MOBILE MERGE -->") if "<!-- MOBILE MERGE -->" in H else [H]
 
-    # 変換（全角→半角）
     def _z2h(s: str) -> str:
         return (s or "").translate(str.maketrans("０１２３４５６７８９，", "0123456789,"))
 
     def _to(tok: str) -> int | None:
-        from re import sub
-        t = sub(r"[^\d]", "", _z2h(tok))
+        t = re.sub(r"[^\d]", "", _z2h(tok))
         if not t:
             return None
         v = int(t)
         return v if 500 <= v <= 3_000_000 else None
 
-    # 金額（¥/裸数字どちらも）— “円” は別途オプションで吸う
     YEN = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})"
-    # 「数字と税込の間にタグ/記号が多少入ってもOK」にするセパレータ
     SEP = r"(?:[^0-9]{0,20}(?:<[^>]+>[^0-9]{0,20}){0,2})"
-
-    # 税込←→金額（左右どちらでも可）
-    PAT_R = re.compile(rf"税込{SEP}({YEN})(?:\s*円)?", re.I)       # 税込 の右に 金額
-    PAT_L = re.compile(rf"({YEN})(?:\s*円)?{SEP}税込", re.I)       # 金額 の右に 税込
-
-    # 「通常の注文」系ラベル（スマホ/表記ゆれ含む）
+    PAT_R = re.compile(rf"税込{SEP}({YEN})(?:\s*円)?", re.I)
+    PAT_L = re.compile(rf"({YEN})(?:\s*円)?{SEP}税込", re.I)
     LABEL = re.compile(r"(通常の注文|通常注文|通常のご注文|一回限りの注文|1回の注文|１回の注文)")
 
     def _scan_html_block(block: str) -> int | None:
-        # まず「税込の真横」を両方向で探す
+        # “税込” の左右いずれかにある金額を優先
         for rx in (PAT_L, PAT_R):
             for m in rx.finditer(block):
                 v = _to(m.group(1))
-                if v:
+                if v is not None:
                     return v
-        # 価格箱の中身（a-offscreen / a-price-whole）
+
+        # 価格箱の中身
         for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]+)<', block, re.I):
-            v = _to(m.group(1));  if v: return v
+            v = _to(m.group(1))
+            if v is not None:
+                return v
+
         m = re.search(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]+)\s*<', block, re.I)
         if m:
-            v = _to(m.group(1));  if v: return v
-        # 最後の保険：円付きの書式だけ許容
+            v = _to(m.group(1))
+            if v is not None:
+                return v
+
+        # 最後の保険：円付き
         m = re.search(rf"{YEN}\s*円", block)
         if m:
-            v = _to(m.group(0));  if v: return v
+            v = _to(m.group(0))
+            if v is not None:
+                return v
         return None
 
     for Hpart in parts:
-        # 1) 「通常の注文」周辺だけを強制的に切り出して読む（ここが最優先）
+        # 1) 「通常の注文」周辺（最優先）
         m = LABEL.search(Hpart)
         if m:
             i = m.start()
-            win = Hpart[max(0, i-3000): i+12000]   # 少し広めに見る
+            win = Hpart[max(0, i - 3000): i + 12000]
             v = _scan_html_block(win)
-            if v:
+            if v is not None:
                 return v
 
-        # 2) 既知の価格箱だけをピンポイントで読む
+        # 2) 既知の価格箱
         for bid, span in (
             ("priceToPay", 15000),
             ("corePriceDisplay_desktop_feature_div", 15000),
@@ -954,15 +952,16 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 mm = re.search(rf'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\'][\s\S]{{0,{span}}}', Hpart, re.I)
             if mm:
                 v = _scan_html_block(mm.group(0))
-                if v:
+                if v is not None:
                     return v
 
-        # 3) 最後の保険：ページ先頭側 HTML から “税込の真横”
+        # 3) 保険：ページ先頭側
         v = _scan_html_block(Hpart[:40000])
-        if v:
+        if v is not None:
             return v
 
     return None
+
 
 
 
