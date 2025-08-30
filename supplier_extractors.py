@@ -872,101 +872,82 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """
-    Amazon.co.jp: 価格箱と「税込」近傍だけから支払価格を抽出。
-    - 価格箱(#priceToPay / #corePrice* / #apex_desktop)内の「税込」に最も近い金額を最優先
-    - 次に「通常の注文」ブロック
-    - 最後にページ全体の「税込」近傍
-    - 500円未満や「/袋」「/個」「ポイント」「％」「OFF」「送料」近傍は除外
-    """
     import re
-
-    H = str(html or "")
-    if not H:
+    t = str(text or "")
+    if not t:
         return None
+    # 正規化
+    t = t.replace("\u3000", " ").replace("\u00A0", " ")
+    t = re.sub(r"\s+", " ", t)
 
-    # 金額（全角数字・全角カンマ対応）
-    YEN = re.compile(
+    # 金額パターン（全角対応）
+    YEN = (
         r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'
-        r'[¥￥]\s*[0-9０-９]{3,7}|'
+        r'[¥￥]?\s*[0-9０-９]{3,7}|'
         r'[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|'
         r'[0-9０-９]{3,7}\s*円)'
     )
-    BAD_NEAR = re.compile(r"(ポイント|pt|還元|%|％|OFF|円OFF|クーポン|相当|円相当|以上|超|から|送料|配送料|/袋|/個)", re.I)
+    STOP = re.compile(r"(ポイント|pt|還元|%|％|OFF|円OFF|クーポン|相当|円相当|以上|超|から|最大|上限|送料|配送料)", re.I)
+    UNIT = re.compile(r"(/|あたり|当たり|/袋|/個|/枚|/本|/台|/kg|/g|/ml|/mL)", re.I)
 
     def _to_int(s: str) -> int | None:
-        t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
-        if not t:
+        z2h = str.maketrans("０１２３４５６７８９，", "0123456789,")
+        t2 = re.sub(r"[^\d]", "", (s or "").translate(z2h))
+        if not t2:
             return None
-        v = int(t)
+        v = int(t2)
         return v if 500 <= v <= 3_000_000 else None
 
-    def _pick_in_block(block: str) -> int | None:
-        if not block:
-            return None
-        # まず「税込」位置
-        tax_pos = block.find("税込")
-        # 候補収集（NGワード近傍/小額は除外）
-        candidates: list[tuple[int, int, int, int]] = []  # (score, start, end, value)
-        for m in YEN.finditer(block):
-            s, e = m.start(), m.end()
-            ctx = block[max(0, s-60): e+60]
-            if BAD_NEAR.search(ctx):
-                continue
-            v = _to_int(m.group(0))
-            if v is None:
-                continue
-            # スコア: 「税込」に近いほど高評価、タグ内先頭ほど少し加点
-            score = 0
-            if tax_pos != -1:
-                # 税込より左側（本体価格）を優先
-                if e <= tax_pos + 2:
-                    score += 20
-                # 税込までの距離の逆数
-                score += max(0, 12 - abs((tax_pos - e)//10))
-            # “円/¥” 表記は微加点（裸数字より確度高）
-            if re.search(r"[¥￥]|円", m.group(0)):
-                score += 2
-            candidates.append((score, s, e, v))
+    def _pick_around_tax(body: str) -> int | None:
+        """『税込』の近傍±20文字にある金額のみ採用"""
+        cands: list[int] = []
+        for m in re.finditer(r"税込", body):
+            seg = body[max(0, m.start()-80): m.end()+80]
+            for n in re.finditer(YEN, seg):
+                win = seg[max(0, n.start()-60): n.end()+60]
+                if STOP.search(win) or UNIT.search(win):
+                    continue
+                v = _to_int(n.group(0))
+                if v is not None:
+                    cands.append(v)
+        if cands:
+            # 同値多数→最頻値、なければ最小値
+            from collections import Counter
+            cnt = Counter(cands)
+            top = cnt.most_common(1)[0]
+            return top[0] if top[1] >= 2 else min(cands)
+        return None
 
-        if not candidates:
-            return None
-        # 最高スコアの中から最小値（通常価格）を返す
-        best = max(c[0] for c in candidates)
-        return min(c[3] for c in candidates if c[0] == best)
+    # 1) 『税込』近傍（ページ本文）
+    v = _pick_around_tax(t)
+    if isinstance(v, int):
+        return v
 
-    # 1) 価格箱
-    for bid, span in (
-        ("priceToPay", 3000),
-        ("corePriceDisplay_desktop_feature_div", 6000),
-        ("corePrice_feature_div", 6000),
-        ("corePriceDisplay_mobile_feature_div", 6000),
-        ("apex_desktop", 8000),
-    ):
-        m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
-        if m:
-            v = _pick_in_block(m.group(1))
-            if isinstance(v, int):
-                return v
-
-    # 2) 「通常の注文」ブロック
-    m = re.search(r"(通常の(?:ご)?注文[\s\S]{0,1200})", H)
-    if m:
-        v = _pick_in_block(m.group(1))
+    # 2) 『通常の注文』ブロック内で『税込』近傍
+    i = t.find("通常の注文")
+    if i != -1:
+        seg = t[max(0, i-300): i+1500]
+        v = _pick_around_tax(seg)
         if isinstance(v, int):
             return v
 
-    # 3) ページ全体：『税込』周辺だけを走査
+    # 3) フォールバック：ページ上部から候補抽出（STOP/UNIT除外）
+    head = t[:20000]
     vals: list[int] = []
-    for t in re.finditer(r"税込", H[:200000]):
-        seg = H[max(0, t.start()-400): t.end()+400]
-        v = _pick_in_block(seg)
-        if isinstance(v, int):
+    for m in re.finditer(YEN, head):
+        win = head[max(0, m.start()-80): m.end()+80]
+        if STOP.search(win) or UNIT.search(win):
+            continue
+        v = _to_int(m.group(0))
+        if v is not None:
             vals.append(v)
     if vals:
-        return min(vals)
+        from collections import Counter
+        cnt = Counter(vals).most_common(1)[0]
+        return cnt[0] if cnt[1] >= 2 else min(vals)
 
     return None
+
 
 
 
