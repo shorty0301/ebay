@@ -8,7 +8,6 @@ GAS版からPython移植
 import re, json, functools, requests
 from typing import Dict, Any
 from bs4 import BeautifulSoup
-from typing import Dict, Any
 
 # ======== 共通ユーティリティ ==========
 def strip_tags(s: str) -> str:
@@ -923,18 +922,22 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
         val = to_v(m.group(1)); i = m.start()
         ctx = blk[max(0, i-200): m.end()+200]
+
         if not val:
             log_hit("whole", None, ctx, "dropped", "not_numeric");  continue
         if BAD_NEAR.search(ctx):
             log_hit("whole", val, ctx, "dropped", "near_strike");   continue
         if STOP.search(ctx):
+            log_hit("whole", val, ctx, "dropped", "near_stop");     continue
+
+        # ★“しきい値/送料無料”ガードは STOP 判定とは独立に実行（要素分割対策）
         wide = blk[max(0, i-80): m.end()+80]
         if re.search(r'(以上で?|送料無料|通常配送無料|配送料無料)', wide, re.I):
-        if not re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', wide, re.I):
-            log_hit("offscreen", val, wide, "dropped", "threshold_free_shipping_split")
-            continue
+            # priceToPay 直近のみ許容
+            if not re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', wide, re.I):
+                log_hit("whole", val, wide, "dropped", "threshold_free_shipping_split")
+                continue
 
-            log_hit("whole", val, ctx, "dropped", "near_stop");     continue
         if is_unit_price(ctx, val):
             log_hit("whole", val, ctx, "dropped", "unit_price");    continue
 
@@ -1574,22 +1577,21 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
 
 
     elif ("mercari" in host) or ("jp.mercari.com" in host):
-    s = stock_from_mercari(html, text)
-    if s: stock = s
+        s = stock_from_mercari(html, text)
+        if s: stock = s
+        price = price_from_mercari(html, text)
 
-    price = price_from_mercari(html, text)
-
-    # --- 一時的な強制呼び出し＆ログ ---
-    try:
-        print("[DBG] calling PW fallback…")
-        v = mercari_price_via_playwright_sync(
-            url, timeout_ms=90_000, headless=False, retries=1
-        )
-        print("[DBG] PW returned:", v)
-        if isinstance(v, int):
-            price = v
-    except Exception as e:
-        print("[DBG] PW error:", e)
+        # --- 一時的な強制呼び出し＆ログ ---
+        try:
+            print("[DBG] calling PW fallback…")
+            v = mercari_price_via_playwright_sync(
+                url, timeout_ms=90_000, headless=False, retries=1
+            )
+            print("[DBG] PW returned:", v)
+            if isinstance(v, int):
+                price = v
+        except Exception as e:
+            print("[DBG] PW error:", e)
 
         
     elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp")) or ("rakuten.co.jp" in host):
