@@ -968,7 +968,47 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             if m:
                 blk = m.group(1); break
         if not blk:
-            return None
+                # ---- 最終保険：上部テキストのラベル近傍（フッター年号は見ない） ----
+        try:
+            T = strip_tags(H).replace("\u3000", " ").replace("\u00A0", " ")
+        except Exception:
+            T = re.sub("<[^>]+>", " ", H)
+        head = T[:15000]  # 上部だけ見る
+
+        STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|通常配送無料|配送料無料|送料無料|以上で)", re.I)
+        LABELS = r"(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)"
+        YEN    = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})"
+
+        # ラベル → 金額
+        for m in re.finditer(LABELS + r"[^\d¥￥]{0,20}" + YEN, head, re.I):
+            ctx = head[max(0, m.start()-40): m.end()+40]
+            if STOP.search(ctx):
+                continue
+            v = _to(m.group(0))
+            if v and not (1900 <= v <= 2100):
+                return v
+
+        # 金額 → ラベル
+        for m in re.finditer(YEN + r"[^\d¥￥]{0,20}" + LABELS, head, re.I):
+            ctx = head[max(0, m.start()-40): m.end()+40]
+            if STOP.search(ctx):
+                continue
+            v = _to(m.group(0))
+            if v and not (1900 <= v <= 2100):
+                return v
+
+        # 出現多数（モード）で拾う（同額が2回以上出たらそれ）
+        from collections import Counter
+        vals = []
+        for m in re.finditer(r"[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}", head):
+            v = _to(m.group(0))
+            if v:
+                vals.append(v)
+        if vals:
+            v, cnt = Counter(vals).most_common(1)[0]
+            if cnt >= 2 and not (1900 <= v <= 2100):
+                return v
+        return None
 
         # offscreen（￥/円 なくてもOK）
         for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I):
