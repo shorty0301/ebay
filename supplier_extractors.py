@@ -971,15 +971,20 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if m:
             blk = m.group(1)
             break
+            
     if not blk:
-        mpos = re.search(r'(id=["\']priceToPay["\']|class=["\'][^"\']*\bpriceToPay\b)', H, re.I)
-        if mpos:
-            i = mpos.start()
-            blk = H[max(0, i-8000): i+8000]
+        anchor = re.search(r'(priceToPay|corePriceDisplay_desktop_feature_div|corePrice_feature_div|corePriceDisplay_mobile_feature_div|apex_desktop)', H, re.I)
+        if anchor:
+            s = max(0, anchor.start()-5000); e = min(len(H), anchor.start()+5000)
+            blk = H[s:e]
         else:
-            # それも無ければ先頭〜4万字だけ（全文ではない）を安全に見る
-            blk = H[:40000]
-
+            blk = H[:12000]  # 最後の保険
+            
+    STOP       = re.compile(r'(ポイント|pt|還元|クーポン|OFF|円OFF|%|％|ギフト券)', re.I)
+    THRESH_NUM = re.compile(r'[¥￥]?\s*\d{3,5}\s*円?\s*(?:以上|超|から)', re.I)
+    FREEWORD   = re.compile(r'(送料無料|通常配送無料|配送料無料|無料配送)', re.I)
+    def _is_threshold_free_shipping(s: str) -> bool:
+        return bool(THRESH_NUM.search(s) and FREEWORD.search(s))
 
     # (1) a-offscreen（￥/円 が無くてもOKにする）
     for m in re.finditer(
@@ -987,34 +992,39 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         blk, re.I
     ):
         token = m.group(1)
+        ctx   = blk[max(0, m.start()-160): m.end()+160]
+        if STOP.search(ctx) or _is_threshold_free_shipping(ctx):
+            continue
         v = _to(token)
         if v:
-            # 念のため年号っぽい裸数字は落とす（通貨/円が無い時だけ）
+            # 年号保険（通貨記号無しの 19xx/20xx は捨てる）
             if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', token):
                 continue
             return v
 
     # (2) a-price-whole（小数分割のときは整数部だけ拾う）
-    m_whole = re.search(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I)
-    if m_whole:
-        tok = m_whole.group(1)
-        v = _to(tok)
-        if v and not (1900 <= v <= 2100 and not re.search(r'[¥￥]|円', tok)):
-            return v
+   for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
+       token = m.group(1)
+       ctx   = blk[max(0, m.start()-140): m.end()+140]
+       if STOP.search(ctx) or _is_threshold_free_shipping(ctx):
+           continue
+       v = _to(token)
+       if v:
+           if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', ctx):
+               continue
+           return v
 
     # (3) data-a-color="price" / class=*price 近傍にある金額
-    for mm in re.finditer(
-        r'(?:data-a-color\s*=\s*["\']price["\']|class=["\'][^"\']*\bprice\b[^"\']*["\'])[\s\S]{0,240}',
-        blk, re.I
-    ):
-        seg = mm.group(0)
-        mnum = re.search(
-            r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)',
-            seg
-        )
-        if mnum:
-            v = _to(mnum.group(0))
+    for m in re.finditer(r'(?:data-a-color\s*=\s*["\']price["\']|class=["\'][^"\']*\bprice\b[^"\']*["\'])', blk, re.I):
+        seg = blk[m.start(): m.start()+240]  # 近傍だけ調べる
+        if _is_threshold_free_shipping(seg) or STOP.search(seg):
+            continue
+        m2 = re.search(r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)', seg)
+        if m2:
+            v = _to(m2.group(0))
             if v:
+                if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', m2.group(0)):
+                    continue
                 return v
 
     # (4) ラベル近傍（±120字）
@@ -1023,17 +1033,18 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         r'((?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円))',
         re.I
     )
-    for m in LABEL_NEAR.finditer(re.sub(r"\s+", " ", blk)):
+    flat = re.sub(r"\s+", " ", blk)
+    for m in LABEL_NEAR.finditer(flat):
         win = m.group(0)
-        if re.search(r"(ポイント|pt|還元|クーポン|OFF|円OFF|%|％|ギフト券)", win, re.I):
+        if STOP.search(win) or _is_threshold_free_shipping(win):
             continue
-        if re.search(r'[¥￥]?\s*\d{3,5}\s*円?\s*(以上|超|から)', win) and re.search(r'(送料無料|通常配送無料|配送料無料|無料配送)', win):
-            continue
-        token = m.group(2)
-        v = _to(token)
-        if v and not (1900 <= v <= 2100 and not re.search(r'[¥￥]|円', token)):
+        v = _to(m.group(2))
+        if v:
+            if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', m.group(2)):
+                continue
             return v
-            
+    return None      
+
     # --- 3) 最終保険：上部テキストで「ラベルの真横」を読む（1996回避用に厳しめ） ---
     head = (strip_tags(html) or text or "")[:25000]
     LABEL = re.compile(r"(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)", re.I)
