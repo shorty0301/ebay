@@ -1710,7 +1710,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     
 
 
-    if price is None:
+    if price is None and not ("amazon.co.jp" in host or host.endswith(".amazon.co.jp")):
         # 汎用の価格抽出ロジック（3桁も許容・文脈で絞る）
         STOP = re.compile(r"(ポイント|pt|付与|獲得|還元|実質|送料|手数料|上限|クーポン|値引|割引|合計\s*\d+|合計金額ではない|%|％)", re.I)
         UNIT_NOISE = re.compile(r"(個|点|件|cm|mm|g|kg|W|V|GB|MB|TB|時間|日|年|サイズ|型番|JAN|品番)", re.I)
