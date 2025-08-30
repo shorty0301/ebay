@@ -1734,7 +1734,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
                     amz_text2 = strip_tags(amz_html2).replace("\u3000", " ").replace("\u00A0", " ")
                     s2 = stock_from_amazon_jp(amz_html2, amz_text2)
                     if s2:
-                    stock = s2
+                        stock = s2
                     p2 = price_from_amazon_jp(amz_html2, amz_text2)
                     if p2 is not None:
                         price = p2
