@@ -75,12 +75,8 @@ def to_int_yen(s: str) -> int | None:
         return None
 # ============================================================
 # Playwright版 価格抽出（任意利用・既存処理へは未接続：副作用なし）
-#  - 仕様に基づく実装
-#  - 既存関数とは独立。呼び出したいときだけ明示的に利用してください
 # ============================================================
 # 依存: playwright.async_api, bs4, lxml, re
-# 注意: ランタイムに未インストールでもモジュール読み込み時に失敗しないよう
-#       import は関数内で行います。
 
 import asyncio as _asyncio
 import json as _json
@@ -1045,6 +1041,76 @@ def price_from_mercari(html: str, text: str) -> int | None:
             return v
     return None
 
+# ==== Mercari専用：Playwright 同期フォールバック（合体版） ====
+def mercari_price_via_playwright_sync(url: str, timeout_ms: int = 60000, headless: bool = True, retries: int = 2) -> int | None:
+    """
+    requestsで価格が取れない場合だけ呼ぶ保険。
+    - Playwright未インストール or 失敗時は None を返す
+    - 他サイトの挙動には一切影響なし
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except Exception:
+        return None  # Playwrightが無ければ何もしない
+
+    YEN_MARK = re.compile(r"(?:￥|¥)\s*([0-9０-９][0-9０-９,，]{2,})")  # 例: ¥12,345
+    YEN_EN   = re.compile(r"([0-9０-９][0-9０-９,，]{2,})\s*円")          # 例: 12,345円
+
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+    def _pick_from_text(txt: str) -> int | None:
+        m = YEN_MARK.search(txt) or YEN_EN.search(txt)
+        if not m:
+            return None
+        return to_int_yen(m.group(1))  # 既存ユーティリティを利用
+
+    for _ in range(max(1, retries)):
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                ctx = browser.new_context(
+                    user_agent=UA,
+                    locale="ja-JP",
+                    extra_http_headers={"Accept-Language": "ja,en;q=0.8"},
+                    viewport={"width": 1400, "height": 900},
+                )
+                page = ctx.new_page()
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                except PWTimeout:
+                    ctx.close(); browser.close()
+                    return None
+
+                # ボタン出現を待ってから少し待機（SPA対策／非表示でも続行）
+                try:
+                    page.wait_for_selector("text=購入手続きへ, text=購入に進む", timeout=20000)
+                except PWTimeout:
+                    pass
+                page.wait_for_timeout(1000)
+
+                # 1) 可視テキストから最短で拾う（¥ / 円 の両方）
+                body_text = page.inner_text("body")
+                v = _pick_from_text(body_text)
+                if v:
+                    ctx.close(); browser.close()
+                    return v
+
+                # 2) JSON保険（例: __NEXT_DATA__ 等に "price": 12345 があるケース）
+                html = page.content()
+                m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', html)
+                if m:
+                    v = to_int_yen(m.group(1))
+                    if v:
+                        ctx.close(); browser.close()
+                        return v
+
+                ctx.close(); browser.close()
+        except Exception:
+            # リトライ継続
+            continue
+    return None
+
 # ======== Rakuten helpers (GAS移植) =========
 def _availability_from_meta_or_ld(html: str) -> str | None:
     # JSON-LD / microdata の availability を見る
@@ -1455,9 +1521,9 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_mercari(html, text)
         if price is None:
             try:
-                p2 = _pw_fetch_price_blocking(url, timeout_ms=60_000, headless=True, retries=2)
-                if isinstance(p2, int):
-                    price = p2
+                v = mercari_price_via_playwright_sync(url, timeout_ms=60_000, headless=True, retries=2)
+                if isinstance(v, int):
+                    price = v
             except Exception:
                 pass
         
@@ -1637,5 +1703,4 @@ def _amz_guess_dp_url(host: str, base_url: str, html: str) -> str | None:
         return path if path.startswith("http") else f"https://{host.rstrip('/')}/{path.lstrip('/')}"
 
     return None
-
 
