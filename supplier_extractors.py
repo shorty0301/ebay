@@ -873,25 +873,24 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp の支払価格取得（軽量版）
+    Amazon.co.jp の支払価格取得（軽量・安定版）
     優先順:
-      1) 「税込」前後24文字以内にある価格（最優先）
-      2) 価格箱内の .a-offscreen / .a-price-whole
-      3) 価格箱内の “￥/円付き” 数字
-      4) 旧ID（狭い範囲）
-    スコープは「通常の注文」塊と既知の価格箱だけ（本文全体は見ない）
+      1) テキストで『税込』の前後±12文字にある “￥/円付き” 金額（最優先）
+         - 『通常の注文』近傍 → ページ先頭域（〜12,000字）
+         - 500円未満や「/袋」「/個」等の単価は除外
+      2) 価格箱（priceToPay / corePrice* / apex_desktop）内の .a-offscreen / .a-price-whole
+      3) 旧IDの保険
     """
     import re
 
-    H_all = str(html or "")
-    parts = (re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I)
-             if "<!-- MOBILE MERGE -->" in H_all else [H_all])
+    H = str(html or "")
+    T = str(text or "")
 
-    # ￥/円付きの価格パターン
+    # ￥/円付きパターン
     YEN = r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)'
 
-    def _to_int(token: str) -> int | None:
-        # 500 未満（単価/pt等）を除外
+    def _to_price(token: str) -> int | None:
+        """500円未満を除外して int にする"""
         t = re.sub(r"[^\d]", "", token or "")
         if not t:
             return None
@@ -901,94 +900,95 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         except Exception:
             return None
 
-    def _bad_unit_after(ctx: str) -> bool:
-        # 直後に単位やスラッシュが来る「￥162/袋」などは除外
-        return bool(re.search(r'[/／]\s*(袋|個|枚|本|台|回|か月|ヶ月|月|年|GB|TB|MB|cm|mm|g|kg|ml|L|セット)', ctx))
+    def _bad_unit_after(trail: str) -> bool:
+        """単価の ‘/袋’ などが直後に来るなら除外（全角スラッシュ含む）"""
+        return bool(re.search(r'[/／]\s*(袋|個|枚|本|台|回|か月|ヶ月|月|年|GB|TB|MB|cm|mm|g|kg|ml|L|セット)', trail))
 
-    def _scan_tax_inclusive_first(blk: str) -> int | None:
-        """『税込』の前後±24文字で価格を探す（最優先）"""
+    # --- 1) テキストで『税込』前後を最優先 ---------------------------------
+    #   a) 『通常の注文』から少し先（見た目の価格箱の直上）
+    segs: list[str] = []
+    m_norm = re.search(r'(通常の注文|通常のご注文)', T)
+    if m_norm:
+        segs.append(T[m_norm.start(): m_norm.start() + 1200])
+    #   b) ページ先頭域（本文全体は舐めない）
+    segs.append(T[:12000])
+
+    for seg in segs:
         # 価格 → 税込
-        for m in re.finditer(rf'({YEN})[\s\S]{{0,24}}?税込', blk, re.I):
+        for m in re.finditer(rf'({YEN})[^\d]{{0,12}}税込', seg, re.I):
             tok = m.group(1)
-            tail = blk[m.end(1): m.end(0) + 30]  # 数字直後〜少し先
-            if _bad_unit_after(tail):
+            if _bad_unit_after(seg[m.end(1): m.end(0) + 20]):
                 continue
-            v = _to_int(tok)
+            v = _to_price(tok)
             if v is not None:
                 return v
         # 税込 → 価格
-        for m in re.finditer(rf'税込[\s\S]{{0,24}}?({YEN})', blk, re.I):
+        for m in re.finditer(rf'税込[^\d]{{0,12}}({YEN})', seg, re.I):
             tok = m.group(1)
-            tail = blk[m.end(1): m.end(1) + 30]
-            if _bad_unit_after(tail):
+            if _bad_unit_after(seg[m.end(1): m.end(1) + 20]):
                 continue
-            v = _to_int(tok)
+            v = _to_price(tok)
             if v is not None:
                 return v
-        return None
 
+    # --- 2) HTML の “価格箱” だけをピンポイントで読む ------------------------
     def _scan_price_block(blk: str) -> int | None:
-        # (1) 税込 近傍（最優先）
-        v = _scan_tax_inclusive_first(blk)
-        if v is not None:
-            return v
-        # (2) a-offscreen
-        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,50})<', blk, re.I):
-            v = _to_int(m.group(1))
+        # まず ‘税込’ 近傍（保険）
+        for m in re.finditer(rf'({YEN})[^\d]{{0,12}}税込', blk, re.I):
+            v = _to_price(m.group(1))
             if v is not None:
                 return v
-        # (3) a-price-whole
+        for m in re.finditer(rf'税込[^\d]{{0,12}}({YEN})', blk, re.I):
+            v = _to_price(m.group(1))
+            if v is not None:
+                return v
+        # a-offscreen
+        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{{1,50}})<', blk, re.I):
+            v = _to_price(m.group(1))
+            if v is not None:
+                return v
+        # a-price-whole
         for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]{1,10})\s*<', blk, re.I):
-            v = _to_int(m.group(1))
+            v = _to_price(m.group(1))
             if v is not None:
                 return v
-        # (4) ブロック内の “￥/円付き”
+        # ブロック内の ‘￥/円付き’ の最初
         m = re.search(YEN, blk, re.I)
         if m:
-            v = _to_int(m.group(0))
+            v = _to_price(m.group(0))
             if v is not None:
                 return v
         return None
 
-    # パート（PC/モバイル）毎に処理
-    for H in parts:
-        # A) 「通常の注文」付近（ゆれ対応：通常のご注文 / 幅6000）
-        m_head = re.search(r'(?:通常の注文|通常のご注文)[\s\S]{0,6000}', H)
-        if m_head:
-            v = _scan_price_block(m_head.group(0))
+    for pat in [
+        r'id=["\']priceToPay["\']([\s\S]{0,4000})',
+        r'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\']([\s\S]{0,4000})',
+        r'id=["\']corePriceDisplay_desktop_feature_div["\']([\s\S]{0,6000})',
+        r'id=["\']corePrice_feature_div["\']([\s\S]{0,6000})',
+        r'id=["\']corePriceDisplay_mobile_feature_div["\']([\s\S]{0,6000})',
+        r'id=["\']apex_desktop["\']([\s\S]{0,8000})',
+    ]:
+        m = re.search(pat, H, re.I)
+        if not m:
+            continue
+        v = _scan_price_block(m.group(1))
+        if v is not None:
+            return v
+
+    # --- 3) 旧IDの保険 ------------------------------------------------------
+    for pat in [
+        r'id=["\']priceblock_ourprice["\'][^>]*>\s*([^<]+)<',
+        r'id=["\']priceblock_dealprice["\'][^>]*>\s*([^<]+)<',
+        r'id=["\']sns-base-price["\'][^>]*>\s*([^<]+)<',
+    ]:
+        m = re.search(pat, H, re.I)
+        if m:
+            v = _to_price(m.group(1))
             if v is not None:
                 return v
-
-        # B) 既知の価格箱（id/class）
-        price_blocks = [
-            r'id=["\']priceToPay["\']([\s\S]{0,4000})',
-            r'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\']([\s\S]{0,4000})',
-            r'id=["\']corePriceDisplay_desktop_feature_div["\']([\s\S]{0,6000})',
-            r'id=["\']corePrice_feature_div["\']([\s\S]{0,6000})',
-            r'id=["\']corePriceDisplay_mobile_feature_div["\']([\s\S]{0,6000})',
-            r'id=["\']apex_desktop["\']([\s\S]{0,8000})',
-        ]
-        for pat in price_blocks:
-            m = re.search(pat, H, re.I)
-            if not m:
-                continue
-            v = _scan_price_block(m.group(1))
-            if v is not None:
-                return v
-
-        # C) 旧IDの保険（狭い範囲）
-        for pat in [
-            r'id=["\']priceblock_ourprice["\'][^>]*>\s*([^<]+)<',
-            r'id=["\']priceblock_dealprice["\'][^>]*>\s*([^<]+)<',
-            r'id=["\']sns-base-price["\'][^>]*>\s*([^<]+)<',
-        ]:
-            m = re.search(pat, H, re.I)
-            if m:
-                v = _to_int(m.group(1))
-                if v is not None:
-                    return v
 
     return None
+
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
