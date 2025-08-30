@@ -1,10 +1,7 @@
 # supplier_extractors.py
 # -*- coding: utf-8 -*-
-"""
-各ECサイトのHTMLから 在庫 / 数量 / 価格 を抽出するヘルパ
-GAS版からPython移植
-"""
 
+import os
 import re, json, functools, requests
 from typing import Dict, Any
 from bs4 import BeautifulSoup
