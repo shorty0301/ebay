@@ -873,49 +873,38 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp専用の価格抽出（高速スニッファ → 改良フォールバック）
-    ※ 他サイトへは一切影響しません
+    Amazon.co.jp専用の価格抽出（スコアリング強化版）
+    - 1540 のような“裸の4桁”は拒否（通貨 or カンマ or 円が無ければ不採用）
+    - 購入用コンテナ優先、割引/ポイント/クーポン近傍は除外
+    ※ 他サイトには影響しません
     """
-    # 0) ロボット/ブロックページはスキップ
     if re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", str(html or ""), re.I):
         return None
 
-    # 1) 高速スニッファ
     v = _amz_price_fast_sniff_improved(html)
     if isinstance(v, int):
         return v
 
-    # 2) BeautifulSoupベースの改良フォールバック
     return _amz_price_fallback_improved(html, text)
 
 
 def _amz_price_fast_sniff_improved(html: str) -> int | None:
-    """
-    Amazon.co.jp の価格を最短で抜く高速スニッファ
-    - .a-offscreen / priceblock_* / corePrice* / apex_desktop / mobile_feature_div を即時抽出
-    - .a-price-whole + .a-price-fraction の合成も拾う（最近の未命中パターン対策）
-    - 年号(通貨記号なし4桁)の誤検出は除外
-    """
     H = str(html or "")
     if not H:
         return None
 
-    # ---- ユーティリティ ----
-    def _is_likely_year(value: int, original_str: str, has_currency: bool) -> bool:
-        if has_currency:
-            return False
-        if 1900 <= value <= 2100:
-            digits_only = re.sub(r"[^\d]", "", original_str)
-            # 通貨無しかつ4桁ぴったりなら年号っぽい
-            if len(digits_only) == 4:
-                return True
-        return False
+    # ---- helpers ----
+    STOP = re.compile(r"(割引|値引|OFF|％|%|クーポン|ポイント|pt|還元|相当|円相当|おトク便|定期|サブスク|下取り|買取)", re.I)
 
-    def _amz_to_int_improved(tok: str) -> int | None:
+    def _valid_int(tok: str, ctx: str = "") -> int | None:
+        """価格文字列を厳格に数値へ。裸の4桁は通貨・円・カンマが無ければ拒否。"""
         s = str(tok or "").strip()
         if not s:
             return None
         has_currency = bool(re.search(r"[¥￥]|円", s))
+        has_comma = bool(re.search(r"[,，]", s))
+        # 通貨 or 円 or カンマ が無い「裸の数値」は、最低でも5桁以上だけ許可（1540対策）
+        bare = not (has_currency or has_comma)
         t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
         if not t:
             return None
@@ -923,84 +912,89 @@ def _amz_price_fast_sniff_improved(html: str) -> int | None:
             v = int(t)
         except Exception:
             return None
-        # 価格レンジ（誤検出を減らす堅め設定）
+        if bare and len(t) <= 4:
+            return None
         if v < 500 or v > 3_000_000:
             return None
-        if _is_likely_year(v, s, has_currency):
+        # 年号(1900-2100)の“裸4桁”も拒否
+        if bare and 1900 <= v <= 2100 and len(t) == 4:
+            return None
+        # 割引/ポイント/クーポン近傍は除外
+        if ctx and STOP.search(ctx):
             return None
         return v
 
-    money_pattern = r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[¥￥]\s*[0-9０-９]{3,7}|[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|[0-9０-９]{3,7}\s*円)'
-    yen_num = re.compile(money_pattern)
+    def _add(cands, score, val):
+        if isinstance(val, int):
+            cands.append((score, val))
 
-    # 代表的な価格要素（正規表現で最短抽出）
-    sel_like = [
-        r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',
-        r'id=["\']priceblock_ourprice["\'][^>]*>\s*([^<]{1,40})<',
-        r'id=["\']priceblock_dealprice["\'][^>]*>\s*([^<]{1,40})<',
-        r'id=["\']sns-base-price["\'][^>]*>\s*([^<]{1,40})<',
-        r'id=["\']corePriceDisplay_desktop_feature_div["\'][\s\S]{0,400}?class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',
-        r'id=["\']corePrice_feature_div["\'][\s\S]{0,400}?class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',
-        r'id=["\']apex_desktop["\'][\s\S]{0,800}?class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',
-        r'id=["\']corePriceDisplay_mobile_feature_div["\'][\s\S]{0,400}?class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',
-        # a-price コンテナ配下の offscreen（テンプレ差分吸収）
-        r'class=["\'][^"\']*\ba-price\b[^"\']*["\'][\s\S]{0,200}?class=["\'][^"\']*\ba-offscreen\b[^"\']*["\'][^>]*>\s*([^<]{1,40})<',
+    # 検出
+    cands = []
+    # 購入用コンテナ内の a-offscreen（最優先）
+    containers = [
+        r'id=["\']priceToPay["\']',
+        r'id=["\']corePriceDisplay_desktop_feature_div["\']',
+        r'id=["\']corePrice_feature_div["\']',
+        r'id=["\']corePriceDisplay_mobile_feature_div["\']',
+        r'id=["\']apex_desktop["\']',
     ]
-    for rx in sel_like:
-        m = re.search(rx, H, re.I)
-        if m:
-            t = m.group(1)
-            n = yen_num.search(t) or re.search(r'[¥￥]?\s*\d[\d,，]{2,}', t)
-            if n:
-                v = _amz_to_int_improved(n.group(0))
-                if v is not None:
-                    return v
+    for cont in containers:
+        for m in re.finditer(fr'(<(?:div|span)[^>]*{cont}[^>]*>[\s\S]{{0,1500}}?)', H, re.I):
+            box = m.group(1)
+            # a-offscreen
+            for n in re.finditer(r'class=["\'][^"\']*\ba-offscreen\b[^"\']*["\'][^>]*>\s*([^<]{1,40})<', box, re.I):
+                tok = n.group(1)
+                ctx = box[max(0, n.start()-120): n.end()+120]
+                v = _valid_int(tok, ctx)
+                _add(cands, 100, v)
+            # a-price-whole + fraction
+            mw = re.search(
+                r'<(?:span|div)[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][\s\S]{0,400}?'
+                r'<span[^>]*class=["\'][^"\']*\ba-price-whole\b[^"\']*["\'][^>]*>([^<]{1,20})</span>'
+                r'[\s\S]{0,60}?'
+                r'(?:<span[^>]*class=["\'][^"\']*\ba-price-fraction\b[^"\']*["\'][^>]*>([^<]{1,4})</span>)?',
+                box, re.I
+            )
+            if mw:
+                whole = (mw.group(1) or "").strip()
+                ctx = box[:200]
+                v = _valid_int(whole, ctx)
+                _add(cands, 95, v)
 
-    # --- 追加: a-price-whole + a-price-fraction の合成 ---
-    m_whole = re.search(
-        r'<(?:span|div)[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][\s\S]{0,400}?'
-        r'<span[^>]*class=["\'][^"\']*\ba-price-whole\b[^"\']*["\'][^>]*>([^<]{1,16})</span>'
-        r'[\s\S]{0,60}?'
-        r'(?:<span[^>]*class=["\'][^"\']*\ba-price-fraction\b[^"\']*["\'][^>]*>([^<]{1,4})</span>)?',
-        H, re.I
-    )
-    if m_whole:
-        whole = (m_whole.group(1) or "").strip()
-        # 日本円は小数が基本無いので fraction は無視（残したいなら f"{whole}.{frac}"）
-        v = _amz_to_int_improved(whole)
-        if v is not None:
-            return v
+    # .a-price .a-offscreen（汎用）
+    for n in re.finditer(r'<[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][^>]*>[\s\S]{0,200}?class=["\'][^"\']*\ba-offscreen\b[^"\']*["\'][^>]*>\s*([^<]{1,40})<', H, re.I):
+        tok = n.group(1)
+        ctx = H[max(0, n.start()-160): n.end()+160]
+        v = _valid_int(tok, ctx)
+        _add(cands, 80, v)
 
-    # JSON-LD
+    # JSON-LD price
     for script in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', H, re.I):
         raw = re.sub(r"//.*?$|/\*.*?\*/", "", script, flags=re.S | re.M)
         raw = re.sub(r",\s*([}\]])", r"\1", raw)
         try:
             data = json.loads(raw)
         except Exception:
-            continue
-
-        def walk_json(o):
+            data = None
+        def walk(o):
             if isinstance(o, dict):
                 for k in ("price", "lowPrice", "lowprice"):
                     if k in o:
-                        vv = _amz_to_int_improved(str(o[k]))
-                        if vv is not None:
-                            return vv
+                        v = _valid_int(str(o[k]))
+                        if v is not None:
+                            return v
                 for vv in o.values():
-                    r = walk_json(vv)
+                    r = walk(vv)
                     if r is not None:
                         return r
             elif isinstance(o, list):
                 for it in o:
-                    r = walk_json(it)
+                    r = walk(it)
                     if r is not None:
                         return r
             return None
-
-        got = walk_json(data)
-        if got is not None:
-            return got
+        v = walk(data) if data is not None else None
+        _add(cands, 70, v)
 
     # meta/itemprop
     for rx in [
@@ -1008,20 +1002,21 @@ def _amz_price_fast_sniff_improved(html: str) -> int | None:
         r'itemprop=["\']price["\'][^>]*content=["\']([^"\']+)',
     ]:
         for m in re.finditer(rx, H, re.I):
-            v = _amz_to_int_improved(m.group(1))
-            if v is not None:
-                return v
+            tok = m.group(1)
+            v = _valid_int(tok)
+            _add(cands, 65, v)
 
-    return None
+    if not cands:
+        return None
+
+    # 上位スコア群から“最も妥当”を選ぶ
+    best = max(s for s, _ in cands)
+    top = [v for s, v in cands if s == best]
+    # priceToPay系は最終価格＝低めになることが多いので、同点内は最小を優先
+    return min(top)
 
 
 def _amz_price_fallback_improved(html: str, text: str) -> int | None:
-    """
-    BeautifulSoupによる改良フォールバック
-    - 代表セレクタ + .a-price .a-offscreen
-    - a-price-whole/fraction 合成
-    - 「通常の注文」ブロック
-    """
     try:
         from bs4 import BeautifulSoup
     except Exception:
@@ -1031,23 +1026,15 @@ def _amz_price_fallback_improved(html: str, text: str) -> int | None:
     if not H:
         return None
 
-    def _is_year_with_context(value: int, original_str: str, context: str, has_currency: bool) -> bool:
-        if has_currency:
-            return False
-        if 1900 <= value <= 2100:
-            digits_only = re.sub(r"[^\d]", "", original_str)
-            if len(digits_only) == 4:
-                # 文脈に年・型番・©等があればより年号寄りと判断
-                if re.search(r"(年|発売|発行|出版|copyright|©|\(c\)|model|型|version)", context, re.I):
-                    return True
-                return True
-        return False
+    STOP = re.compile(r"(割引|値引|OFF|％|%|クーポン|ポイント|pt|還元|相当|円相当|おトク便|定期|サブスク|下取り|買取)", re.I)
 
-    def _to_int_ctx(tok: str, ctx: str = "") -> int | None:
+    def _valid_int_ctx(tok: str, ctx: str = "") -> int | None:
         s = str(tok or "").strip()
         if not s:
             return None
         has_currency = bool(re.search(r"[¥￥]|円", s))
+        has_comma = bool(re.search(r"[,，]", s))
+        bare = not (has_currency or has_comma)
         t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
         if not t:
             return None
@@ -1055,9 +1042,13 @@ def _amz_price_fallback_improved(html: str, text: str) -> int | None:
             v = int(t)
         except Exception:
             return None
+        if bare and len(t) <= 4:
+            return None
         if v < 500 or v > 3_000_000:
             return None
-        if _is_year_with_context(v, s, ctx, has_currency):
+        if bare and 1900 <= v <= 2100 and len(t) == 4:
+            return None
+        if ctx and STOP.search(ctx):
             return None
         return v
 
@@ -1066,46 +1057,50 @@ def _amz_price_fallback_improved(html: str, text: str) -> int | None:
     except Exception:
         soup = BeautifulSoup(H, "html.parser")
 
+    cands = []
+
+    def _add(score, v):
+        if isinstance(v, int):
+            cands.append((score, v))
+
     # 代表セレクタ
-    price_selectors = [
+    sels = [
         "#priceToPay .a-offscreen",
         "#corePriceDisplay_desktop_feature_div .a-offscreen",
         "#corePrice_feature_div .a-offscreen",
         "#corePriceDisplay_mobile_feature_div .a-offscreen",
         "#apex_desktop .a-offscreen",
         ".priceToPay .a-offscreen",
+        ".a-price .a-offscreen",
         "#priceblock_ourprice",
         "#priceblock_dealprice",
-        ".a-price .a-offscreen",  # 追加
     ]
-    for sel in price_selectors:
+    for sel in sels:
         el = soup.select_one(sel)
         if not el:
             continue
         txt = el.get_text(" ", strip=True)
-        parent_text = el.parent.get_text(" ", strip=True)[:200] if el.parent else ""
-        v = _to_int_ctx(txt, parent_text)
-        if v is not None:
-            return v
+        ctx = el.parent.get_text(" ", strip=True)[:240] if el.parent else ""
+        v = _valid_int_ctx(txt, ctx)
+        _add(100, v)
 
-    # --- 追加: a-price-whole + a-price-fraction 合成（regexで手早く） ---
-    m_whole = re.search(
+    # a-price-whole + fraction
+    m = re.search(
         r'<(?:span|div)[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][\s\S]{0,400}?'
-        r'<span[^>]*class=["\'][^"\']*\ba-price-whole\b[^"\']*["\'][^>]*>([^<]{1,16})</span>'
+        r'<span[^>]*class=["\'][^"\']*\ba-price-whole\b[^"\']*["\'][^>]*>([^<]{1,20})</span>'
         r'[\s\S]{0,60}?'
         r'(?:<span[^>]*class=["\'][^"\']*\ba-price-fraction\b[^"\']*["\'][^>]*>([^<]{1,4})</span>)?',
         H, re.I
     )
-    if m_whole:
-        whole = (m_whole.group(1) or "").strip()
-        ctx = soup.get_text(" ", strip=True)[:200] if soup else ""
-        v = _to_int_ctx(whole, ctx)
-        if v is not None:
-            return v
+    if m:
+        whole = (m.group(1) or "").strip()
+        page_ctx = soup.get_text(" ", strip=True)[:240]
+        v = _valid_int_ctx(whole, page_ctx)
+        _add(95, v)
 
-    # 「通常の注文」/「一回限りの購入」ブロック
+    # 「通常の注文」ブロック
     labels = soup.find_all(string=re.compile(r"(通常の注文|通常のご注文|一回限りの購入|一度のみの購入)"))
-    def _nearest_row(el):
+    def _row(el):
         p = el.parent if hasattr(el, "parent") else None
         for _ in range(10):
             if not p:
@@ -1117,25 +1112,28 @@ def _amz_price_fallback_improved(html: str, text: str) -> int | None:
         return el.parent if hasattr(el, "parent") else None
 
     for lab in labels:
-        row = _nearest_row(lab)
+        row = _row(lab)
         if not row:
             continue
         row_text = row.get_text(" ", strip=True)
         if re.search(r"(定期|おトク便|サブスク)", row_text):
             continue
-        # 優先: .a-offscreen
         for off in row.select(".a-offscreen"):
-            v = _to_int_ctx(off.get_text(" ", strip=True), row_text)
-            if v is not None:
-                return v
-        # 保険: 金額パターン
+            v = _valid_int_ctx(off.get_text(" ", strip=True), row_text)
+            _add(90, v)
+        # 保険の金額パターン
         YEN = re.compile(r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|\d{1,3}(?:[,，]\d{3})+\s*円|[¥￥]\s*\d{3,7}|\d{3,7}\s*円)")
-        for m in YEN.finditer(row_text):
-            v = _to_int_ctx(m.group(0), row_text)
-            if v is not None:
-                return v
+        for m2 in YEN.finditer(row_text):
+            v = _valid_int_ctx(m2.group(0), row_text)
+            _add(85, v)
 
-    return None
+    if not cands:
+        return None
+
+    best = max(s for s, _ in cands)
+    top = [v for s, v in cands if s == best]
+    return min(top)
+
 
 def _amz_price_fast_sniff(html: str) -> int | None:
     """互換エイリアス（旧呼び出し想定があれば）"""
