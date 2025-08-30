@@ -884,13 +884,18 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     def _to(token: str) -> int | None:
         v = to_int_yen(token)
         if v is not None and 100 <= v <= 3_000_000:
+            if v < 500 and not re.search(r"[¥￥]|円", token):
+                return None
             return v
         t = re.sub(r"[^\d]", "", token or "")
         if not t:
             return None
         try:
             v = int(t)
-            return v if 100 <= v <= 3_000_000 else None
+            if 100 <= v <= 3_000_000:
+                if v < 500 and not re.search(r"[¥￥]|円", token):
+                    return None
+                return v
         except Exception:
             return None
 
