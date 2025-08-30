@@ -973,12 +973,15 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             break
     if not blk:
         return None 
-    # a-offscreen
-    for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]\s*[\d,，]{1,10})\s*<', blk, re.I):
+    # a-offscreen（￥/円 が無くてもOKにする）
+    for m in re.finditer(
+        r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<',
+        blk, re.I
+    ):
         token = m.group(1)
         v = _to(token)
         if v:
-            # 念のため：年号ぽい裸数字は落とす（通貨は付いてるので基本通る）
+            # 念のため年号っぽい裸数字は落とす（offscreenは基本通貨付くが保険）
             if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', token):
                 continue
             return v
@@ -1001,6 +1004,30 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if v:
             # 念のため：年号ぽい裸数字は落とす（ここも通貨/円は必ず含まれる）
             if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', token):
+                continue
+            return v
+            
+    # --- 3) 最終保険：上部テキストで「ラベルの真横」を読む（1996回避用に厳しめ） ---
+    head = (strip_tags(html) or text or "")[:25000]
+    LABEL = re.compile(r"(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)", re.I)
+    BAD   = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|%|％|ギフト券)", re.I)
+    THRESH_NUM = re.compile(r'[¥￥]?\s*\d{3,5}\s*円?\s*(?:以上|超|から)', re.I)
+    FREEWORD   = re.compile(r'(送料無料|通常配送無料|配送料無料|無料配送)', re.I)
+    MONEY = re.compile(r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)')
+
+    for m in LABEL.finditer(head):
+        win = head[max(0, m.start()-120): m.end()+120]
+        if BAD.search(win): 
+            continue
+        if THRESH_NUM.search(win) and FREEWORD.search(win):
+            continue
+        mm = MONEY.search(win)
+        if not mm:
+            continue
+        v = _to(mm.group(0))
+        if v:
+            # ここも年号の裸数字は除外
+            if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', mm.group(0)):
                 continue
             return v
 
