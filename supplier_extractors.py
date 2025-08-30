@@ -873,109 +873,97 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp 価格抽出（最短ルート）
-    1) 「通常の注文（通常注文/通常のご注文/1回の注文…）」ブロック内で
-       『税込』の直前/直後に“ほぼ隣接（非数字0〜6文字）”する金額だけを採用
-       ※ クーポン/定期便などの説明が入っていても、“税込の真横”以外は無視
-    2) それで取れなければ、ページ全体で同じ “税込の真横” パターンを探す
-    3) まだ無ければ priceToPay/corePrice/apex_desktop の箱内だけを見る
-    4) 500円未満は単価ノイズとして捨てる
+    Amazon.co.jp 価格抽出（強制的に「通常の注文」＞「税込の真横」）
+    優先順:
+      1) HTML内の「通常の注文」周辺 (±数千文字) で “税込 の直前/直後” の金額
+         ※ タグ挟み込みや全角/半角スペースも許容、近接は最大 ~20 文字まで
+      2) 既知の価格箱 (priceToPay / corePrice* / apex_desktop) 内の a-offscreen / a-price-whole
+      3) 最後に HTML全体の “税込の真横”
+    500円未満はノイズとして破棄。
     """
     import re
 
     H = str(html or "")
-    T = str(text or "")
 
-    # ---- helpers ----
+    # MOBILE MERGE 対応
+    parts = H.split("<!-- MOBILE MERGE -->") if "<!-- MOBILE MERGE -->" in H else [H]
+
+    # 変換（全角→半角）
     def _z2h(s: str) -> str:
         return (s or "").translate(str.maketrans("０１２３４５６７８９，", "0123456789,"))
 
-    def _v(tok: str) -> int | None:
-        from math import isnan
-        # 既存ユーティリティ優先
-        try:
-            vv = to_int_yen(tok)
-        except Exception:
-            vv = None
-        if vv is None:
-            t = re.sub(r"[^\d]", "", _z2h(tok))
-            vv = int(t) if t.isdigit() else None
-        if vv is None or not (500 <= vv <= 3_000_000):
+    def _to(tok: str) -> int | None:
+        from re import sub
+        t = sub(r"[^\d]", "", _z2h(tok))
+        if not t:
             return None
-        return vv
+        v = int(t)
+        return v if 500 <= v <= 3_000_000 else None
 
-    # 「税込」と数字が“ほぼ隣接”するパターン（左右両方向）
-    NUM = r"(?:[¥￥]?\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[¥￥]?\s*[0-9０-９]{3,7})"
-    PAT_R = re.compile(rf"税込(?:[^0-9]{{0,6}})({NUM})(?:\s*円)?")
-    PAT_L = re.compile(rf"({NUM})(?:\s*円)?(?:[^0-9]{{0,6}})税込")
+    # 金額（¥/裸数字どちらも）— “円” は別途オプションで吸う
+    YEN = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})"
+    # 「数字と税込の間にタグ/記号が多少入ってもOK」にするセパレータ
+    SEP = r"(?:[^0-9]{0,20}(?:<[^>]+>[^0-9]{0,20}){0,2})"
 
-    # 「通常の注文」系ラベルの近傍テキストをまず優先
-    LAB = re.compile(r"(通常の注文|通常注文|通常のご注文|一回限りの注文|1回の注文|１回の注文)")
-    win_idxs = [m.start() for m in LAB.finditer(T)]
-    for i in win_idxs:
-        seg = T[max(0, i-200): i+800]  # ラベル周辺だけを見る（広すぎない）
-        # 右側 “税込 NNNN”
-        m = PAT_R.search(seg)
-        if m:
-            val = _v(m.group(1))
-            if isinstance(val, int):
-                return val
-        # 左側 “NNNN 税込”
-        m = PAT_L.search(seg)
-        if m:
-            val = _v(m.group(1))
-            if isinstance(val, int):
-                return val
+    # 税込←→金額（左右どちらでも可）
+    PAT_R = re.compile(rf"税込{SEP}({YEN})(?:\s*円)?", re.I)       # 税込 の右に 金額
+    PAT_L = re.compile(rf"({YEN})(?:\s*円)?{SEP}税込", re.I)       # 金額 の右に 税込
 
-    # 全文から “税込の真横” を探す（同点は大きい方＝割引後より本体側を優先）
-    cands = []
-    for m in PAT_R.finditer(T):
-        val = _v(m.group(1))
-        if val: cands.append(val)
-    for m in PAT_L.finditer(T):
-        val = _v(m.group(1))
-        if val: cands.append(val)
-    if cands:
-        return max(cands)
+    # 「通常の注文」系ラベル（スマホ/表記ゆれ含む）
+    LABEL = re.compile(r"(通常の注文|通常注文|通常のご注文|一回限りの注文|1回の注文|１回の注文)")
 
-    # 価格箱だけを読む（a-offscreen / a-price-whole）
-    def _scan_block(blk: str) -> int | None:
-        # a-offscreen 最優先
-        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,50})<', blk, re.I):
-            val = _v(m.group(1))
-            if val is not None:
-                return val
-        # a-price-whole（小数分割の整数部）
-        m = re.search(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]{1,10})\s*<', blk, re.I)
+    def _scan_html_block(block: str) -> int | None:
+        # まず「税込の真横」を両方向で探す
+        for rx in (PAT_L, PAT_R):
+            for m in rx.finditer(block):
+                v = _to(m.group(1))
+                if v:
+                    return v
+        # 価格箱の中身（a-offscreen / a-price-whole）
+        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]+)<', block, re.I):
+            v = _to(m.group(1));  if v: return v
+        m = re.search(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]+)\s*<', block, re.I)
         if m:
-            val = _v(m.group(1))
-            if val is not None:
-                return val
-        # “¥/円 付き”のみ保険（素の裸数字は拾わない）
-        m = re.search(r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)', blk)
+            v = _to(m.group(1));  if v: return v
+        # 最後の保険：円付きの書式だけ許容
+        m = re.search(rf"{YEN}\s*円", block)
         if m:
-            val = _v(m.group(0))
-            if val is not None:
-                return val
+            v = _to(m.group(0));  if v: return v
         return None
 
-    for bid, span in (
-        ("priceToPay", 12000),
-        ("corePriceDisplay_desktop_feature_div", 12000),
-        ("corePrice_feature_div", 12000),
-        ("corePriceDisplay_mobile_feature_div", 12000),
-        ("apex_desktop", 12000),
-    ):
-        m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
-        if not m and bid == "priceToPay":
-            m = re.search(r'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\']([\s\S]{0,%d})' % span, H, re.I)
-        if not m:
-            continue
-        val = _scan_block(m.group(1))
-        if isinstance(val, int):
-            return val
+    for Hpart in parts:
+        # 1) 「通常の注文」周辺だけを強制的に切り出して読む（ここが最優先）
+        m = LABEL.search(Hpart)
+        if m:
+            i = m.start()
+            win = Hpart[max(0, i-3000): i+12000]   # 少し広めに見る
+            v = _scan_html_block(win)
+            if v:
+                return v
+
+        # 2) 既知の価格箱だけをピンポイントで読む
+        for bid, span in (
+            ("priceToPay", 15000),
+            ("corePriceDisplay_desktop_feature_div", 15000),
+            ("corePrice_feature_div", 15000),
+            ("corePriceDisplay_mobile_feature_div", 15000),
+            ("apex_desktop", 20000),
+        ):
+            mm = re.search(rf'id=["\']{bid}["\'][\s\S]{{0,{span}}}', Hpart, re.I)
+            if not mm and bid == "priceToPay":
+                mm = re.search(rf'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\'][\s\S]{{0,{span}}}', Hpart, re.I)
+            if mm:
+                v = _scan_html_block(mm.group(0))
+                if v:
+                    return v
+
+        # 3) 最後の保険：ページ先頭側 HTML から “税込の真横”
+        v = _scan_html_block(Hpart[:40000])
+        if v:
+            return v
 
     return None
+
 
 
 
