@@ -1065,16 +1065,38 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         log_hit("a-price", cand_val, seg, "kept", f"score={score}", {"dist": abs(pos_here - p2p_pos) if p2p_pos>=0 else -1})
         cands.append((score, cand_val, pos_here, "a-price", abs(pos_here - p2p_pos) if p2p_pos>=0 else 10**9))
 
-    # 採用ルール（同点時は priceToPay に近い方を優先。そのうえで値が小さい方）
+    
+    from collections import Counter  # 先頭で一度だけ
+    # 採用ルール（まず多数決、ダメなら従来ロジック）
     if cands:
         best_score = max(s for s,_,_,_,_ in cands)
-        top = [(s,v,pos,kind,dist) for (s,v,pos,kind,dist) in cands if s==best_score]
-        # 1) dist（近い方） 2) 価格（小さい方） 3) 出現位置（早い方）
+
+        # 出現回数の多い金額を優先
+        cnt = Counter(v for _, v, _, _, _ in cands)
+        multi = []
+        for v, k in cnt.items():
+            if k >= 2:
+                # 同じ金額の候補のうち、priceToPay に最も近い距離を代表として持つ
+                dmin = min(d for (s, vv, pos, kind, d) in cands if vv == v)
+                multi.append((k, dmin, v))
+
+        if multi:
+            # ①出現回数多い順 ②距離が近い順 ③金額が小さい順
+            multi.sort(key=lambda x: (-x[0], x[1], x[2]))
+            picked = multi[0][2]
+            trace["picked"] = {"val": picked, "how": "vote_by_repetition", "count": multi[0][0]}
+            globals()['__amz_trace__'] = trace
+            return picked
+
+        # 多数決で決まらない場合は従来ルール
+        top = [(s, v, pos, kind, dist) for (s, v, pos, kind, dist) in cands if s == best_score]
+        # ①priceToPayに近い ②金額が小さい ③出現位置が早い
         top.sort(key=lambda x: (x[4], x[1], x[2]))
         picked = top[0][1]
         trace["picked"] = {"val": picked, "how": "score_then_distance_then_min", "top_score": best_score}
         globals()['__amz_trace__'] = trace
         return picked
+
 
     # テキスト側の保険（STOP 強化済み）
     for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{4,7})\s*円", T[:40000]):
