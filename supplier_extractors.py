@@ -902,11 +902,14 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             log_hit("offscreen", val, ctx, "dropped", "near_strike");   continue
         if STOP.search(ctx):
             log_hit("offscreen", val, ctx, "dropped", "near_stop");     continue
-        wide = blk[max(0, i-80): m.end()+80]
+
+        # しきい値/送料無料ガード（←ここ）
+        wide = blk[max(0, i-120): m.end()+120]
         if re.search(r'(以上で?|送料無料|通常配送無料|配送料無料)', wide, re.I):
-        if not re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', wide, re.I):
-            log_hit("offscreen", val, wide, "dropped", "threshold_free_shipping_split")
-            continue
+            # ← この if を 1段深くすること！
+            if not re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', wide, re.I):
+                log_hit("offscreen", val, wide, "dropped", "threshold_free_shipping_split")
+                continue
 
         if is_unit_price(ctx, val):
             log_hit("offscreen", val, ctx, "dropped", "unit_price");    continue
@@ -918,11 +921,11 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         log_hit("offscreen", val, ctx, "kept", f"score={score}", {"dist": abs(i - p2p_pos)})
         cands.append((score, val, i, "offscreen", abs(i - p2p_pos) if p2p_pos>=0 else 10**9))
 
+
     # a-price-whole
     for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
         val = to_v(m.group(1)); i = m.start()
         ctx = blk[max(0, i-200): m.end()+200]
-
         if not val:
             log_hit("whole", None, ctx, "dropped", "not_numeric");  continue
         if BAD_NEAR.search(ctx):
@@ -930,10 +933,8 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if STOP.search(ctx):
             log_hit("whole", val, ctx, "dropped", "near_stop");     continue
 
-        # ★“しきい値/送料無料”ガードは STOP 判定とは独立に実行（要素分割対策）
-        wide = blk[max(0, i-80): m.end()+80]
+        wide = blk[max(0, i-120): m.end()+120]
         if re.search(r'(以上で?|送料無料|通常配送無料|配送料無料)', wide, re.I):
-            # priceToPay 直近のみ許容
             if not re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', wide, re.I):
                 log_hit("whole", val, wide, "dropped", "threshold_free_shipping_split")
                 continue
@@ -947,6 +948,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         score += boost_by_distance(i)
         log_hit("whole", val, ctx, "kept", f"score={score}", {"dist": abs(i - p2p_pos)})
         cands.append((score, val, i, "whole", abs(i - p2p_pos) if p2p_pos>=0 else 10**9))
+
 
     # 採用ルール（同点時は priceToPay に近い方を優先。そのうえで値が小さい方）
     if cands:
