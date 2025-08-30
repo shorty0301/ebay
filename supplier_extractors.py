@@ -985,6 +985,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     return None
 
 
+
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
     t = str(text or "")
     if re.search(r"(現在お取り扱いできません|一時的に在庫切れ|再入荷予定は立っておりません)", t):
