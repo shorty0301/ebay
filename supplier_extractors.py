@@ -873,12 +873,13 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp の支払価格を “価格箱” と “通常の注文” ブロックだけから取得する極小実装。
-    - 最優先: priceToPay（id または class）内の .a-offscreen / .a-price-whole
-    - 次点: corePrice* / apex_desktop の同様要素
-    - さらに「通常の注文」から 5,000字以内ブロックを直読み
-    - 本文全体のスキャンはしない
-    - 500円未満は除外（単位価格 162 等を弾く）
+    Amazon.co.jp の支払価格取得（軽量版）
+    優先順:
+      1) 「税込」前後24文字以内にある価格（最優先）
+      2) 価格箱内の .a-offscreen / .a-price-whole
+      3) 価格箱内の “￥/円付き” 数字
+      4) 旧ID（狭い範囲）
+    スコープは「通常の注文」塊と既知の価格箱だけ（本文全体は見ない）
     """
     import re
 
@@ -886,13 +887,11 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     parts = (re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I)
              if "<!-- MOBILE MERGE -->" in H_all else [H_all])
 
-    PRICE_YEN = re.compile(
-        r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)',
-        re.I
-    )
+    # ￥/円付きの価格パターン
+    YEN = r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)'
 
     def _to_int(token: str) -> int | None:
-        # 162/袋などの小額を除外（500未満は棄却）
+        # 500 未満（単価/pt等）を除外
         t = re.sub(r"[^\d]", "", token or "")
         if not t:
             return None
@@ -902,19 +901,49 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         except Exception:
             return None
 
+    def _bad_unit_after(ctx: str) -> bool:
+        # 直後に単位やスラッシュが来る「￥162/袋」などは除外
+        return bool(re.search(r'[/／]\s*(袋|個|枚|本|台|回|か月|ヶ月|月|年|GB|TB|MB|cm|mm|g|kg|ml|L|セット)', ctx))
+
+    def _scan_tax_inclusive_first(blk: str) -> int | None:
+        """『税込』の前後±24文字で価格を探す（最優先）"""
+        # 価格 → 税込
+        for m in re.finditer(rf'({YEN})[\s\S]{{0,24}}?税込', blk, re.I):
+            tok = m.group(1)
+            tail = blk[m.end(1): m.end(0) + 30]  # 数字直後〜少し先
+            if _bad_unit_after(tail):
+                continue
+            v = _to_int(tok)
+            if v is not None:
+                return v
+        # 税込 → 価格
+        for m in re.finditer(rf'税込[\s\S]{{0,24}}?({YEN})', blk, re.I):
+            tok = m.group(1)
+            tail = blk[m.end(1): m.end(1) + 30]
+            if _bad_unit_after(tail):
+                continue
+            v = _to_int(tok)
+            if v is not None:
+                return v
+        return None
+
     def _scan_price_block(blk: str) -> int | None:
-        # 1) a-offscreen が最優先（“￥1,620” の素テキスト）
+        # (1) 税込 近傍（最優先）
+        v = _scan_tax_inclusive_first(blk)
+        if v is not None:
+            return v
+        # (2) a-offscreen
         for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,50})<', blk, re.I):
             v = _to_int(m.group(1))
             if v is not None:
                 return v
-        # 2) a-price-whole（小数分割の whole）
+        # (3) a-price-whole
         for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]{1,10})\s*<', blk, re.I):
             v = _to_int(m.group(1))
             if v is not None:
                 return v
-        # 3) どうしても無ければブロック内の“￥/円付き数値”で拾う
-        m = PRICE_YEN.search(blk)
+        # (4) ブロック内の “￥/円付き”
+        m = re.search(YEN, blk, re.I)
         if m:
             v = _to_int(m.group(0))
             if v is not None:
@@ -923,14 +952,14 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
 
     # パート（PC/モバイル）毎に処理
     for H in parts:
-        # A) 「通常の注文」から 5,000 文字だけを切り出して読む（ページと同じ見た目の塊）
-        m_head = re.search(r'通常の注文[\s\S]{0,5000}', H)
+        # A) 「通常の注文」付近（ゆれ対応：通常のご注文 / 幅6000）
+        m_head = re.search(r'(?:通常の注文|通常のご注文)[\s\S]{0,6000}', H)
         if m_head:
             v = _scan_price_block(m_head.group(0))
             if v is not None:
                 return v
 
-        # B) 既知の価格箱（id/class）だけをピンポイント抽出して読む
+        # B) 既知の価格箱（id/class）
         price_blocks = [
             r'id=["\']priceToPay["\']([\s\S]{0,4000})',
             r'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\']([\s\S]{0,4000})',
