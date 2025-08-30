@@ -872,201 +872,165 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp の本体価格抽出（通常の注文/税込を優先）
-    - 価格箱 (id|class=priceToPay / apex_desktop / corePrice*) だけをまず探索
-    - a-offscreen / a-price-whole (+ fraction) を拾う
-    - 定期/クーポン/還元/送料無料しきい値/単価表記を除外
-    - だめでも最後に本文の上部をスコア探索
-    - 複数あれば “最大値（通常価格になりやすい）” を返す
+    Amazon.co.jp 価格抽出（価格箱だけを見る安全版）
+    - PC/SPを分割（fetch_htmlが <!-- MOBILE MERGE --> を挿入）
+    - priceToPay / corePriceDisplay_* / corePrice_* / apex_desktop の直下だけを読む
+    - .a-offscreen → a-price-whole(+fraction) → 旧ID → JSON-LDの順
+    - 本文の広域スキャンは一切しない（年号/クーポン数字の誤爆を防止）
     """
     import re
+    H_all = str(html or "")
 
-    H = str(html or "")
+    # PC/SP を分割
+    parts = (
+        re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I)
+        if "<!-- MOBILE MERGE -->" in H_all
+        else [H_all]
+    )
 
-    # ---------------------------
-    # 数値化（小額の裸3桁は弱いので抑制）
-    # ---------------------------
-    def _to_int(tok: str) -> int | None:
-        from re import sub
-        t = sub(r"[^\d]", "", tok or "")
+    def _to_int(token: str) -> int | None:
+        # 通貨ありは通常パース、無ければ数字だけ（a-price-whole対策）
+        v = to_int_yen(token)
+        if isinstance(v, int) and 100 <= v <= 3_000_000:
+            return v
+        t = re.sub(r"[^\d]", "", token or "")
         if not t:
             return None
         try:
             v = int(t)
-        except ValueError:
+            return v if 100 <= v <= 3_000_000 else None
+        except Exception:
             return None
-        if not (100 <= v <= 3_000_000):
-            return None
-        # 500未満は通貨/円が無いと単価の可能性が高いので弾く
-        if v < 500 and not re.search(r"[¥￥]|円", tok):
-            return None
-        return v
 
-    BAD_NEAR = re.compile(
-        r"(定期|おトク便|Subscribe|Save|SNS|クーポン|coupon|OFF|円OFF|割引|"
-        r"ポイント|pt|還元|相当|円相当|実質|セール|タイムセール|併用|適用)", re.I
+    # 価格箱ID群
+    BOX_XPATH = (
+        '//*[@id="priceToPay" or '
+        'contains(@id,"corePriceDisplay_") or '
+        '@id="corePrice_feature_div" or '
+        '@id="corePriceDisplay_mobile_feature_div" or '
+        '@id="apex_desktop"]'
     )
-    THNUM  = re.compile(r'[¥￥]?\s*\d{3,5}\s*円?\s*(以上|超|から)', re.I)
-    FREE   = re.compile(r'(送料無料|通常配送無料|配送料無料|無料配送)', re.I)
-    UNIT_TAIL = re.compile(r"[／/]\s*(袋|個|枚|本|箱|g|kg|mg|L|l|ml|mL|cm|mm|GB|MB|TB|セット|回|時間|月|年)")
 
-    def _is_threshold(s: str) -> bool:
-        return bool(THNUM.search(s) and FREE.search(s))
+    # 価格候補抽出（lxml優先）
+    def _from_dom(H: str) -> int | None:
+        try:
+            from lxml import html as LH
+            doc = LH.fromstring(H)
+            boxes = doc.xpath(BOX_XPATH)
+            if not boxes:
+                return None
 
-    # ---------------------------
-    # 価格箱ブロックを広めに収集（id でも class でも）
-    # ---------------------------
-    blocks: list[str] = []
-    # id / class どちらも priceToPay を拾う。span長は広めに。
-    for pat, span in (
-        (r'(?:id|class)=["\'][^"\']*\bpriceToPay\b[^"\']*["\']', 15000),
-        (r'id=["\']apex_desktop["\']', 15000),
-        (r'id=["\']corePriceDisplay_desktop_feature_div["\']', 15000),
-        (r'id=["\']corePrice_feature_div["\']', 15000),
-        (r'id=["\']corePriceDisplay_mobile_feature_div["\']', 15000),
-    ):
-        for m in re.finditer(pat, H, re.I):
-            # 直後～span 文字をブロックに
-            start = m.end()
-            end = min(len(H), start + span)
-            blocks.append(H[start:end])
+            # 1) .a-offscreen に通貨付きが多い
+            for b in boxes:
+                texts = b.xpath('.//span[contains(@class,"a-offscreen")]/text()')
+                for t in texts:
+                    v = _to_int(t)
+                    if v:
+                        # 1900〜2100の裸年号は理屈上ここには来ないが一応ガード
+                        if 1900 <= v <= 2100 and not re.search(r"[¥￥]|円", t):
+                            continue
+                        return v
 
-    cands: list[int] = []
+            # 2) a-price-whole (+ a-price-fraction)
+            for b in boxes:
+                whole = "".join(b.xpath('.//span[contains(@class,"a-price-whole")]/text()')[:1])
+                if whole:
+                    frac = "".join(b.xpath('.//span[contains(@class,"a-price-fraction")]/text()')[:1])  # 使わず無視でもOK
+                    v = _to_int(whole)
+                    if v:
+                        return v
 
-    # ---------------------------
-    # ブロック内で a-offscreen / a-price-whole を抽出
-    # ---------------------------
-    for blk in blocks:
-        sblk = re.sub(r"\s+", " ", blk)
+            # 3) 旧ID（保険）
+            legacy = doc.xpath('//*[@id="priceblock_ourprice" or @id="priceblock_dealprice" or @id="sns-base-price"]/text()')
+            for t in legacy:
+                v = _to_int(t)
+                if v:
+                    return v
 
-        # (1) apexPriceToPay → a-offscreen（最優先）
-        for m in re.finditer(
-            r'apexPriceToPay[^<]*</span>\s*<span[^>]*class=["\'][^"\']*a-offscreen[^"\']*["\'][^>]*>'
-            r'\s*([¥￥]?\s*(?:\d{1,3}(?:[,，]\d{3})+|\d{4,7}))'
-            r'(?:\s*円)?\s*([^<]{0,30})<',
-            sblk, re.I
+            return None
+        except Exception:
+            return None
+
+    # lxmlが無い/取れない時の限定regex（価格箱の中だけ）
+    def _from_regex(H: str) -> int | None:
+        blk = ""
+        for bid, span in (
+            ("priceToPay", 3000),
+            ("corePriceDisplay_desktop_feature_div", 6000),
+            ("corePrice_feature_div", 6000),
+            ("corePriceDisplay_mobile_feature_div", 6000),
+            ("apex_desktop", 8000),
         ):
-            tok, tail = m.group(1), (m.group(2) or "")
-            ctx = sblk[max(0, m.start()-200): m.end()+200]
-            if BAD_NEAR.search(ctx) or _is_threshold(ctx):
-                continue
-            v = _to_int(tok)
-            if v is None: 
-                continue
-            if v < 500 and UNIT_TAIL.search(tail):
-                continue
-            if 1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok):
-                continue
-            cands.append(v)
+            m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
+            if m:
+                blk = m.group(1); break
+        if not blk:
+            return None
 
-        # (2) 汎用 a-offscreen（尻尾チェック）
+        # a-offscreen（￥/円あり/なし両対応）
         for m in re.finditer(
-            r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*(?:\d{1,3}(?:[,，]\d{3})+|\d{4,7}))'
-            r'(?:\s*円)?\s*([^<]{0,30})<',
-            sblk, re.I
-        ):
-            tok, tail = m.group(1), (m.group(2) or "")
-            ctx = sblk[max(0, m.start()-200): m.end()+200]
-            if BAD_NEAR.search(ctx) or _is_threshold(ctx):
-                continue
-            v = _to_int(tok)
-            if v is None: 
-                continue
-            if v < 500 and UNIT_TAIL.search(tail):
-                continue
-            if 1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok):
-                continue
-            cands.append(v)
-
-        # (3) a-price-whole (+ fraction) 1000以上のみ許容
-        for m in re.finditer(
-            r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]{1,10})\s*<', sblk, re.I
+            r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I
         ):
             tok = m.group(1)
-            ctx = sblk[max(0, m.start()-200): m.end()+200]
-            if BAD_NEAR.search(ctx) or _is_threshold(ctx):
-                continue
             v = _to_int(tok)
-            if v and v >= 1000:
-                cands.append(v)
+            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
+                return v
 
-    if cands:
-        return max(cands)
-
-    # ---------------------------
-    # 最終フォールバック：本文上部のスコア探索
-    # ---------------------------
-    try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(H, "html.parser")
-        T = soup.get_text(" ", strip=True)
-        T = re.sub(r"\s+", " ", T)
-    except Exception:
-        T = re.sub("<[^>]+>", " ", H)
-        T = re.sub(r"\s+", " ", T)
-
-    head = T[:20000]
-
-    PRICE = re.compile(
-        r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{4,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{4,7}\s*円)"
-    )
-    LABEL = re.compile(r"(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)")
-    BUY   = re.compile(r"(カートに入れる|今すぐ買う|今すぐ購入|注文手続き)")
-
-    # 「BUY近傍」をまず見る（購入エリアの価格が本体であることが多い）
-    buy_cands: list[int] = []
-    for b in BUY.finditer(head):
-        i = b.start()
-        ctx = head[max(0, i-1200): i+1200]
-        for m in PRICE.finditer(ctx):
-            tok = m.group(1)
-            win = ctx[max(0, m.start()-120): m.end()+120]
-            if BAD_NEAR.search(win) or _is_threshold(win):
-                continue
-            v = _to_int(tok)
+        # a-price-whole（小数分割時）
+        m = re.search(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]{1,10})\s*<', blk, re.I)
+        if m:
+            v = _to_int(m.group(1))
             if v:
-                # 単価尻尾（”/袋” 等）が近い行は除外
-                tail = ctx[m.end(): m.end()+24]
-                if v < 500 and UNIT_TAIL.search(tail):
-                    continue
-                buy_cands.append(v)
-    if buy_cands:
-        return max(buy_cands)
+                return v
 
-    # ラベル近傍（本文全体・上部）— ラベル→金額／金額→ラベルの両方向
-    lab_cands: list[int] = []
-    for m in re.finditer(r"(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)[^\d¥￥]{0,20}"+PRICE.pattern, head, re.I):
-        seg = m.group(0)
-        if BAD_NEAR.search(seg) or _is_threshold(seg):
-            continue
-        tok = re.search(PRICE, seg).group(1)
-        v = _to_int(tok)
-        if v:
-            lab_cands.append(v)
-    for m in re.finditer(PRICE.pattern + r"[^\d¥￥]{0,20}(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)", head, re.I):
-        seg = m.group(0)
-        if BAD_NEAR.search(seg) or _is_threshold(seg):
-            continue
-        tok = re.search(PRICE, seg).group(1)
-        v = _to_int(tok)
-        if v:
-            lab_cands.append(v)
-    if lab_cands:
-        return max(lab_cands)
+        # 旧ID（保険）
+        for m in re.finditer(
+            r'id=["\'](?:priceblock_ourprice|priceblock_dealprice|sns-base-price)["\'][^>]*>\s*([^<]{1,40})<',
+            H, re.I
+        ):
+            v = _to_int(m.group(1))
+            if v:
+                return v
 
-    # それでもダメなら、上部で “¥付き” の数字からモードっぽい値を最大優先で
-    from collections import Counter
-    vals = []
-    for m in PRICE.finditer(head):
-        v = _to_int(m.group(1))
-        if v:
-            vals.append(v)
-    if vals:
-        freq = Counter(vals).most_common()
-        # 同頻度は最大値を優先
-        top_count = freq[0][1]
-        top_vals = [v for v,c in freq if c == top_count]
-        return max(top_vals)
+        # JSON-LDの Offer price（さらに保険）
+        for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', H, re.I):
+            raw = m.group(1)
+            try:
+                import json
+                data = json.loads(re.sub(r",\s*([}\]])", r"\1", raw))
+            except Exception:
+                continue
+            def walk(o):
+                if isinstance(o, dict):
+                    typ = (o.get("@type") or "").lower()
+                    if typ in ("offer", "aggregateoffer"):
+                        for k in ("price", "lowPrice", "lowprice"):
+                            if k in o:
+                                vv = _to_int(str(o[k]))
+                                if vv:
+                                    return vv
+                    for v in o.values():
+                        r = walk(v)
+                        if r: return r
+                elif isinstance(o, list):
+                    for it in o:
+                        r = walk(it)
+                        if r: return r
+                return None
+            vv = walk(data)
+            if vv:
+                return vv
+
+        return None
+
+    # PC/SP どちらかで取れればOK
+    for H in parts:
+        v = _from_dom(H)
+        if isinstance(v, int):
+            return v
+        v = _from_regex(H)
+        if isinstance(v, int):
+            return v
 
     return None
 
