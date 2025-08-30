@@ -1521,7 +1521,7 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_mercari(html, text)
         if price is None:
             try:
-                v = mercari_price_via_playwright_sync(url, timeout_ms=60_000, headless=True, retries=2)
+                v = mercari_price_via_playwright_sync(url, timeout_ms=90_000, headless=false, retries=1)
                 if isinstance(v, int):
                     price = v
             except Exception:
