@@ -872,10 +872,10 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     import re
-    H = str(html or "")  
 
-    # --- 1) PC/MOBILE を個別に試す -------------------------
-    parts = re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I) if "<!-- MOBILE MERGE -->" in H_all else [H_all]
+    H_all = str(html or "")  # ← 修正ポイント1
+    parts = (re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I)
+             if "<!-- MOBILE MERGE -->" in H_all else [H_all])
 
     def _to(token: str) -> int | None:
         v = to_int_yen(token)
@@ -891,7 +891,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             return None
 
     def _pick_from_single(H: str) -> int | None:
-        # --- DOM直読（lxml があれば最優先） ---
+        # --- DOM読み（lxmlがあれば最優先） ---
         try:
             from lxml import html as LH
             doc = LH.fromstring(H)
@@ -910,7 +910,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                     if v:
                         return v
 
-            # (a-2) a-price-whole（小数分割のwhole）
+            # (a-2) a-price-whole
             for r in roots:
                 wholes = r.xpath('.//span[contains(@class,"a-price-whole")]/text()')
                 if wholes:
@@ -918,15 +918,16 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                     if v:
                         return v
 
-            # (a-3) data-a-color="price" 近傍の素テキスト
+            # (a-3) data-a-color="price" 近傍
             for r in roots:
                 seg = " ".join(r.xpath('.//*[contains(@data-a-color,"price") or contains(@class,"price")]/text()'))
                 m = re.search(r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)', seg)
                 if m:
-                    v = _to(m.group(0)); 
-                    if v: return v
+                    v = _to(m.group(0))
+                    if v:
+                        return v
 
-            # (a-4) ラベル“真横”（±120文字）
+            # (a-4) ラベル真横
             LABELS = ("通常の注文", "税込", "価格", "販売価格", "お支払い金額", "支払金額")
             BAD    = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|%|％|ギフト券)", re.I)
             THNUM  = re.compile(r'[¥￥]?\s*\d{3,5}\s*円?\s*(?:以上|超|から)', re.I)
@@ -946,108 +947,106 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                         m2 = YEN.search(win)
                         if m2:
                             v = _to(m2.group(0))
-                            if v: return v
+                            if v:
+                                return v
 
-            # (a-5) 旧ID（念のため）
+            # (a-5) 旧ID
             for txt in doc.xpath('//*[@id="priceblock_ourprice" or @id="priceblock_dealprice" or @id="sns-base-price"]/text()'):
                 v = _to(txt)
                 if v:
                     return v
 
         except Exception:
-            pass  # lxml なし or 失敗 → regex fallback
+            pass  # lxml 無し or 失敗 → regexへ
 
-    # --- regex フォールバック（価格箱ブロックだけ） ---
-    blk = ""
-    for bid, span in (("priceToPay", 3000),
-                      ("corePriceDisplay_desktop_feature_div", 6000),
-                      ("corePrice_feature_div", 6000),
-                      ("corePriceDisplay_mobile_feature_div", 6000),
-                      ("apex_desktop", 8000)):
-        m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
-        if m:
-            blk = m.group(1)
-            break
+        # --- regex フォールバック（価格箱ブロックだけ） ---
+        blk = ""
+        for bid, span in (("priceToPay", 3000),
+                          ("corePriceDisplay_desktop_feature_div", 6000),
+                          ("corePrice_feature_div", 6000),
+                          ("corePriceDisplay_mobile_feature_div", 6000),
+                          ("apex_desktop", 8000)):
+            m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
+            if m:
+                blk = m.group(1)
+                break
 
-    if not blk:
-        # ---- 最終保険：上部テキストのラベル近傍（フッター年号は見ない） ----
-        try:
-            T = strip_tags(H).replace("\u3000", " ").replace("\u00A0", " ")
-        except Exception:
-            T = re.sub("<[^>]+>", " ", H)
-        head = T[:15000]  # 上部だけ見る
+        if not blk:
+            # ---- 最終保険：上部テキストのラベル近傍 ----
+            try:
+                T = strip_tags(H).replace("\u3000", " ").replace("\u00A0", " ")
+            except Exception:
+                T = re.sub("<[^>]+>", " ", H)
+            head = T[:15000]
 
-        STOP   = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|通常配送無料|配送料無料|送料無料|以上で)", re.I)
-        LABELS = r"(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)"
-        YEN    = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)"
+            STOP   = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|通常配送無料|配送料無料|送料無料|以上で)", re.I)
+            LABELS = r"(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)"
+            YEN    = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)"
 
-        # ラベル → 金額
-        pat_l2y = re.compile(rf"{LABELS}[^\d¥￥]{{0,20}}({YEN})", re.I)
-        for m in pat_l2y.finditer(head):
-            tok = m.group(1)
-            ctx = head[max(0, m.start()-60): m.end()+60]
-            if STOP.search(ctx):
-                continue
-            v = _to(tok)
-            # 年号っぽい裸数字は除外（通貨/円が無い 1900〜2100）
-            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
-                return v
-
-        # 金額 → ラベル
-        pat_y2l = re.compile(rf"({YEN})[^\d¥￥]{{0,20}}{LABELS}", re.I)
-        for m in pat_y2l.finditer(head):
-            tok = m.group(1)
-            ctx = head[max(0, m.start()-60): m.end()+60]
-            if STOP.search(ctx):
-                continue
-            v = _to(tok)
-            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
-                return v
-
-        # 出現多数（モード）で拾う（同額が2回以上出たらそれ）
-        from collections import Counter
-        vals: list[int] = []
-        for m in re.finditer(r"[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円", head):
-            v = _to(m.group(0))
-            if v:
-                vals.append(v)
-        if vals:
-            v, cnt = Counter(vals).most_common(1)[0]
-            if cnt >= 2 and not (1900 <= v <= 2100):
-                return v
-
-        return None
-
-
-        # offscreen（￥/円 なくてもOK）
-        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I):
-            token = m.group(1)
-            v = _to(token)
-            if v:
-                if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', token):
+            # ラベル → 金額
+            pat_l2y = re.compile(rf"{LABELS}[^\d¥￥]{{0,20}}({YEN})", re.I)
+            for m in pat_l2y.finditer(head):
+                tok = m.group(1)
+                ctx = head[max(0, m.start()-60): m.end()+60]
+                if STOP.search(ctx):
                     continue
-                return v
+                v = _to(tok)
+                if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
+                    return v
 
-        # ラベル近傍（±120）
-        LABEL_NEAR = re.compile(
-            r'(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)[^¥￥\d]{0,40}'
-            r'((?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円))',
-            re.I
-        )
-        for m in LABEL_NEAR.finditer(re.sub(r"\s+", " ", blk)):
-            win = m.group(0)
-            if re.search(r"(ポイント|pt|還元|クーポン|OFF|円OFF|%|％|ギフト券)", win, re.I):
-                continue
-            if re.search(r'[¥￥]?\s*\d{3,5}\s*円?\s*(以上|超|から)', win) and re.search(r'(送料無料|通常配送無料|配送料無料|無料配送)', win):
-                continue
-            v = _to(m.group(2))
-            if v:
-                if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', m.group(2)):
+            # 金額 → ラベル
+            pat_y2l = re.compile(rf"({YEN})[^\d¥￥]{{0,20}}{LABELS}", re.I)
+            for m in pat_y2l.finditer(head):
+                tok = m.group(1)
+                ctx = head[max(0, m.start()-60): m.end()+60]
+                if STOP.search(ctx):
                     continue
-                return v
-        return None
+                v = _to(tok)
+                if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
+                    return v
 
-    # パートごとに試し、最初に取れたものを返す
+            # 出現多数（モード）
+            from collections import Counter
+            vals: list[int] = []
+            for m in re.finditer(r"[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円", head):
+                v = _to(m.group(0))
+                if v:
+                    vals.append(v)
+            if vals:
+                v, cnt = Counter(vals).most_common(1)[0]
+                if cnt >= 2 and not (1900 <= v <= 2100):
+                    return v
+            return None
+        else:
+            # blk 内の offscreen
+            for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I):
+                token = m.group(1)
+                v = _to(token)
+                if v:
+                    if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', token):
+                        continue
+                    return v
+
+            # blk 内のラベル近傍
+            LABEL_NEAR = re.compile(
+                r'(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)[^¥￥\d]{0,40}'
+                r'((?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円))',
+                re.I
+            )
+            for m in LABEL_NEAR.finditer(re.sub(r"\s+", " ", blk)):
+                win = m.group(0)
+                if re.search(r"(ポイント|pt|還元|クーポン|OFF|円OFF|%|％|ギフト券)", win, re.I):
+                    continue
+                if re.search(r'[¥￥]?\s*\d{3,5}\s*円?\s*(以上|超|から)', win) and re.search(r'(送料無料|通常配送無料|配送料無料|無料配送)', win):
+                    continue
+                v = _to(m.group(2))
+                if v:
+                    if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', m.group(2)):
+                        continue
+                    return v
+            return None
+
+    # パートごとに試す
     for H in parts:
         v = _pick_from_single(H)
         if isinstance(v, int):
@@ -1651,7 +1650,8 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_surugaya(html, text)
     # ========== Amazon.co.jp ==========
     elif ("amazon.co.jp" in host) or host.endswith(".amazon.co.jp"):
-        # 1st pass: 価格箱だけ読む軽量版（price_from_amazon_jp は価格箱XPath＋ラベル近傍）
+        dp_url = None  # 先に用意しておく（未定義参照を防止）
+
         if debug:
             H = html or ""
             T = text or ""
@@ -1669,33 +1669,23 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
                 "robot":      bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", H, re.I)),
             })
 
+        # まずは手元のHTMLから判定
         s = stock_from_amazon_jp(html, text)
         if s:
             stock = s
         price = price_from_amazon_jp(html, text)
 
-        # 再取得するかの判定（DP化やロボットページ時など）
-        need_follow = False
-        if price is None and stock in ("UNKNOWN", "", None):
-            need_follow = True
-        if not re.search(r"/(dp|gp/product)/", url):
-            need_follow = True
-        if len(html or "") < 3000:
-            need_follow = True
-        if re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", html or "", re.I):
-            need_follow = True
+        # /dp/ への追撃が必要か
+        need_follow = (
+            (price is None and stock in ("UNKNOWN", "", None)) or
+            (not re.search(r"/(dp|gp/product)/", url)) or
+            (len(html or "") < 3000) or
+            bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", html or "", re.I))
+        )
         if CI_MODE:
             need_follow = False
-        if price is None and PLAYWRIGHT_ENABLED:
-            try:
-                p3 = amazon_price_via_playwright_sync(dp_url or url, headless=True)
-            except Exception:
-                p3 = None
-            if isinstance(p3, int):
-                price = p3
 
-        # 2nd pass: HTMLから /dp/… を推定して一度だけ再取得（正規URLへ寄せる）
-        dp_url = None
+        # /dp/ を推定して再取得（1回だけ）
         if need_follow:
             try:
                 dp_url = _amz_guess_dp_url(host, url, html)
@@ -1717,12 +1707,10 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
                 except Exception:
                     pass
 
-        # 3rd pass（任意の保険）：Playwrightで価格箱だけ直読（未定義なら無視）
-        if price is None:
+        # 最終保険：Playwright（dp_url が取れていればそちらを優先）
+        if price is None and PLAYWRIGHT_ENABLED:
             try:
                 p3 = amazon_price_via_playwright_sync(dp_url or url, headless=True)
-            except NameError:
-                p3 = None
             except Exception:
                 p3 = None
             if isinstance(p3, int):
