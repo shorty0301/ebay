@@ -8,7 +8,114 @@ GAS版からPython移植
 import re, json, functools, requests
 from typing import Dict, Any
 from bs4 import BeautifulSoup
-import os
+
+# ==== Amazon Simple Scraper (requests + BS4) ====
+try:
+    from fake_useragent import UserAgent as _UAClass  # 任意
+except Exception:
+    _UAClass = None
+
+def _amz_simple_ua() -> str:
+    if _UAClass:
+        try:
+            return _UAClass().random
+        except Exception:
+            pass
+    # フォールバックUA（固定）
+    return ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+def _amz_price_int_from_text(s: str) -> int | None:
+    """通貨 or カンマの無い“裸4桁”は弾く。500〜3,000,000の範囲のみ許容。"""
+    if not s:
+        return None
+    has_currency = bool(re.search(r"[¥￥]|円", s))
+    has_comma    = bool(re.search(r"[,，]", s))
+    bare         = not (has_currency or has_comma)
+    t = re.sub(r"[^\d]", "", z2h_digits(s))
+    if not t:
+        return None
+    try:
+        v = int(t)
+    except Exception:
+        return None
+    if bare and len(t) == 4:          # 例: 1540 対策
+        return None
+    if v < 500 or v > 3_000_000:
+        return None
+    return v
+
+def _amz_price_from_soup(soup: BeautifulSoup) -> int | None:
+    """購入用の価格箱優先で抽出（.a-price-whole / .a-offscreen）"""
+    sel_groups = [
+        # 最優先: priceToPay
+        ["#priceToPay .a-offscreen"],
+        # 主要価格ブロック
+        [
+            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#apex_desktop .a-price .a-offscreen",
+            "#corePrice_feature_div .a-price .a-offscreen",
+            "#corePriceDisplay_mobile_feature_div .a-price .a-offscreen",
+        ],
+        # 従来のID
+        ["#priceblock_ourprice", "#priceblock_dealprice"],
+        # 最後の保険
+        [".a-price .a-offscreen", ".a-price-whole"],
+    ]
+    for sels in sel_groups:
+        for sel in sels:
+            el = soup.select_one(sel)
+            if not el:
+                continue
+            txt = el.get_text(" ", strip=True)
+            v = _amz_price_int_from_text(txt)
+            if isinstance(v, int):
+                return v
+    # whole+fraction 形式（小数は無視）
+    m = soup.select_one(".a-price .a-price-whole")
+    if m:
+        v = _amz_price_int_from_text(m.get_text(" ", strip=True))
+        if isinstance(v, int):
+            return v
+    return None
+
+def _amz_stock_from_soup(soup: BeautifulSoup) -> str | None:
+    """在庫のざっくり判定（既存の判定と等価の簡易版）"""
+    body = soup.get_text(" ", strip=True)
+    if re.search(r"(現在お取り扱いできません|一時的に在庫切れ|再入荷予定は立っておりません)", body):
+        return "OUT_OF_STOCK"
+    if re.search(r"(売り切れ|在庫切れ|SOLD\s*OUT)", body, re.I):
+        return "OUT_OF_STOCK"
+    if re.search(r"(在庫あり|カートに入れる|今すぐ買う|今すぐ購入)", body):
+        m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", body)
+        if m:
+            n = int(z2h_digits(m.group(1)))
+            return "LAST_ONE" if n == 1 else "IN_STOCK"
+        return "IN_STOCK"
+    return None
+
+def amazon_fetch_price_and_stock(url: str, timeout: int = HTTP_TIMEOUT) -> tuple[int | None, str | None]:
+    """requests + BS4 でURLから直接取得（外部依存は無し／fake_useragentは任意）"""
+    u = url if url.startswith("http") else ("https://" + url)
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": _amz_simple_ua(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "ja,en;q=0.8",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    try:
+        r = sess.get(u, timeout=timeout)
+        if r.status_code != 200:
+            return None, None
+        soup = BeautifulSoup(r.content, "html.parser")
+    except Exception:
+        return None, None
+    price = _amz_price_from_soup(soup)
+    stock = _amz_stock_from_soup(soup)
+    return price, stock
+
 
 # ======== 共通ユーティリティ ==========
 CI_MODE = bool(os.getenv("GITHUB_ACTIONS") or os.getenv("CI"))
@@ -122,249 +229,6 @@ def to_int_yen(s: str) -> int | None:
         return v if 0 < v < 10_000_000 else None
     except:
         return None
-        
-# ============================================================
-# Playwright版 価格抽出（任意利用・既存処理へは未接続：副作用なし）
-# ============================================================
-import asyncio as _asyncio
-import json as _json
-import re as _re
-from collections import Counter as _Counter
-
-_YEN_RE = _re.compile(r"(?:￥|¥)\s*([0-9０-９][0-9０-９,，]{2,})")
-_DEFAULT_LABEL_WORDS: tuple[str, ...] = ("税込", "送料込", "送料込み")
-
-def _z2h_digits_play(s: str) -> str:
-    table = str.maketrans("０１２３４５６７８９，，", "0123456789,,")
-    return (s or "").translate(table)
-
-def _to_int_play(s: str, lo: int = 100, hi: int = 3_000_000) -> int | None:
-    t = _re.sub(r"[^\d]", "", _z2h_digits_play(s))
-    if not t:
-        return None
-    try:
-        v = int(t)
-        return v if lo <= v <= hi else None
-    except Exception:
-        return None
-
-def _pick_mode_min_play(nums: list[int]) -> int | None:
-    arr = [n for n in nums if isinstance(n, int)]
-    if not arr:
-        return None
-    freq = _Counter(arr).most_common()
-    top_vals = [v for v, c in freq if c == freq[0][1]]
-    return min(top_vals)
-
-async def fetch_price_playwright(
-    url: str,
-    *,
-    timeout_ms: int = 60_000,
-    headless: bool = True,
-    retries: int = 2,
-    buy_button_texts: tuple[str, ...] = ("購入手続き", "今すぐ購入", "カートに入れる"),
-    label_words: tuple[str, ...] = _DEFAULT_LABEL_WORDS,
-    return_extra: bool = False,
-) -> Dict[str, Any]:
-    
-    try:
-        from playwright.async_api import async_playwright, Error as PWError, TimeoutError as PWTimeout
-        from lxml import html as LH
-    except Exception:
-        # Playwright等が未導入の場合も、既存フローに影響しないよう失敗のみ返す
-        return {"status": "price_not_found"}
-
-    UA_WIN_CHROME = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    )
-
-    async def _once() -> Dict[str, Any]:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=headless)
-            ctx = await browser.new_context(
-                user_agent=UA_WIN_CHROME,
-                locale="ja-JP",
-                extra_http_headers={"Accept-Language": "ja,en;q=0.8"},
-                device_scale_factor=1.0,
-            )
-            page = await ctx.new_page()
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            except (PWTimeout, PWError):
-                await ctx.close(); await browser.close()
-                return {"status": "timeout_goto"}
-
-            await page.wait_for_timeout(700)
-            content = await page.content()
-            soup = BeautifulSoup(content, "lxml")
-            doc = LH.fromstring(content)
-
-            # 1) 購入ボタン近傍
-            btn_or = " or ".join([f"contains(., '{t}')" for t in buy_button_texts])
-            btn_pred = f"((self::button or self::a) and ({btn_or}))"
-            # 直近の ¥ 含有要素を後方優先で
-            def _scan_near(with_label: bool) -> int | None:
-                nodes = doc.xpath(f"//*[contains(., '¥') or contains(., '￥')][preceding::*[{btn_pred}]]")
-                for el in reversed(nodes):
-                    txt = " ".join(el.xpath(".//text()")).strip()
-                    if not txt:
-                        continue
-                    if with_label and not any(w in txt for w in label_words):
-                        continue
-                    m = _YEN_RE.search(txt)
-                    if not m:
-                        continue
-                    v = _to_int_play(m.group(1))
-                    if v is not None:
-                        return v
-                return None
-            v1a = _scan_near(True)
-            if v1a is not None:
-                out = {"price": v1a, "source": "dom:near_buy+label"}
-                if return_extra:
-                    out.update(_collect_extras_play(soup))
-                await ctx.close(); await browser.close()
-                return out
-            v1b = _scan_near(False)
-            if v1b is not None:
-                out = {"price": v1b, "source": "dom:near_buy"}
-                if return_extra:
-                    out.update(_collect_extras_play(soup))
-                await ctx.close(); await browser.close()
-                return out
-
-            # 2) JSON-LD Offer/AggregateOffer
-            try:
-                def _walk(o) -> int | None:
-                    if isinstance(o, dict):
-                        t = (o.get("@type") or o.get("type") or "").lower()
-                        if t in {"offer", "aggregateoffer"}:
-                            for k in ("price", "lowPrice", "lowprice"):
-                                if k in o:
-                                    v = _to_int_play(str(o[k]))
-                                    if v is not None:
-                                        return v
-                        for v in o.values():
-                            r = _walk(v)
-                            if r is not None:
-                                return r
-                    elif isinstance(o, list):
-                        for it in o:
-                            r = _walk(it)
-                            if r is not None:
-                                return r
-                    return None
-                for sc in soup.find_all("script", attrs={"type": _re.compile(r"ld\+json", _re.I)}):
-                    raw = (sc.string or sc.get_text() or "").strip()
-                    if not raw:
-                        continue
-                    raw = _re.sub(r"//.*?$|/\*.*?\*/", "", raw, flags=_re.S | _re.M)
-                    raw = _re.sub(r",\s*([}\]])", r"\1", raw)
-                    try:
-                        data = _json.loads(raw)
-                    except Exception:
-                        continue
-                    v2 = _walk(data)
-                    if v2 is not None:
-                        out = {"price": v2, "source": "jsonld:price"}
-                        if return_extra:
-                            out.update(_collect_extras_play(soup))
-                        await ctx.close(); await browser.close()
-                        return out
-            except Exception:
-                pass
-
-            # 3) <meta name="product:price:amount">
-            meta = soup.find("meta", attrs={"name": "product:price:amount"})
-            if meta and meta.get("content"):
-                v3 = _to_int_play(meta["content"])
-                if v3 is not None:
-                    out = {"price": v3, "source": "meta:product:price:amount"}
-                    if return_extra:
-                        out.update(_collect_extras_play(soup))
-                    await ctx.close(); await browser.close()
-                    return out
-
-            # 4) 可視テキスト全体
-            label_hits: list[int] = []
-            generic_hits: list[int] = []
-            for el in soup.find_all(text=_re.compile(r"[¥￥]")):
-                try:
-                    block = el.parent.get_text(" ", strip=True)
-                except Exception:
-                    continue
-                if not block:
-                    continue
-                m = _YEN_RE.search(block)
-                if not m:
-                    continue
-                v = _to_int_play(m.group(1))
-                if v is None:
-                    continue
-                if any(w in block for w in label_words):
-                    label_hits.append(v)
-                else:
-                    generic_hits.append(v)
-            if label_hits:
-                v4a = _pick_mode_min_play(label_hits)
-                if v4a is not None:
-                    out = {"price": v4a, "source": "text:labeled"}
-                    if return_extra:
-                        out.update(_collect_extras_play(soup))
-                    await ctx.close(); await browser.close()
-                    return out
-            full = soup.get_text(" ", strip=True)
-            all_nums = [_to_int_play(m.group(1)) for m in _YEN_RE.finditer(full)]
-            all_nums = [n for n in all_nums if isinstance(n, int)]
-            v4b = _pick_mode_min_play(all_nums or generic_hits)
-            if v4b is not None:
-                out = {"price": v4b, "source": "text:mode"}
-                if return_extra:
-                    out.update(_collect_extras_play(soup))
-                await ctx.close(); await browser.close()
-                return out
-
-            await ctx.close(); await browser.close()
-            return {"status": "price_not_found"}
-
-    def _collect_extras_play(soup: BeautifulSoup) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        ttl = None
-        if soup.title and soup.title.string:
-            ttl = soup.title.string.strip()
-        if not ttl:
-            ogt = soup.find("meta", property="og:title")
-            if ogt and ogt.get("content"):
-                ttl = ogt["content"].strip()
-        if ttl:
-            out["title"] = ttl[:200]
-        brand = None
-        for meta_key, attr in (("product:brand", "property"), ("brand", "name")):
-            tag = soup.find("meta", attrs={attr: meta_key})
-            if tag and tag.get("content"):
-                brand = tag["content"].strip()
-                break
-        if brand:
-            out["brand"] = brand[:100]
-        return out
-
-    last: Dict[str, Any] | None = None
-    for _ in range(max(1, retries)):
-        res = await _once()
-        if "price" in res:
-            return res
-        last = res
-        await _asyncio.sleep(0.3)
-    return last or {"status": "price_not_found"}
-
-# 任意：Mercari専用の薄いアダプタ（外部から明示的に呼ぶ想定。既存フローに未接続）
-async def mercari_price_via_playwright(url: str, **kw) -> int | None:
-    if not _re.search(r"https?://([^/]*\.)?mercari\.com", url):
-        return None
-    res = await fetch_price_playwright(url, **kw)
-    return res.get("price") if isinstance(res, dict) else None
 
 # ========== fetch_html ==========
 def fetch_html(url: str) -> str:
@@ -871,344 +735,6 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
-def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """
-    Amazon.co.jp専用の価格抽出（スコアリング強化版）
-    - 1540 のような“裸の4桁”は拒否（通貨 or カンマ or 円が無ければ不採用）
-    - 購入用コンテナ優先、割引/ポイント/クーポン近傍は除外
-    ※ 他サイトには影響しません
-    """
-    if re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", str(html or ""), re.I):
-        return None
-
-    v = _amz_price_fast_sniff_improved(html)
-    if isinstance(v, int):
-        return v
-
-    return _amz_price_fallback_improved(html, text)
-
-
-def _amz_price_fast_sniff_improved(html: str) -> int | None:
-    """
-    Amazon.co.jp の価格を最短で抜く高速スニッファ（購入用コンテナ限定）
-    - 「.a-offscreen 全域キャッチ」は廃止（クーポン等の誤検出=1540対策）
-    - #priceToPay / corePrice* / apex_desktop / mobile_feature の“中”だけを見る
-    - .a-price-whole + .a-price-fraction 合成も対応
-    - 通貨なし4桁（年号/裸数字）は拒否
-    """
-    H = str(html or "")
-    if not H:
-        return None
-
-    STOP = re.compile(r"(割引|値引|OFF|％|%|クーポン|coupon|ポイント|pt|還元|相当|円相当|おトク便|定期|サブスク|下取り|買取)", re.I)
-
-    def _valid_int(tok: str, ctx: str = "") -> int | None:
-        s = str(tok or "").strip()
-        if not s:
-            return None
-        # マイナスは除外（割引額）
-        if re.search(r"[−\-]\s*[¥￥]?\s*\d", s):
-            return None
-        has_currency = bool(re.search(r"[¥￥]|円", s))
-        has_comma = bool(re.search(r"[,，]", s))
-        bare = not (has_currency or has_comma)
-        t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
-        if not t:
-            return None
-        try:
-            v = int(t)
-        except Exception:
-            return None
-        # 裸4桁/年号は拒否
-        if bare and len(t) == 4:
-            return None
-        # 価格レンジ
-        if v < 500 or v > 3_000_000:
-            return None
-        # 周辺に割引/クーポン語があれば除外
-        if ctx and STOP.search(ctx):
-            return None
-        return v
-
-    # 価格候補（スコア方式・最優先は priceToPay）
-    cands: list[tuple[int, int]] = []
-
-    # 購入用コンテナ一覧（この“中”だけを見る）
-    containers = [
-        r'id=["\']priceToPay["\']',                                   # 最優先
-        r'id=["\']corePriceDisplay_desktop_feature_div["\']',
-        r'id=["\']corePrice_feature_div["\']',
-        r'id=["\']corePriceDisplay_mobile_feature_div["\']',
-        r'id=["\']apex_desktop["\']',
-    ]
-
-    # a-offscreen を“各コンテナ内だけ”で拾う
-    for rank, cont in enumerate(containers):
-        for m in re.finditer(fr'(<(?:div|span)[^>]*{cont}[^>]*>[\s\S]{{0,2000}}?)', H, re.I):
-            box = m.group(1)
-            # a-offscreen 候補
-            for n in re.finditer(r'class=["\'][^"\']*\ba-offscreen\b[^"\']*["\'][^>]*>\s*([^<]{1,50})<', box, re.I):
-                tok = n.group(1)
-                i0 = n.start()
-                ctx = box[max(0, i0-200): i0+200]
-                v = _valid_int(tok, ctx)
-                if isinstance(v, int):
-                    # priceToPay を強く優遇（rank=0 → 高スコア）
-                    cands.append((100 - rank*5, v))
-
-            # a-price-whole + fraction（合成）
-            mw = re.search(
-                r'<(?:span|div)[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][\s\S]{0,400}?'
-                r'<span[^>]*class=["\'][^"\']*\ba-price-whole\b[^"\']*["\'][^>]*>([^<]{1,20})</span>'
-                r'[\s\S]{0,60}?'
-                r'(?:<span[^>]*class=["\'][^"\']*\ba-price-fraction\b[^"\']*["\'][^>]*>([^<]{1,4})</span>)?',
-                box, re.I
-            )
-            if mw:
-                whole = (mw.group(1) or "").strip()
-                ctx = box[:240]
-                v = _valid_int(whole, ctx)
-                if isinstance(v, int):
-                    cands.append((95 - rank*5, v))
-
-    # JSON-LD price（保険）
-    for script in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', H, re.I):
-        raw = re.sub(r"//.*?$|/\*.*?\*/", "", script, flags=re.S | re.M)
-        raw = re.sub(r",\s*([}\]])", r"\1", raw)
-        try:
-            data = json.loads(raw)
-        except Exception:
-            data = None
-        def walk(o):
-            if isinstance(o, dict):
-                for k in ("price", "lowPrice", "lowprice"):
-                    if k in o:
-                        vv = _valid_int(str(o[k]))
-                        if vv is not None:
-                            return vv
-                for vv in o.values():
-                    r = walk(vv);  if r is not None: return r
-            elif isinstance(o, list):
-                for it in o:
-                    r = walk(it);  if r is not None: return r
-            return None
-        v = walk(data) if data is not None else None
-        if isinstance(v, int):
-            cands.append((60, v))
-
-    # meta/itemprop（最後の保険）
-    for rx in [
-        r'(?:name|property)=["\'](?:product:price:amount|og:price:amount)["\'][^>]*content=["\']([^"\']+)',
-        r'itemprop=["\']price["\'][^>]*content=["\']([^"\']+)',
-    ]:
-        for m in re.finditer(rx, H, re.I):
-            v = _valid_int(m.group(1))
-            if isinstance(v, int):
-                cands.append((55, v))
-
-    if not cands:
-        return None
-
-    # 最高スコア帯から選ぶ（= priceToPay 等を最優先）
-    best = max(s for s, _ in cands)
-    top = [v for s, v in cands if s == best]
-    # ここは“最小”ではなく“先頭 or 最大”が無難だが、
-    # 価格箱では割引額の方が小さいことが多いので最大を採用
-    return max(top)
-
-
-def _amz_price_fallback_improved(html: str, text: str) -> int | None:
-    """
-    BeautifulSoupフォールバック（購入用コンテナ限定 & ストップ語除外 & マイナス拒否）
-    """
-    try:
-        from bs4 import BeautifulSoup
-    except Exception:
-        return None
-
-    H = str(html or "")
-    if not H:
-        return None
-
-    STOP = re.compile(r"(割引|値引|OFF|％|%|クーポン|coupon|ポイント|pt|還元|相当|円相当|おトク便|定期|サブスク|下取り|買取)", re.I)
-
-    def _valid_int_ctx(tok: str, ctx: str = "") -> int | None:
-        s = str(tok or "").strip()
-        if not s:
-            return None
-        if re.search(r"[−\-]\s*[¥￥]?\s*\d", s):
-            return None
-        has_currency = bool(re.search(r"[¥￥]|円", s))
-        has_comma = bool(re.search(r"[,，]", s))
-        bare = not (has_currency or has_comma)
-        t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
-        if not t:
-            return None
-        try:
-            v = int(t)
-        except Exception:
-            return None
-        if bare and len(t) == 4:
-            return None
-        if v < 500 or v > 3_000_000:
-            return None
-        if ctx and STOP.search(ctx):
-            return None
-        return v
-
-    try:
-        soup = BeautifulSoup(H, "lxml")
-    except Exception:
-        soup = BeautifulSoup(H, "html.parser")
-
-    # 1) 購入用コンテナ優先のセレクタ順
-    sel_groups = [
-        ["#priceToPay .a-offscreen"],  # 最優先
-        [
-            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
-            "#apex_desktop .a-price .a-offscreen",
-            "#corePrice_feature_div .a-price .a-offscreen",
-            "#corePriceDisplay_mobile_feature_div .a-price .a-offscreen",
-        ],
-        ["#priceblock_ourprice", "#priceblock_dealprice"],
-    ]
-
-    for sels in sel_groups:
-        for sel in sels:
-            el = soup.select_one(sel)
-            if not el:
-                continue
-            txt = el.get_text(" ", strip=True)
-            ctx = el.parent.get_text(" ", strip=True)[:300] if el.parent else ""
-            v = _valid_int_ctx(txt, ctx)
-            if isinstance(v, int):
-                return v
-
-    # 2) a-price-whole + fraction（全体の中から合成）
-    m = re.search(
-        r'<(?:span|div)[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][\s\S]{0,400}?'
-        r'<span[^>]*class=["\'][^"\']*\ba-price-whole\b[^"\']*["\'][^>]*>([^<]{1,20})</span>'
-        r'[\s\S]{0,60}?'
-        r'(?:<span[^>]*class=["\'][^"\']*\ba-price-fraction\b[^"\']*["\'][^>]*>([^<]{1,4})</span>)?',
-        H, re.I
-    )
-    if m:
-        whole = (m.group(1) or "").strip()
-        page_ctx = soup.get_text(" ", strip=True)[:300]
-        v = _valid_int_ctx(whole, page_ctx)
-        if isinstance(v, int):
-            return v
-
-    # 3) 「通常の注文」ブロック（保険）
-    labels = soup.find_all(string=re.compile(r"(通常の注文|通常のご注文|一回限りの購入|一度のみの購入)"))
-    def _row(el):
-        p = el.parent if hasattr(el, "parent") else None
-        for _ in range(10):
-            if not p:
-                break
-            cls = " ".join(p.get("class", []))
-            if "a-row" in cls or "a-section" in cls or p.name in ("div", "li", "tr"):
-                return p
-            p = p.parent
-        return el.parent if hasattr(el, "parent") else None
-
-    for lab in labels:
-        row = _row(lab)
-        if not row:
-            continue
-        row_text = row.get_text(" ", strip=True)
-        if re.search(r"(定期|おトク便|サブスク)", row_text):
-            continue
-        for off in row.select(".a-offscreen"):
-            v = _valid_int_ctx(off.get_text(" ", strip=True), row_text)
-            if isinstance(v, int):
-                return v
-        YEN = re.compile(r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|\d{1,3}(?:[,，]\d{3})+\s*円|[¥￥]\s*\d{3,7}|\d{3,7}\s*円)")
-        for m2 in YEN.finditer(row_text):
-            v = _valid_int_ctx(m2.group(0), row_text)
-            if isinstance(v, int):
-                return v
-
-    return None
-
-
-
-def _amz_price_fast_sniff(html: str) -> int | None:
-    """互換エイリアス（旧呼び出し想定があれば）"""
-    return _amz_price_fast_sniff_improved(html)
-
-
-def stock_from_amazon_jp(html: str, text: str) -> str | None:
-    t = str(text or "")
-    if re.search(r"(現在お取り扱いできません|一時的に在庫切れ|再入荷予定は立っておりません)", t):
-        return "OUT_OF_STOCK"
-    if re.search(r"(在庫あり|カートに入れる|今すぐ買う|今すぐ購入)", t):
-        m = re.search(r"残り\s*([0-9０-９]+)\s*(?:点|個|枚|本)", t)
-        if m:
-            n = int(z2h_digits(m.group(1)))
-            return "LAST_ONE" if n == 1 else "IN_STOCK"
-        return "IN_STOCK"
-    if re.search(r"(売り切れ|在庫切れ|SOLD\s*OUT)", t, re.I):
-        return "OUT_OF_STOCK"
-    return None
-    
-def amazon_price_via_playwright_sync(url: str, timeout_ms: int = 45000, headless: bool = True) -> int | None:
-    """
-    任意の最終保険。Playwrightがない環境ではNoneを返すだけ（他サイト無影響）。
-    """
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    except Exception:
-        return None
-
-    SELS = [
-        '#priceToPay .a-offscreen',
-        '#corePriceDisplay_desktop_feature_div .a-offscreen',
-        '#corePrice_feature_div .a-offscreen',
-        '#corePriceDisplay_mobile_feature_div .a-offscreen',
-        '#apex_desktop .a-offscreen',
-        '#priceblock_ourprice', '#priceblock_dealprice', '#sns-base-price'
-    ]
-    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-
-    with sync_playwright() as p:
-        br = p.chromium.launch(headless=headless)
-        ctx = br.new_context(user_agent=UA, locale="ja-JP",
-                             extra_http_headers={"Accept-Language": "ja,en;q=0.8"})
-        pg = ctx.new_page()
-        try:
-            pg.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            pg.wait_for_timeout(600)
-        except PWTimeout:
-            ctx.close(); br.close(); return None
-
-        # canonical が dp/gp/product なら正規URLへ
-        try:
-            can = pg.get_attribute('link[rel="canonical"]', 'href')
-            if can and ('/dp/' in can or '/gp/product/' in can):
-                pg.goto(can, wait_until="domcontentloaded", timeout=timeout_ms)
-                pg.wait_for_timeout(400)
-        except Exception:
-            pass
-
-        for sel in SELS:
-            try:
-                txt = pg.inner_text(sel, timeout=1500)
-                v = to_int_yen(txt)
-                if v is None:
-                    t = re.sub(r"[^\d]", "", txt or "")
-                    v = int(t) if t else None
-                if v and 100 <= v <= 3_000_000:
-                    ctx.close(); br.close(); return v
-            except Exception:
-                continue
-
-        ctx.close(); br.close()
-    return None
-
-
-
-
 
 def stock_from_mercari(html: str, text: str) -> str | None:
     """
@@ -1605,16 +1131,6 @@ def _price_from_rakuten(html: str, text: str) -> int | None:
 
 # ========== 在庫・価格 抽出のメイン ==========
 def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str, Any]:
-    """
-    戻り値:
-      {
-        "stock": "IN_STOCK|OUT_OF_STOCK|LAST_ONE|UNKNOWN",
-        "qty":   "数字文字列 or ''",
-        "price": int or None,
-        "_debug": {"host": "...", "text_snippet": "..."}  # debug時のみ
-      }
-    """
-    # ★デフォルト値（早期return禁止）
     stock: str = "UNKNOWN"
     qty:   str = ""
     price: Any = None
@@ -1735,91 +1251,12 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         price = price_from_surugaya(html, text)
     # ========== Amazon.co.jp ==========
     elif ("amazon.co.jp" in host) or host.endswith(".amazon.co.jp"):
-        dp_url = None
-
-        if debug:
-            H = html or ""
-            T = text or ""
-            print("[AMZ] len(html)=", len(H))
-            print("[AMZ] markers:", {
-                "apex":       bool(re.search(r'id=["\']apex_desktop["\']', H, re.I)),
-                "corePrice":  bool(re.search(r'id=["\']corePrice_feature_div["\']', H, re.I)),
-                "corePriceDisp": bool(re.search(r'id=["\']corePriceDisplay_desktop_feature_div["\']', H, re.I)),
-                "priceToPay_id":    bool(re.search(r'id=["\']priceToPay["\']', H, re.I)),
-                "priceToPay_class": bool(re.search(r'class=["\'][^"\']*\bpriceToPay\b', H, re.I)),
-                "aOffscreen": bool(re.search(r'class=["\']a-offscreen["\']', H, re.I)),
-                "buyNow":     bool(re.search(r"(今すぐ買う|今すぐ購入|Buy Now)", T)),
-                "addCart":    bool(re.search(r"(カートに入れる|Add to Cart)", T)),
-                "unavail":    bool(re.search(r"(現在お取り扱いできません|Currently unavailable)", T, re.I)),
-                "robot":      bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", H, re.I)),
-            })
-
-        # 1) 手元HTMLで判定
-        s = stock_from_amazon_jp(html, text)
+        # ここは新実装：URLへ直接アクセスして価格/在庫を最短取得
+        p, s = amazon_fetch_price_and_stock(url, timeout=HTTP_TIMEOUT)
         if s:
             stock = s
-        price = price_from_amazon_jp(html, text)
-
-        # 1.5) 価格が未取得なら、まずは“強い取得”で再評価（Playwrightより軽い）
-        if price is None:
-            try:
-                strong_html = _strong_get_html(url)
-                if strong_html and len(strong_html) > len(html or ""):
-                    strong_text = strip_tags(strong_html).replace("\u3000", " ").replace("\u00A0", " ")
-                    s0 = stock_from_amazon_jp(strong_html, strong_text)
-                    if s0:
-                        stock = s0
-                    p0 = price_from_amazon_jp(strong_html, strong_text)
-                    if p0 is not None:
-                        price = p0
-                        html, text = strong_html, strong_text  # 以降の保険にも反映
-            except Exception:
-                pass
-
-        # 2) /dp/ 追撃は「価格が未取得」かつ「非dp/短HTML/Robot気配」の時だけ
-        need_follow = (
-            (price is None) and (
-                (not re.search(r"/(dp|gp/product)/", url)) or
-                (len(html or "") < 3000) or
-                bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", html or "", re.I))
-            )
-        )
-        if CI_MODE:
-            need_follow = False
-
-        if need_follow:
-            try:
-                dp_url = _amz_guess_dp_url(host, url, html)
-            except Exception:
-                dp_url = None
-
-            if dp_url:
-                try:
-                    amz_html2 = fetch_html(dp_url)
-                    amz_text2 = strip_tags(amz_html2).replace("\u3000", " ").replace("\u00A0", " ")
-                    s2 = stock_from_amazon_jp(amz_html2, amz_text2)
-                    if s2:
-                        stock = s2
-                    p2 = price_from_amazon_jp(amz_html2, amz_text2)
-                    if p2 is not None:
-                        price = p2
-                    if debug:
-                        print("[AMZ] follow_dp=", dp_url, " price=", p2)
-                except Exception:
-                    pass
-
-        # 3) 最終保険：Playwright（導入されていなければ None で戻るだけ）
-        if price is None and PLAYWRIGHT_ENABLED:
-            try:
-                p3 = amazon_price_via_playwright_sync(dp_url or url, headless=True)
-            except Exception:
-                p3 = None
-            if isinstance(p3, int):
-                price = p3
-                if debug:
-                    print("[AMZ] playwright price:", p3)
-
-
+        if isinstance(p, int):
+            price = p
 
 
 
@@ -1931,88 +1368,3 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
 @functools.lru_cache(maxsize=256)
 def fetch_and_extract(url: str) -> Dict[str, Any]:
     return extract_supplier_info(url, fetch_html(url))
-
-def _strong_get_html(url: str) -> str:
-    try:
-        if "amazon.co.jp" not in url:
-            return ""  # 他サイトは触らない
-
-        import requests, re
-        sess = requests.Session()
-
-        from requests.adapters import HTTPAdapter
-        sess.mount("https://", HTTPAdapter(max_retries=1))
-        sess.mount("http://",  HTTPAdapter(max_retries=1))
-        
-        UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
-        UA_MB = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-        H_PC = {"User-Agent": UA_PC, "Accept-Language": "ja,en;q=0.8", "Referer": "https://www.google.com/"}
-        H_MB = {"User-Agent": UA_MB, "Accept-Language": "ja,en;q=0.8", "Referer": "https://www.google.com/"}
-
-        def _get(u, headers):
-            try:
-                r = sess.get(u, headers=headers, timeout=20, allow_redirects=True)
-                return r.status_code, (r.text or "")
-            except Exception:
-                return 0, ""
-        if CI_MODE:
-            for hdr in (H_PC, H_MB):
-                sc, h = _get(url, hdr)
-                if sc == 200 and h:
-                    return h
-            return ""
-        htmls: list[str] = []
-        sc1, h1 = _get(url, H_PC);  sc2, h2 = _get(url, H_MB)
-        if sc1 == 200 and h1: htmls.append(h1)
-        if sc2 == 200 and h2: htmls.append(h2)
-
-        m = re.search(r"(https?://[^/]*amazon\.co\.jp)/(?:.*?)(/(?:dp|gp/product)/[A-Z0-9]{10})", url, re.I)
-        if m:
-            canon = m.group(1).rstrip("/") + m.group(2)
-            sc3, h3 = _get(canon, H_PC);  sc4, h4 = _get(canon + "?psc=1", H_PC)
-            if sc3 == 200 and h3: htmls.append(h3)
-            if sc4 == 200 and h4: htmls.append(h4)
-      
-        def _is_robot(h: str) -> bool:
-            return bool(re.search(r"(Robot Check|captcha|自動アクセス|ロボットによる|enable cookies)", h, re.I))
-        pool = [h for h in htmls if h and not _is_robot(h)] or htmls
-        return max(pool, key=len) if pool else ""
-    except Exception:
-        return ""
-
-def _amz_guess_dp_url(host: str, base_url: str, html: str) -> str | None:
-    """
-    取得HTMLから /dp/ または /gp/product/ の商品詳細URLを推定して返す。
-    1) <link rel="canonical" href=".../dp/ASIN"> を最優先
-    2) ページ内の href="/dp/ASIN" / "/gp/product/ASIN" を拾う
-    """
-    H = str(html or "")
-
-    # 1) canonical
-    m = re.search(
-        r'rel=["\']canonical["\'][^>]*href=["\']([^"\']+/(?:dp|gp/product)/[A-Z0-9]{10})',
-        H, re.I
-    )
-    if m:
-        u = m.group(1)
-        return u if u.startswith("http") else f"https://{host.rstrip('/')}/{u.lstrip('/')}"
-
-    # 2) ページ内リンク
-    m = re.search(r'href=["\'](/?(?:dp|gp/product)/[A-Z0-9]{10})', H, re.I)
-    if m:
-        path = m.group(1)
-        return path if path.startswith("http") else f"https://{host.rstrip('/')}/{path.lstrip('/')}"
-
-    # 3) og:url に dp/gp/product が入っているケース
-    m = re.search(r'property=["\']og:url["\'][^>]*content=["\']([^"\']+/(?:dp|gp/product)/[A-Z0-9]{10})', H, re.I)
-    if m:
-        u = m.group(1)
-        return u if u.startswith("http") else f"https://{host.rstrip('/')}/{u.lstrip('/')}"
-
-    # 4) 埋め込みASINから推定（data-asin や "ASIN":"XXXXXXXXXX"）
-    m = re.search(r'(["\']ASIN["\']\s*:\s*["\']|data-asin=["\'])([A-Z0-9]{10})', H, re.I)
-    if m:
-        asin = m.group(2)
-        return f"https://{host.rstrip('/')}/dp/{asin}"
-    return None
-
