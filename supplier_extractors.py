@@ -884,6 +884,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     def _to(token: str) -> int | None:
         v = to_int_yen(token)
         if v is not None and 100 <= v <= 3_000_000:
+            # 通貨/円が無い小額は除外
             if v < 500 and not re.search(r"[¥￥]|円", token):
                 return None
             return v
@@ -899,7 +900,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         except Exception:
             return None
 
-    # ラベル近傍用（共通）
+    # 共通の正規表現
     BAD   = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|%|％|ギフト券)", re.I)
     THNUM = re.compile(r'[¥￥]?\s*\d{3,5}\s*円?\s*(?:以上|超|から)', re.I)
     FREE  = re.compile(r'(送料無料|通常配送無料|配送料無料|無料配送)', re.I)
@@ -927,24 +928,6 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                     v = _to(txt)
                     if v:
                         return v
-
-            # (b-1) a-offscreen（￥/円 無しでも許容 だが小額は厳しめ）
-            STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|ギフト券|%|％)", re.I)
-
-            for m in re.finditer(
-                r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I
-            ):
-                tok = m.group(1)
-                win = blk[max(0, m.start()-60): m.end()+60]
-                if STOP.search(win):
-                    continue
-
-                v = _to(tok)
-                if v:
-                    if 1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok):
-                        continue
-                    return v
-
 
             # (a-2) a-price-whole（小数分割）
             for r in roots:
@@ -985,6 +968,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 v = _to(txt)
                 if v:
                     return v
+
         except Exception:
             pass  # lxml なし or 失敗 → 次へ
 
@@ -1003,7 +987,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 break
 
         if blk:
-            # (b-1) a-offscreen（￥/円 無しでも許容）
+            # (b-1) a-offscreen（￥/円 無しでも許容／小額は _to が弾く）
             for m in re.finditer(
                 r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I
             ):
@@ -1027,7 +1011,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", m.group(2))):
                     return v
 
-        # 3) どうしても取れない時：ページ上部テキストでラベル⇄金額を探す
+        # 3) ページ上部テキストでラベル⇄金額を探す（最終保険）
         try:
             T = strip_tags(H).replace("\u3000", " ").replace("\u00A0", " ")
         except Exception:
@@ -1071,7 +1055,6 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 return v
 
     return None
-
 
     def _pick_from_single(H: str) -> int | None:
         # --- DOM読み（lxmlがあれば最優先） ---
