@@ -889,21 +889,28 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
 
 
 def _amz_price_fast_sniff_improved(html: str) -> int | None:
+    """
+    Amazon.co.jp の価格を最短で抜く高速スニッファ（購入用コンテナ限定）
+    - 「.a-offscreen 全域キャッチ」は廃止（クーポン等の誤検出=1540対策）
+    - #priceToPay / corePrice* / apex_desktop / mobile_feature の“中”だけを見る
+    - .a-price-whole + .a-price-fraction 合成も対応
+    - 通貨なし4桁（年号/裸数字）は拒否
+    """
     H = str(html or "")
     if not H:
         return None
 
-    # ---- helpers ----
-    STOP = re.compile(r"(割引|値引|OFF|％|%|クーポン|ポイント|pt|還元|相当|円相当|おトク便|定期|サブスク|下取り|買取)", re.I)
+    STOP = re.compile(r"(割引|値引|OFF|％|%|クーポン|coupon|ポイント|pt|還元|相当|円相当|おトク便|定期|サブスク|下取り|買取)", re.I)
 
     def _valid_int(tok: str, ctx: str = "") -> int | None:
-        """価格文字列を厳格に数値へ。裸の4桁は通貨・円・カンマが無ければ拒否。"""
         s = str(tok or "").strip()
         if not s:
             return None
+        # マイナスは除外（割引額）
+        if re.search(r"[−\-]\s*[¥￥]?\s*\d", s):
+            return None
         has_currency = bool(re.search(r"[¥￥]|円", s))
         has_comma = bool(re.search(r"[,，]", s))
-        # 通貨 or 円 or カンマ が無い「裸の数値」は、最低でも5桁以上だけ許可（1540対策）
         bare = not (has_currency or has_comma)
         t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
         if not t:
@@ -912,42 +919,44 @@ def _amz_price_fast_sniff_improved(html: str) -> int | None:
             v = int(t)
         except Exception:
             return None
-        if bare and len(t) <= 4:
+        # 裸4桁/年号は拒否
+        if bare and len(t) == 4:
             return None
+        # 価格レンジ
         if v < 500 or v > 3_000_000:
             return None
-        # 年号(1900-2100)の“裸4桁”も拒否
-        if bare and 1900 <= v <= 2100 and len(t) == 4:
-            return None
-        # 割引/ポイント/クーポン近傍は除外
+        # 周辺に割引/クーポン語があれば除外
         if ctx and STOP.search(ctx):
             return None
         return v
 
-    def _add(cands, score, val):
-        if isinstance(val, int):
-            cands.append((score, val))
+    # 価格候補（スコア方式・最優先は priceToPay）
+    cands: list[tuple[int, int]] = []
 
-    # 検出
-    cands = []
-    # 購入用コンテナ内の a-offscreen（最優先）
+    # 購入用コンテナ一覧（この“中”だけを見る）
     containers = [
-        r'id=["\']priceToPay["\']',
+        r'id=["\']priceToPay["\']',                                   # 最優先
         r'id=["\']corePriceDisplay_desktop_feature_div["\']',
         r'id=["\']corePrice_feature_div["\']',
         r'id=["\']corePriceDisplay_mobile_feature_div["\']',
         r'id=["\']apex_desktop["\']',
     ]
-    for cont in containers:
-        for m in re.finditer(fr'(<(?:div|span)[^>]*{cont}[^>]*>[\s\S]{{0,1500}}?)', H, re.I):
+
+    # a-offscreen を“各コンテナ内だけ”で拾う
+    for rank, cont in enumerate(containers):
+        for m in re.finditer(fr'(<(?:div|span)[^>]*{cont}[^>]*>[\s\S]{{0,2000}}?)', H, re.I):
             box = m.group(1)
-            # a-offscreen
-            for n in re.finditer(r'class=["\'][^"\']*\ba-offscreen\b[^"\']*["\'][^>]*>\s*([^<]{1,40})<', box, re.I):
+            # a-offscreen 候補
+            for n in re.finditer(r'class=["\'][^"\']*\ba-offscreen\b[^"\']*["\'][^>]*>\s*([^<]{1,50})<', box, re.I):
                 tok = n.group(1)
-                ctx = box[max(0, n.start()-120): n.end()+120]
+                i0 = n.start()
+                ctx = box[max(0, i0-200): i0+200]
                 v = _valid_int(tok, ctx)
-                _add(cands, 100, v)
-            # a-price-whole + fraction
+                if isinstance(v, int):
+                    # priceToPay を強く優遇（rank=0 → 高スコア）
+                    cands.append((100 - rank*5, v))
+
+            # a-price-whole + fraction（合成）
             mw = re.search(
                 r'<(?:span|div)[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][\s\S]{0,400}?'
                 r'<span[^>]*class=["\'][^"\']*\ba-price-whole\b[^"\']*["\'][^>]*>([^<]{1,20})</span>'
@@ -957,18 +966,12 @@ def _amz_price_fast_sniff_improved(html: str) -> int | None:
             )
             if mw:
                 whole = (mw.group(1) or "").strip()
-                ctx = box[:200]
+                ctx = box[:240]
                 v = _valid_int(whole, ctx)
-                _add(cands, 95, v)
+                if isinstance(v, int):
+                    cands.append((95 - rank*5, v))
 
-    # .a-price .a-offscreen（汎用）
-    for n in re.finditer(r'<[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][^>]*>[\s\S]{0,200}?class=["\'][^"\']*\ba-offscreen\b[^"\']*["\'][^>]*>\s*([^<]{1,40})<', H, re.I):
-        tok = n.group(1)
-        ctx = H[max(0, n.start()-160): n.end()+160]
-        v = _valid_int(tok, ctx)
-        _add(cands, 80, v)
-
-    # JSON-LD price
+    # JSON-LD price（保険）
     for script in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', H, re.I):
         raw = re.sub(r"//.*?$|/\*.*?\*/", "", script, flags=re.S | re.M)
         raw = re.sub(r",\s*([}\]])", r"\1", raw)
@@ -980,43 +983,44 @@ def _amz_price_fast_sniff_improved(html: str) -> int | None:
             if isinstance(o, dict):
                 for k in ("price", "lowPrice", "lowprice"):
                     if k in o:
-                        v = _valid_int(str(o[k]))
-                        if v is not None:
-                            return v
+                        vv = _valid_int(str(o[k]))
+                        if vv is not None:
+                            return vv
                 for vv in o.values():
-                    r = walk(vv)
-                    if r is not None:
-                        return r
+                    r = walk(vv);  if r is not None: return r
             elif isinstance(o, list):
                 for it in o:
-                    r = walk(it)
-                    if r is not None:
-                        return r
+                    r = walk(it);  if r is not None: return r
             return None
         v = walk(data) if data is not None else None
-        _add(cands, 70, v)
+        if isinstance(v, int):
+            cands.append((60, v))
 
-    # meta/itemprop
+    # meta/itemprop（最後の保険）
     for rx in [
         r'(?:name|property)=["\'](?:product:price:amount|og:price:amount)["\'][^>]*content=["\']([^"\']+)',
         r'itemprop=["\']price["\'][^>]*content=["\']([^"\']+)',
     ]:
         for m in re.finditer(rx, H, re.I):
-            tok = m.group(1)
-            v = _valid_int(tok)
-            _add(cands, 65, v)
+            v = _valid_int(m.group(1))
+            if isinstance(v, int):
+                cands.append((55, v))
 
     if not cands:
         return None
 
-    # 上位スコア群から“最も妥当”を選ぶ
+    # 最高スコア帯から選ぶ（= priceToPay 等を最優先）
     best = max(s for s, _ in cands)
     top = [v for s, v in cands if s == best]
-    # priceToPay系は最終価格＝低めになることが多いので、同点内は最小を優先
-    return min(top)
+    # ここは“最小”ではなく“先頭 or 最大”が無難だが、
+    # 価格箱では割引額の方が小さいことが多いので最大を採用
+    return max(top)
 
 
 def _amz_price_fallback_improved(html: str, text: str) -> int | None:
+    """
+    BeautifulSoupフォールバック（購入用コンテナ限定 & ストップ語除外 & マイナス拒否）
+    """
     try:
         from bs4 import BeautifulSoup
     except Exception:
@@ -1026,11 +1030,13 @@ def _amz_price_fallback_improved(html: str, text: str) -> int | None:
     if not H:
         return None
 
-    STOP = re.compile(r"(割引|値引|OFF|％|%|クーポン|ポイント|pt|還元|相当|円相当|おトク便|定期|サブスク|下取り|買取)", re.I)
+    STOP = re.compile(r"(割引|値引|OFF|％|%|クーポン|coupon|ポイント|pt|還元|相当|円相当|おトク便|定期|サブスク|下取り|買取)", re.I)
 
     def _valid_int_ctx(tok: str, ctx: str = "") -> int | None:
         s = str(tok or "").strip()
         if not s:
+            return None
+        if re.search(r"[−\-]\s*[¥￥]?\s*\d", s):
             return None
         has_currency = bool(re.search(r"[¥￥]|円", s))
         has_comma = bool(re.search(r"[,，]", s))
@@ -1042,11 +1048,9 @@ def _amz_price_fallback_improved(html: str, text: str) -> int | None:
             v = int(t)
         except Exception:
             return None
-        if bare and len(t) <= 4:
+        if bare and len(t) == 4:
             return None
         if v < 500 or v > 3_000_000:
-            return None
-        if bare and 1900 <= v <= 2100 and len(t) == 4:
             return None
         if ctx and STOP.search(ctx):
             return None
@@ -1057,34 +1061,30 @@ def _amz_price_fallback_improved(html: str, text: str) -> int | None:
     except Exception:
         soup = BeautifulSoup(H, "html.parser")
 
-    cands = []
-
-    def _add(score, v):
-        if isinstance(v, int):
-            cands.append((score, v))
-
-    # 代表セレクタ
-    sels = [
-        "#priceToPay .a-offscreen",
-        "#corePriceDisplay_desktop_feature_div .a-offscreen",
-        "#corePrice_feature_div .a-offscreen",
-        "#corePriceDisplay_mobile_feature_div .a-offscreen",
-        "#apex_desktop .a-offscreen",
-        ".priceToPay .a-offscreen",
-        ".a-price .a-offscreen",
-        "#priceblock_ourprice",
-        "#priceblock_dealprice",
+    # 1) 購入用コンテナ優先のセレクタ順
+    sel_groups = [
+        ["#priceToPay .a-offscreen"],  # 最優先
+        [
+            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#apex_desktop .a-price .a-offscreen",
+            "#corePrice_feature_div .a-price .a-offscreen",
+            "#corePriceDisplay_mobile_feature_div .a-price .a-offscreen",
+        ],
+        ["#priceblock_ourprice", "#priceblock_dealprice"],
     ]
-    for sel in sels:
-        el = soup.select_one(sel)
-        if not el:
-            continue
-        txt = el.get_text(" ", strip=True)
-        ctx = el.parent.get_text(" ", strip=True)[:240] if el.parent else ""
-        v = _valid_int_ctx(txt, ctx)
-        _add(100, v)
 
-    # a-price-whole + fraction
+    for sels in sel_groups:
+        for sel in sels:
+            el = soup.select_one(sel)
+            if not el:
+                continue
+            txt = el.get_text(" ", strip=True)
+            ctx = el.parent.get_text(" ", strip=True)[:300] if el.parent else ""
+            v = _valid_int_ctx(txt, ctx)
+            if isinstance(v, int):
+                return v
+
+    # 2) a-price-whole + fraction（全体の中から合成）
     m = re.search(
         r'<(?:span|div)[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][\s\S]{0,400}?'
         r'<span[^>]*class=["\'][^"\']*\ba-price-whole\b[^"\']*["\'][^>]*>([^<]{1,20})</span>'
@@ -1094,11 +1094,12 @@ def _amz_price_fallback_improved(html: str, text: str) -> int | None:
     )
     if m:
         whole = (m.group(1) or "").strip()
-        page_ctx = soup.get_text(" ", strip=True)[:240]
+        page_ctx = soup.get_text(" ", strip=True)[:300]
         v = _valid_int_ctx(whole, page_ctx)
-        _add(95, v)
+        if isinstance(v, int):
+            return v
 
-    # 「通常の注文」ブロック
+    # 3) 「通常の注文」ブロック（保険）
     labels = soup.find_all(string=re.compile(r"(通常の注文|通常のご注文|一回限りの購入|一度のみの購入)"))
     def _row(el):
         p = el.parent if hasattr(el, "parent") else None
@@ -1120,19 +1121,16 @@ def _amz_price_fallback_improved(html: str, text: str) -> int | None:
             continue
         for off in row.select(".a-offscreen"):
             v = _valid_int_ctx(off.get_text(" ", strip=True), row_text)
-            _add(90, v)
-        # 保険の金額パターン
+            if isinstance(v, int):
+                return v
         YEN = re.compile(r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|\d{1,3}(?:[,，]\d{3})+\s*円|[¥￥]\s*\d{3,7}|\d{3,7}\s*円)")
         for m2 in YEN.finditer(row_text):
             v = _valid_int_ctx(m2.group(0), row_text)
-            _add(85, v)
+            if isinstance(v, int):
+                return v
 
-    if not cands:
-        return None
+    return None
 
-    best = max(s for s, _ in cands)
-    top = [v for s, v in cands if s == best]
-    return min(top)
 
 
 def _amz_price_fast_sniff(html: str) -> int | None:
