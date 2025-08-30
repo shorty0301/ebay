@@ -981,7 +981,12 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             log_hit("offscreen", val, ctx, "dropped", "near_strike");   continue
         if STOP.search(ctx):
             log_hit("offscreen", val, ctx, "dropped", "near_stop");     continue
-
+        if 1900 <= val <= 2100:
+            log_hit("offscreen", val, ctx, "dropped", "year_noise")
+            continue
+        if re.search(r'(©|&copy;|Amazon\.com)', ctx, re.I) and re.search(r'199\d|20\d\d', ctx):
+            log_hit("offscreen", val, ctx, "dropped", "copyright_context")
+            continue
         # しきい値/送料無料ガード（←ここ）
         wide = blk[max(0, i-160): m.end()+160]
         # “○○円以上で送料無料” のような「しきい値」だけ落とす。
@@ -1012,6 +1017,12 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             log_hit("whole", val, ctx, "dropped", "near_strike");   continue
         if STOP.search(ctx):
             log_hit("whole", val, ctx, "dropped", "near_stop");     continue
+        if 1900 <= val <= 2100:
+            log_hit("offscreen", val, ctx, "dropped", "year_noise")
+            continue
+        if re.search(r'(©|&copy;|Amazon\.com)', ctx, re.I) and re.search(r'199\d|20\d\d', ctx):
+            log_hit("offscreen", val, ctx, "dropped", "copyright_context")
+            continue
 
         wide = blk[max(0, i-120): m.end()+120]
         if re.search(r'(以上で?|送料無料|通常配送無料|配送料無料)', wide, re.I):
