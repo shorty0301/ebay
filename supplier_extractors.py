@@ -872,102 +872,105 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp の “通常の注文” 本体価格をできるだけ素直に拾う。
-    - 価格箱(id=priceToPay / apex_desktop / corePrice*)内だけを見る
-    - 定期/クーポン/還元 等の近傍は除外
-    - ¥162/袋 のような単価は除外（3桁は基本弾く）
-    - 複数候補があれば最大値（=通常価格）を返す
+    Amazon.co.jp の本体価格抽出（通常の注文/税込を優先）
+    - 価格箱 (id|class=priceToPay / apex_desktop / corePrice*) だけをまず探索
+    - a-offscreen / a-price-whole (+ fraction) を拾う
+    - 定期/クーポン/還元/送料無料しきい値/単価表記を除外
+    - だめでも最後に本文の上部をスコア探索
+    - 複数あれば “最大値（通常価格になりやすい）” を返す
     """
     import re
 
     H = str(html or "")
 
-    # 価格トークン → int
-    def _to(tok: str) -> int | None:
-        v = to_int_yen(tok)
-        if v is None:
-            t = re.sub(r"[^\d]", "", tok or "")
-            v = int(t) if t else None
-        if v is None:
+    # ---------------------------
+    # 数値化（小額の裸3桁は弱いので抑制）
+    # ---------------------------
+    def _to_int(tok: str) -> int | None:
+        from re import sub
+        t = sub(r"[^\d]", "", tok or "")
+        if not t:
             return None
-        # 100〜3,000,000の範囲に制限、3桁は通貨記号が無ければ弾く
-        if 100 <= v <= 3_000_000:
-            if v < 500 and not re.search(r"[¥￥]|円", tok):
-                return None
-            return v
-        return None
+        try:
+            v = int(t)
+        except ValueError:
+            return None
+        if not (100 <= v <= 3_000_000):
+            return None
+        # 500未満は通貨/円が無いと単価の可能性が高いので弾く
+        if v < 500 and not re.search(r"[¥￥]|円", tok):
+            return None
+        return v
 
-    # ノイズ語（近傍にあれば除外）
     BAD_NEAR = re.compile(
         r"(定期|おトク便|Subscribe|Save|SNS|クーポン|coupon|OFF|円OFF|割引|"
-        r"ポイント|pt|還元|相当|円相当|実質|セール|タイムセール)",
-        re.I,
+        r"ポイント|pt|還元|相当|円相当|実質|セール|タイムセール|併用|適用)", re.I
     )
-    # 打消し等の祖先クラス/ID
-    BAD_ANCESTOR = re.compile(
-        r"(a-text-price|strike|saving|savings|apexSavings|coupon|rebate|subscribe|sns|voucher|promo)",
-        re.I,
-    )
-    # しきい値（〇〇円以上で送料無料）
     THNUM  = re.compile(r'[¥￥]?\s*\d{3,5}\s*円?\s*(以上|超|から)', re.I)
     FREE   = re.compile(r'(送料無料|通常配送無料|配送料無料|無料配送)', re.I)
+    UNIT_TAIL = re.compile(r"[／/]\s*(袋|個|枚|本|箱|g|kg|mg|L|l|ml|mL|cm|mm|GB|MB|TB|セット|回|時間|月|年)")
+
     def _is_threshold(s: str) -> bool:
         return bool(THNUM.search(s) and FREE.search(s))
 
-    # 単価の尻尾（/袋 など）。マッチは“直後の短い尻尾”だけに限定して使う
-    UNIT_TAIL = re.compile(r"[／/]\s*(袋|個|枚|本|箱|g|kg|mg|L|l|ml|mL|cm|mm|GB|MB|TB|セット|回|時間|月|年)")
-
-    # 価格箱だけ切り出し
+    # ---------------------------
+    # 価格箱ブロックを広めに収集（id でも class でも）
+    # ---------------------------
     blocks: list[str] = []
-    for bid, span in (
-        ("priceToPay", 3200),
-        ("apex_desktop", 8200),
-        ("corePriceDisplay_desktop_feature_div", 6200),
-        ("corePrice_feature_div", 6200),
-        ("corePriceDisplay_mobile_feature_div", 6200),
+    # id / class どちらも priceToPay を拾う。span長は広めに。
+    for pat, span in (
+        (r'(?:id|class)=["\'][^"\']*\bpriceToPay\b[^"\']*["\']', 15000),
+        (r'id=["\']apex_desktop["\']', 15000),
+        (r'id=["\']corePriceDisplay_desktop_feature_div["\']', 15000),
+        (r'id=["\']corePrice_feature_div["\']', 15000),
+        (r'id=["\']corePriceDisplay_mobile_feature_div["\']', 15000),
     ):
-        m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
-        if m:
-            blocks.append(m.group(1))
-
-    if not blocks:
-        return None
+        for m in re.finditer(pat, H, re.I):
+            # 直後～span 文字をブロックに
+            start = m.end()
+            end = min(len(H), start + span)
+            blocks.append(H[start:end])
 
     cands: list[int] = []
 
+    # ---------------------------
+    # ブロック内で a-offscreen / a-price-whole を抽出
+    # ---------------------------
     for blk in blocks:
         sblk = re.sub(r"\s+", " ", blk)
 
-        # 1) apexPriceToPay 直下（最優先）
+        # (1) apexPriceToPay → a-offscreen（最優先）
         for m in re.finditer(
             r'apexPriceToPay[^<]*</span>\s*<span[^>]*class=["\'][^"\']*a-offscreen[^"\']*["\'][^>]*>'
-            r'\s*([¥￥]?\s*(?:\d{1,3}(?:[,，]\d{3})+|\d{4,7}))(?:\s*円)?\s*([^<]{0,24})<',
-            sblk, re.I):
-            tok, tail = m.group(1), m.group(2) or ""
-            ctx = sblk[max(0, m.start()-140): m.end()+140]
+            r'\s*([¥￥]?\s*(?:\d{1,3}(?:[,，]\d{3})+|\d{4,7}))'
+            r'(?:\s*円)?\s*([^<]{0,30})<',
+            sblk, re.I
+        ):
+            tok, tail = m.group(1), (m.group(2) or "")
+            ctx = sblk[max(0, m.start()-200): m.end()+200]
             if BAD_NEAR.search(ctx) or _is_threshold(ctx):
                 continue
-            v = _to(tok)
-            if v is None:
+            v = _to_int(tok)
+            if v is None: 
                 continue
             if v < 500 and UNIT_TAIL.search(tail):
                 continue
-            # 年号っぽい裸数字は通貨無しなら除外
             if 1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok):
                 continue
             cands.append(v)
 
-        # 2) 汎用 a-offscreen（尻尾も見る）
+        # (2) 汎用 a-offscreen（尻尾チェック）
         for m in re.finditer(
             r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*(?:\d{1,3}(?:[,，]\d{3})+|\d{4,7}))'
-            r'(?:\s*円)?\s*([^<]{0,24})<',
-            sblk, re.I):
-            tok, tail = m.group(1), m.group(2) or ""
-            ctx = sblk[max(0, m.start()-140): m.end()+140]
+            r'(?:\s*円)?\s*([^<]{0,30})<',
+            sblk, re.I
+        ):
+            tok, tail = m.group(1), (m.group(2) or "")
+            ctx = sblk[max(0, m.start()-200): m.end()+200]
             if BAD_NEAR.search(ctx) or _is_threshold(ctx):
                 continue
-            v = _to(tok)
-            if v is None:
+            v = _to_int(tok)
+            if v is None: 
                 continue
             if v < 500 and UNIT_TAIL.search(tail):
                 continue
@@ -975,18 +978,95 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 continue
             cands.append(v)
 
-        # 3) a-price-whole（小数分割）。“1000以上”だけ許可
-        for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]{1,10})\s*<', sblk, re.I):
-            v = _to(m.group(1))
-            if v and v >= 1000:  # 162などの単価は弾く
-                ctx = sblk[max(0, m.start()-140): m.end()+140]
-                if BAD_NEAR.search(ctx) or _is_threshold(ctx):
-                    continue
+        # (3) a-price-whole (+ fraction) 1000以上のみ許容
+        for m in re.finditer(
+            r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]{1,10})\s*<', sblk, re.I
+        ):
+            tok = m.group(1)
+            ctx = sblk[max(0, m.start()-200): m.end()+200]
+            if BAD_NEAR.search(ctx) or _is_threshold(ctx):
+                continue
+            v = _to_int(tok)
+            if v and v >= 1000:
                 cands.append(v)
 
-    # 複数あれば “最大値=通常価格” を採用（定期/割引/単価のほうが小さいため）
     if cands:
         return max(cands)
+
+    # ---------------------------
+    # 最終フォールバック：本文上部のスコア探索
+    # ---------------------------
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(H, "html.parser")
+        T = soup.get_text(" ", strip=True)
+        T = re.sub(r"\s+", " ", T)
+    except Exception:
+        T = re.sub("<[^>]+>", " ", H)
+        T = re.sub(r"\s+", " ", T)
+
+    head = T[:20000]
+
+    PRICE = re.compile(
+        r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{4,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{4,7}\s*円)"
+    )
+    LABEL = re.compile(r"(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)")
+    BUY   = re.compile(r"(カートに入れる|今すぐ買う|今すぐ購入|注文手続き)")
+
+    # 「BUY近傍」をまず見る（購入エリアの価格が本体であることが多い）
+    buy_cands: list[int] = []
+    for b in BUY.finditer(head):
+        i = b.start()
+        ctx = head[max(0, i-1200): i+1200]
+        for m in PRICE.finditer(ctx):
+            tok = m.group(1)
+            win = ctx[max(0, m.start()-120): m.end()+120]
+            if BAD_NEAR.search(win) or _is_threshold(win):
+                continue
+            v = _to_int(tok)
+            if v:
+                # 単価尻尾（”/袋” 等）が近い行は除外
+                tail = ctx[m.end(): m.end()+24]
+                if v < 500 and UNIT_TAIL.search(tail):
+                    continue
+                buy_cands.append(v)
+    if buy_cands:
+        return max(buy_cands)
+
+    # ラベル近傍（本文全体・上部）— ラベル→金額／金額→ラベルの両方向
+    lab_cands: list[int] = []
+    for m in re.finditer(r"(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)[^\d¥￥]{0,20}"+PRICE.pattern, head, re.I):
+        seg = m.group(0)
+        if BAD_NEAR.search(seg) or _is_threshold(seg):
+            continue
+        tok = re.search(PRICE, seg).group(1)
+        v = _to_int(tok)
+        if v:
+            lab_cands.append(v)
+    for m in re.finditer(PRICE.pattern + r"[^\d¥￥]{0,20}(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)", head, re.I):
+        seg = m.group(0)
+        if BAD_NEAR.search(seg) or _is_threshold(seg):
+            continue
+        tok = re.search(PRICE, seg).group(1)
+        v = _to_int(tok)
+        if v:
+            lab_cands.append(v)
+    if lab_cands:
+        return max(lab_cands)
+
+    # それでもダメなら、上部で “¥付き” の数字からモードっぽい値を最大優先で
+    from collections import Counter
+    vals = []
+    for m in PRICE.finditer(head):
+        v = _to_int(m.group(1))
+        if v:
+            vals.append(v)
+    if vals:
+        freq = Counter(vals).most_common()
+        # 同頻度は最大値を優先
+        top_count = freq[0][1]
+        top_vals = [v for v,c in freq if c == top_count]
+        return max(top_vals)
 
     return None
 
