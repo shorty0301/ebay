@@ -871,235 +871,131 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """
-    Amazon.co.jp 価格抽出（PC/MOBILE統合HTML想定）
-    - 最優先: priceToPay / data-a-color="price"
-    - ただし  定期おトク便 / coupon / saving / strike / sns系 は祖先ごと除外
-    - ラベル「通常の注文」近傍を強優先
-    - ダメなら価格箱regex、さらにテキスト保険
-    """
+    """Amazon.co.jp: '通常の注文'の本体価格だけを取る。定期/クーポン/節約/単価は除外。"""
     import re
-
     H_all = str(html or "")
     parts = re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I) if "<!-- MOBILE MERGE -->" in H_all else [H_all]
 
-    # 共通: 文字列→int（500未満の裸数字は除外）
-    def _to(token: str) -> int | None:
-        v = to_int_yen(token)
+    # token -> int（500未満の裸数字は単価の可能性が高いので捨てる）
+    def _to(tok: str) -> int | None:
+        v = to_int_yen(tok)
         if v is not None and 100 <= v <= 3_000_000:
-            if v < 500 and not re.search(r"[¥￥]|円", token):
+            if v < 500 and not re.search(r'[¥￥]|円', tok):  # 通貨無しの小額は却下（例: ￥162/袋）
                 return None
             return v
-        t = re.sub(r"[^\d]", "", token or "")
+        t = re.sub(r'[^\d]', '', tok or '')
         if not t:
             return None
-        try:
-            v = int(t)
-            if 100 <= v <= 3_000_000:
-                if v < 500 and not re.search(r"[¥￥]|円", token):
-                    return None
-                return v
-        except Exception:
-            pass
+        v = int(t)
+        if 100 <= v <= 3_000_000:
+            if v < 500 and not re.search(r'[¥￥]|円', tok):
+                return None
+            return v
         return None
 
-    BAD_WORDS  = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|ギフト券|実質|相当|円相当|定期|おトク便|まとめ買い|Subscribe|Save)", re.I)
-    YEN_RX     = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)"
-    YEN        = re.compile(YEN_RX)
-    THNUM      = re.compile(r'[¥￥]?\s*\d{3,5}\s*円?\s*(?:以上|超|から)', re.I)
-    FREE       = re.compile(r'(送料無料|通常配送無料|配送料無料|無料配送)', re.I)
-    LABELS_TXT = ("通常の注文", "税込", "価格", "販売価格", "お支払い金額", "支払金額")
-
-    def _is_threshold(s: str) -> bool:
+    BAD_NEAR = re.compile(r"(定期|おトク便|Subscribe|Save|sns|クーポン|coupon|OFF|円OFF|割引|ポイント|pt|還元|相当|円相当|実質)", re.I)
+    BAD_ANCESTOR = re.compile(r"(a-text-price|strike|saving|savings|apexSavings|coupon|rebate|subscribe|sns|voucher|promo)", re.I)
+    UNIT_AFTER = re.compile(r"[／/]\s*(袋|個|枚|本|箱|g|kg|L|l|ml|mL|cm|mm|GB|MB|TB|セット|回|時間|月|年)")
+    THNUM  = re.compile(r'[¥￥]?\s*\d{3,5}\s*円?\s*(以上|超|から)', re.I)
+    FREE   = re.compile(r'(送料無料|通常配送無料|配送料無料|無料配送)', re.I)
+    def _is_threshold(s: str) -> bool:  # 「○○円以上で送料無料」系を弾く
         return bool(THNUM.search(s) and FREE.search(s))
 
-    def _scan_single(H: str) -> int | None:
-        # 1) DOM（lxml）で価格箱を厳密に取る
+    def _scan_dom(H: str) -> int | None:
         try:
             from lxml import html as LH
             doc = LH.fromstring(H)
 
-            cands: list[tuple[int, int]] = []
+            def ok_node(n) -> bool:
+                for anc in n.xpath("ancestor::*"):
+                    name = ((anc.get("class") or "") + " " + (anc.get("id") or "")).strip()
+                    if name and BAD_ANCESTOR.search(name):
+                        return False
+                near = " ".join(n.xpath('.//text() | preceding-sibling::*//text() | following-sibling::*//text()'))[:400]
+                if BAD_NEAR.search(near) or _is_threshold(near) or UNIT_AFTER.search(near):
+                    return False
+                return True
 
-            # 1-0) 「通常の注文」近傍 最優先（±160）
-            for root in doc.xpath('//*[@id="priceToPay" or @id="corePriceDisplay_desktop_feature_div" or @id="corePrice_feature_div" or @id="corePriceDisplay_mobile_feature_div" or @id="apex_desktop"]'):
-                t = " ".join(root.xpath(".//text()"))
-                if "通常の注文" in t:
-                    for m in re.finditer("通常の注文", t):
-                        win = t[max(0, m.start()-160): m.end()+160]
-                        if _is_threshold(win) or BAD_WORDS.search(win):
-                            continue
-                        m2 = YEN.search(win)
-                        if m2:
-                            v = _to(m2.group(0))
-                            if v: cands.append((110, v))
+            # 優先順: priceToPay → apexPriceToPay → その他の価格箱
+            cand = []
 
-            # 1-1) id=priceToPay 直下の a-offscreen（sns/定期などの祖先を除外）
-            for txt in doc.xpath(
-                '//*[@id="priceToPay"]'
-                '//span[contains(@class,"a-offscreen") and not(ancestor::*['
-                'contains(@id,"sns") or contains(@class,"sns") or contains(@class,"subscribe") or '
-                'contains(@class,"saving") or contains(@class,"apexSavings") or contains(@class,"rebate") or '
-                'contains(@class,"coupon") or contains(., "定期") or contains(., "おトク便")'
-                '])]/text()'
-            ):
-                v = _to(txt)
-                if v: cands.append((100, v))
+            for sel in [
+                '//*[@id="priceToPay"]//span[contains(@class,"a-offscreen")]',
+                '//*[contains(@class,"apexPriceToPay")]//span[contains(@class,"a-offscreen")]',
+                '//*[@id="corePriceDisplay_desktop_feature_div" or @id="corePrice_feature_div" or @id="corePriceDisplay_mobile_feature_div" or @id="apex_desktop"]//span[contains(@class,"a-offscreen")]',
+            ]:
+                nodes = doc.xpath(sel)
+                for n in nodes:
+                    if not ok_node(n):
+                        continue
+                    v = _to("".join(n.xpath(".//text()")))
+                    if v:
+                        cand.append(v)
+                if cand:  # 上位セレクタで見つかったらそれだけで決定
+                    return max(cand)
 
-            # 1-2) data-a-color="price" 直下の a-offscreen（同じ除外）
-            for txt in doc.xpath(
-                '//*[@id="corePriceDisplay_desktop_feature_div" or @id="corePrice_feature_div" or '
-                '@id="corePriceDisplay_mobile_feature_div" or @id="apex_desktop"]'
-                '//*[@data-a-color="price"]//span[contains(@class,"a-offscreen") and not(ancestor::*['
-                'contains(@id,"sns") or contains(@class,"sns") or contains(@class,"subscribe") or '
-                'contains(@class,"saving") or contains(@class,"apexSavings") or contains(@class,"rebate") or '
-                'contains(@class,"coupon") or contains(., "定期") or contains(., "おトク便")'
-                '])]/text()'
-            ):
-                v = _to(txt)
-                if v: cands.append((96, v))
-
-            # 1-3) 価格箱配下 offscreen（strike/saving/coupon/sns/定期 祖先は除外）
-            for txt in doc.xpath(
-                '//*[@id="corePriceDisplay_desktop_feature_div" or @id="corePrice_feature_div" or '
-                '@id="corePriceDisplay_mobile_feature_div" or @id="apex_desktop"]'
-                '//span[contains(@class,"a-offscreen") and not(ancestor::*['
-                'contains(@class,"a-text-price") or contains(@class,"strike") or '
-                'contains(@class,"saving") or contains(@class,"apexSavings") or contains(@class,"rebate") or '
-                'contains(@class,"coupon") or contains(@id,"sns") or contains(@class,"sns") or contains(@class,"subscribe") or '
-                'contains(., "定期") or contains(., "おトク便")'
-                '])]/text()'
-            ):
-                v = _to(txt)
-                if v: cands.append((92, v))
-
-            # 1-4) a-price-whole（同様に除外）
-            for txt in doc.xpath(
-                '//*[@id="priceToPay" or @id="corePriceDisplay_desktop_feature_div" or '
-                '@id="corePrice_feature_div" or @id="corePriceDisplay_mobile_feature_div" or @id="apex_desktop"]'
-                '//span[contains(@class,"a-price-whole") and not(ancestor::*['
-                'contains(@id,"sns") or contains(@class,"sns") or contains(@class,"subscribe") or '
-                'contains(@class,"saving") or contains(@class,"apexSavings") or contains(@class,"rebate") or '
-                'contains(@class,"coupon") or contains(., "定期") or contains(., "おトク便")'
-                '])]/text()'
-            ):
-                v = _to(txt)
-                if v: cands.append((90, v))
-
-            # 1-5) ラベル近傍（±120）
-            for root in doc.xpath('//*[@id="priceToPay" or @id="corePriceDisplay_desktop_feature_div" or @id="corePrice_feature_div" or @id="corePriceDisplay_mobile_feature_div" or @id="apex_desktop"]'):
-                t = " ".join(root.xpath(".//text()"))
-                for lab in LABELS_TXT:
-                    for m in re.finditer(re.escape(lab), t):
-                        win = t[max(0, m.start()-120): m.end()+120]
-                        if BAD_WORDS.search(win) or _is_threshold(win):
-                            continue
-                        m2 = YEN.search(win)
-                        if m2:
-                            v = _to(m2.group(0))
-                            if v: cands.append((88, v))
-
-            # 1-6) 旧ID（低優先度）
-            for txt in doc.xpath('//*[@id="priceblock_ourprice" or @id="priceblock_dealprice" or @id="sns-base-price"]/text()'):
-                v = _to(txt)
-                if v: cands.append((80, v))
-
-            if cands:
-                best = max(s for s, _ in cands)
-                # 同点は「より大きい値」を採用（節約側の小さい額を避ける）
-                return max(v for s, v in cands if s == best)
-
+            return None
         except Exception:
-            pass
+            return None
 
-        # 2) 価格箱だけ regex
+    def _scan_regex(H: str) -> int | None:
+        # 価格箱のブロックだけを抽出
         blk = ""
-        for bid, span in (
-            ("priceToPay", 3000),
-            ("corePriceDisplay_desktop_feature_div", 6000),
-            ("corePrice_feature_div", 6000),
-            ("corePriceDisplay_mobile_feature_div", 6000),
-            ("apex_desktop", 8000),
-        ):
+        for bid, span in (("priceToPay", 3000), ("apex_desktop", 8000),
+                          ("corePriceDisplay_desktop_feature_div", 6000),
+                          ("corePrice_feature_div", 6000),
+                          ("corePriceDisplay_mobile_feature_div", 6000)):
             m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
             if m:
                 blk = m.group(1); break
+        if not blk:
+            return None
 
-        if blk:
-            # sns/subscribe/saving/strike/coupon 領域を丸ごと間引く
-            sblk = re.sub(
-                r'<[^>]+(?:class|id)=["\'][^"\']*(?:sns|subscribe|saving|apexSavings|coupon|rebate|a-text-price|strike)[^"\']*["\'][^>]*>.*?</[^>]+>',
-                " ", re.sub(r"\s+", " ", blk), flags=re.I
-            )
-            # 通常の注文 近傍（±160）
-            for m in re.finditer("通常の注文", sblk):
-                win = sblk[max(0, m.start()-160): m.end()+160]
-                if _is_threshold(win) or BAD_WORDS.search(win):
-                    continue
-                m2 = re.search(YEN_RX, win)
-                if m2:
-                    v = _to(m2.group(0))
-                    if v: return v
+        sblk, pool = re.sub(r"\s+", " ", blk), []
 
-            # offscreen
-            for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', sblk, re.I):
-                tok = m.group(1)
-                v = _to(tok)
-                if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
-                    return v
-
-            # a-price-whole
-            for m in re.finditer(r'class=["\'][^"\']*a-price-whole[^"\']*["\'][^>]*>\s*([\d,，]{1,10})\s*<', sblk, re.I):
-                v = _to(m.group(1))
-                if v: return v
-
-        # 3) テキスト保険（上部）
-        try:
-            T = strip_tags(H).replace("\u3000", " ").replace("\u00A0", " ")
-        except Exception:
-            T = re.sub("<[^>]+>", " ", H)
-        head = T[:15000]
-
-        STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|通常配送無料|配送料無料|送料無料|以上で|定期|おトク便|まとめ買い)", re.I)
-        # ラベル→金額
-        for m in re.finditer(r"(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)[^\d¥￥]{0,20}"+YEN_RX, head, re.I):
-            tok = re.search(YEN_RX, m.group(0), re.I).group(0)
-            ctx = head[max(0, m.start()-70): m.end()+70]
-            if STOP.search(ctx) or _is_threshold(ctx):
+        # apexPriceToPay 直下の a-offscreen（最優先）
+        for m in re.finditer(r'apexPriceToPay[^<]*</span>\s*<span[^>]*class=["\'][^"\']*a-offscreen[^"\']*["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', sblk, re.I):
+            ctx = sblk[max(0, m.start()-140): m.end()+140]
+            if BAD_NEAR.search(ctx) or _is_threshold(ctx) or UNIT_AFTER.search(ctx): 
                 continue
-            v = _to(tok)
-            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
-                return v
-        # 金額→ラベル
-        for m in re.finditer(YEN_RX + r"[^\d¥￥]{0,20}(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)", head, re.I):
-            tok = re.search(YEN_RX, m.group(0), re.I).group(0)
-            ctx = head[max(0, m.start()-70): m.end()+70]
-            if STOP.search(ctx) or _is_threshold(ctx):
+            v = _to(m.group(1))
+            if v: pool.append(v)
+
+        # 汎用 offscreen（近傍フィルタを強め）
+        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', sblk, re.I):
+            ctx = sblk[max(0, m.start()-140): m.end()+140]
+            if BAD_NEAR.search(ctx) or _is_threshold(ctx) or UNIT_AFTER.search(ctx):
                 continue
-            v = _to(tok)
-            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
-                return v
+            v = _to(m.group(1))
+            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", m.group(1))):
+                pool.append(v)
 
-        # 出現多数（モード）
-        from collections import Counter
-        vals = []
-        for m in re.finditer(YEN_RX, head):
-            v = _to(m.group(0))
-            if v: vals.append(v)
-        if vals:
-            v, cnt = Counter(vals).most_common(1)[0]
-            if cnt >= 2 and not (1900 <= v <= 2100):
-                return v
+        return max(pool) if pool else None
 
-        return None
-
-    # パートごとに試す
+    # PC/Mobile いずれかで取得
     for H in parts:
-        v = _scan_single(H)
+        v = _scan_dom(H)
         if isinstance(v, int):
             return v
-    return None
+        v = _scan_regex(H)
+        if isinstance(v, int):
+            return v
 
+    # 最終保険：ページ上部テキスト。ただし通貨必須＆近傍ノイズ除外。
+    try:
+        T = strip_tags(H_all).replace("\u3000", " ").replace("\u00A0", " ")
+    except Exception:
+        T = re.sub("<[^>]+>", " ", H_all)
+    head = T[:15000]
+    for m in re.finditer(r"[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円", head):
+        tok = m.group(0)
+        ctx = head[max(0, m.start()-100): m.end()+100]
+        if BAD_NEAR.search(ctx) or _is_threshold(ctx) or UNIT_AFTER.search(ctx):
+            continue
+        v = _to(tok)
+        if v and not (1900 <= v <= 2100):
+            return v
+    return None
 
 
 
