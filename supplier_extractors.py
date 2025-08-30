@@ -873,24 +873,21 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp の支払価格取得（軽量・安定版）
-    優先順:
-      1) テキストで『税込』の前後±12文字にある “￥/円付き” 金額（最優先）
-         - 『通常の注文』近傍 → ページ先頭域（〜12,000字）
-         - 500円未満や「/袋」「/個」等の単価は除外
-      2) 価格箱（priceToPay / corePrice* / apex_desktop）内の .a-offscreen / .a-price-whole
+    Amazon.co.jp 支払価格取得（「税込」最優先・軽量）
+    優先:
+      1) テキストで『価格 ↔ 税込』の近接（±16、ページ冒頭＆「通常の注文」近傍）
+      2) 価格箱(priceToPay/corePrice*/apex_desktop) 内の a-offscreen / a-price-whole
       3) 旧IDの保険
+    ※ 500円未満（例: ￥162/袋）は除外
     """
     import re
 
     H = str(html or "")
-    T = str(text or "")
+    T = (text or "").replace("\u00A0", " ").replace("\u3000", " ")
 
-    # ￥/円付きパターン
     YEN = r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)'
 
     def _to_price(token: str) -> int | None:
-        """500円未満を除外して int にする"""
         t = re.sub(r"[^\d]", "", token or "")
         if not t:
             return None
@@ -900,50 +897,48 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         except Exception:
             return None
 
-    def _bad_unit_after(trail: str) -> bool:
-        """単価の ‘/袋’ などが直後に来るなら除外（全角スラッシュ含む）"""
-        return bool(re.search(r'[/／]\s*(袋|個|枚|本|台|回|か月|ヶ月|月|年|GB|TB|MB|cm|mm|g|kg|ml|L|セット)', trail))
-
-    # --- 1) テキストで『税込』前後を最優先 ---------------------------------
-    #   a) 『通常の注文』から少し先（見た目の価格箱の直上）
-    segs: list[str] = []
+    # ---- 1) 『税込』近傍（最優先） ----
+    segs = []
     m_norm = re.search(r'(通常の注文|通常のご注文)', T)
     if m_norm:
-        segs.append(T[m_norm.start(): m_norm.start() + 1200])
-    #   b) ページ先頭域（本文全体は舐めない）
+        segs.append(T[m_norm.start(): m_norm.start() + 1600])
     segs.append(T[:12000])
 
     for seg in segs:
-        # 価格 → 税込
-        for m in re.finditer(rf'({YEN})[^\d]{{0,12}}税込', seg, re.I):
-            tok = m.group(1)
-            if _bad_unit_after(seg[m.end(1): m.end(0) + 20]):
+        # 価格 → 税込（“価格の直後〜税込までの隙間”だけを見る）
+        for m in re.finditer(rf'({YEN})[^\d]{{0,16}}税込', seg, re.I):
+            gap = seg[m.end(1): m.end(0)]  # 価格～税込 の間だけ
+            # 直後の単価（/袋/個…）が価格にぶら下がっている場合のみ除外
+            if re.search(r'[/／]\s*(袋|個|枚|本|台|回|か月|ヶ月|月|年|GB|TB|MB|cm|mm|g|kg|ml|L|セット)', gap):
                 continue
-            v = _to_price(tok)
+            v = _to_price(m.group(1))
             if v is not None:
                 return v
-        # 税込 → 価格
-        for m in re.finditer(rf'税込[^\d]{{0,12}}({YEN})', seg, re.I):
+
+        # 税込 → 価格（こちらは “￥162/袋” を拾いがちなので広めに弾く）
+        for m in re.finditer(rf'税込[^\d]{{0,16}}({YEN})', seg, re.I):
             tok = m.group(1)
-            if _bad_unit_after(seg[m.end(1): m.end(1) + 20]):
+            # 直後に単価の単位が来るなら除外
+            after = seg[m.end(1): m.end(1) + 10]
+            if re.search(r'[/／]\s*(袋|個|枚|本|台|回|か月|ヶ月|月|年|GB|TB|MB|cm|mm|g|kg|ml|L|セット)', after):
                 continue
             v = _to_price(tok)
             if v is not None:
                 return v
 
-    # --- 2) HTML の “価格箱” だけをピンポイントで読む ------------------------
+    # ---- 2) 価格箱だけ読む ----
     def _scan_price_block(blk: str) -> int | None:
-        # まず ‘税込’ 近傍（保険）
-        for m in re.finditer(rf'({YEN})[^\d]{{0,12}}税込', blk, re.I):
+        # 税込 近傍（保険）
+        for m in re.finditer(rf'({YEN})[^\d]{{0,16}}税込', blk, re.I):
             v = _to_price(m.group(1))
             if v is not None:
                 return v
-        for m in re.finditer(rf'税込[^\d]{{0,12}}({YEN})', blk, re.I):
+        for m in re.finditer(rf'税込[^\d]{{0,16}}({YEN})', blk, re.I):
             v = _to_price(m.group(1))
             if v is not None:
                 return v
         # a-offscreen
-        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{{1,50}})<', blk, re.I):
+        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,60})<', blk, re.I):
             v = _to_price(m.group(1))
             if v is not None:
                 return v
@@ -952,7 +947,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             v = _to_price(m.group(1))
             if v is not None:
                 return v
-        # ブロック内の ‘￥/円付き’ の最初
+        # ブロック内の最初の “￥/円付き”
         m = re.search(YEN, blk, re.I)
         if m:
             v = _to_price(m.group(0))
@@ -975,7 +970,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if v is not None:
             return v
 
-    # --- 3) 旧IDの保険 ------------------------------------------------------
+    # ---- 3) 旧ID保険 ----
     for pat in [
         r'id=["\']priceblock_ourprice["\'][^>]*>\s*([^<]+)<',
         r'id=["\']priceblock_dealprice["\'][^>]*>\s*([^<]+)<',
@@ -988,7 +983,6 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 return v
 
     return None
-
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
