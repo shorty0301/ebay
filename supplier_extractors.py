@@ -1040,6 +1040,10 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         log_hit("a-price", cand_val, seg, "kept", f"score={score}", {"dist": abs(pos_here - p2p_pos) if p2p_pos>=0 else -1})
         cands.append((score, cand_val, pos_here, "a-price", abs(pos_here - p2p_pos) if p2p_pos>=0 else 10**9))
 
+　　# 採用直前
+　　if p2p_pos >= 0 and any(d <= 2000 for (_,_,_,_,d) in cands):
+        cands = [(s,v,pos,kind,d) for (s,v,pos,kind,d) in cands if d <= 2000]
+
     # --- 採用 ---
     from collections import Counter
     if cands:
@@ -1073,11 +1077,26 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     # --- テキスト保険 ---
     for m in re.finditer(r"(?:[¥￥]\s*)?(\d{1,3}(?:[,，]\d{3})+|\d{4,7})\s*円", T[:40000]):
         val = to_v(m.group(1)); i = m.start()
-        if not val: continue
-        if 1900 <= val <= 2100: continue
+        if not val:
+            continue
+        # 年号ノイズを除外
+        if 1900 <= val <= 2100:
+            log_hit("text", val, "", "dropped", "year_noise")
+            continue
         ctx = T[max(0, i-140): i+140]
-        if _is_threshold_free_shipping(ctx):          continue
-        if STOP.search(ctx) or is_unit_price(ctx, val): continue
+        # コピーライト文脈も除外
+        if re.search(r'(Amazon\.com|©|&copy;|Copyright)', ctx, re.I) and re.search(r'199\d|20\d\d', ctx):
+            log_hit("text", val, ctx, "dropped", "copyright_context")
+            continue
+        # 送料無料/しきい値の文脈を除外
+        if _is_threshold_free_shipping(ctx):
+            log_hit("text", val, ctx, "dropped", "threshold_free_shipping")
+            continue
+        # STOP語や単位価格を除外
+        if STOP.search(ctx) or is_unit_price(ctx, val):
+            log_hit("text", val, ctx, "dropped", "stop_or_unit")
+            continue
+        # ここまで残ったら採用
         trace["picked"] = {"val": val, "how": "text_fallback"}
         globals()['__amz_trace__'] = trace
         return val
