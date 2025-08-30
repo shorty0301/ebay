@@ -972,8 +972,9 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             blk = m.group(1)
             break
     if not blk:
-        return None 
-    # a-offscreen（￥/円 が無くてもOKにする）
+        return None
+
+    # (1) a-offscreen（￥/円 が無くてもOKにする）
     for m in re.finditer(
         r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<',
         blk, re.I
@@ -981,18 +982,40 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         token = m.group(1)
         v = _to(token)
         if v:
-            # 念のため年号っぽい裸数字は落とす（offscreenは基本通貨付くが保険）
+            # 念のため年号っぽい裸数字は落とす（通貨/円が無い時だけ）
             if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', token):
                 continue
             return v
 
-    # ラベル近傍（±120字）
+    # (2) a-price-whole（小数分割のときは整数部だけ拾う）
+    m_whole = re.search(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I)
+    if m_whole:
+        tok = m_whole.group(1)
+        v = _to(tok)
+        if v and not (1900 <= v <= 2100 and not re.search(r'[¥￥]|円', tok)):
+            return v
+
+    # (3) data-a-color="price" / class=*price 近傍にある金額
+    for mm in re.finditer(
+        r'(?:data-a-color\s*=\s*["\']price["\']|class=["\'][^"\']*\bprice\b[^"\']*["\'])[\s\S]{0,240}',
+        blk, re.I
+    ):
+        seg = mm.group(0)
+        mnum = re.search(
+            r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)',
+            seg
+        )
+        if mnum:
+            v = _to(mnum.group(0))
+            if v:
+                return v
+
+    # (4) ラベル近傍（±120字）
     LABEL_NEAR = re.compile(
         r'(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)[^¥￥\d]{0,40}'
         r'((?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円))',
         re.I
     )
-
     for m in LABEL_NEAR.finditer(re.sub(r"\s+", " ", blk)):
         win = m.group(0)
         if re.search(r"(ポイント|pt|還元|クーポン|OFF|円OFF|%|％|ギフト券)", win, re.I):
@@ -1001,10 +1024,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             continue
         token = m.group(2)
         v = _to(token)
-        if v:
-            # 念のため：年号ぽい裸数字は落とす（ここも通貨/円は必ず含まれる）
-            if 1900 <= v <= 2100 and not re.search(r'[¥￥]|円', token):
-                continue
+        if v and not (1900 <= v <= 2100 and not re.search(r'[¥￥]|円', token)):
             return v
             
     # --- 3) 最終保険：上部テキストで「ラベルの真横」を読む（1996回避用に厳しめ） ---
