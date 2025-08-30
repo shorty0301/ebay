@@ -48,6 +48,74 @@ def parse_yen_strict(raw: str) -> float:
         if 0 < n < 1e7: return n
     except: pass
     return float("nan")
+    
+def to_int_yen_fuzzy(s: str, lo: int = 1, hi: int = 10_000_000) -> int | None:
+    """
+    価格の“変な表記”もできるだけ円に正規化して整数で返す。
+    例:
+      - '1万2,345円' → 12345
+      - '1.2万' → 12000
+      - '12,000〜15,000円' / '12,000-15,000円' → 12000（下限を採用）
+      - '￥12,345-（税込）' / '約 12 345 円' → 12345
+      - 全角混在 / スペース混在 / 記号混在 も許容
+    """
+    if not s:
+        return None
+    raw = str(s)
+
+    # 正規化（全角→半角、ノーブレークスペース/狭いスペース除去）
+    x = z2h_digits(raw)
+    x = (x.replace("\u00A0", " ")
+           .replace("\u202F", " ")
+           .replace("\u2009", " "))
+    x = re.sub(r"[ \t\r\n]", "", x)
+    x = x.replace("円税込", "円").replace("税込", "").replace("税抜", "")
+
+    # 範囲（〜, ~, －, -）→ 下限を採用
+    x = re.sub(r"[~〜\-ｰ－—–‒]+", "〜", x)  # 記号を統一
+    if "〜" in x:
+        x = x.split("〜", 1)[0]
+
+    # カッコ・ハイフン・末尾記号の除去
+    x = re.sub(r"[()（）〔〕［］【】<>＜＞]", "", x)
+    x = re.sub(r"[^\d万,，.¥￥円]", "", x)  # 記号を限定
+
+    # 「万」表記（'1.2万','12万3,456円' など）
+    # まず 'A万B' → A*10000 + B を優先（Bは3～4桁を想定）
+    m = re.match(r"^(\d+(?:\.\d+)?)[万]\s*([¥￥]?\s*\d{1,4}(?:[,，]\d{3})*|[¥￥]?\s*\d+)?", x)
+    if m:
+        a = float(m.group(1))
+        base = int(a * 10000)
+        b = None
+        if m.group(2):
+            b = re.sub(r"[^\d]", "", m.group(2)) or ""
+            b = int(b) if b.isdigit() else None
+        v = (base + (b or 0))
+        if lo <= v <= hi:
+            return v
+
+    # 単独「万」（'1.2万', '12万'）
+    m = re.match(r"^(\d+(?:\.\d+)?)[万]", x)
+    if m:
+        v = int(float(m.group(1)) * 10000)
+        if lo <= v <= hi:
+            return v
+
+    # 通常（￥12,345円 / 12,345円 / ￥12345- など）
+    # 最初に現れる「数字群」を取る
+    m = re.search(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d+)", x)
+    if not m:
+        return None
+    t = re.sub(r"[^\d]", "", m.group(1))
+    if not t:
+        return None
+    try:
+        v = int(t)
+    except Exception:
+        return None
+    if lo <= v <= hi:
+        return v
+    return None
 
 def pick_best_price(cands) -> float:
     nums=[]
@@ -367,7 +435,13 @@ def price_from_offmall(html: str, text: str) -> int | None:
         add(cands, to_int_yen(m.group(1)), 7)
 
     # 2) 画面テキスト
-    pat_money = re.compile(r"([¥￥]?\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})(?:\s*円)?")
+    pat_money = re.compile(
+        r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+"
+        r"|\d{1,3}(?:[,，]\d{3})+\s*円"
+        r"|[¥￥]?\s*\d{3,7}\s*円?"
+        r"|(?:\d+(?:\.\d+)?)\s*万\s*\d{0,4}\s*円?"
+        r")"
+    )
     for m in pat_money.finditer(text):
         s = m.group(1)
         i = m.start(1)
@@ -831,7 +905,12 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         trace["hits"].append(item)
 
     def to_v(s: str) -> int | None:
-        return to_int_yen(s)
+        # まずは厳密 → ダメならゆるめ
+        v = to_int_yen(s)
+        if v is not None:
+            return v
+        return to_int_yen_fuzzy(s)
+
 
     BAD_NEAR = re.compile(r'(a-text-price|a-text-strike|priceBlockStrikePriceString|basisPrice|listPrice|希望小売価格|定価|旧価格)', re.I)
     STOP     = re.compile(r'(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|配送料|送料無料|通常配送無料|以上で)', re.I)
@@ -1689,15 +1768,18 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
             i = m.start()
             ctx = text[max(0, i-24): i+len(h)+24]
 
-            # 数値へ変換（全角対応）
+            # 数値へ変換（厳密 → ゆるめ）
+            v = None
             n = parse_yen_strict(h)
-            if n != n:  # NaN
-                # 裸数字は parse_yen_strict だとNaNになりやすいので素直に整数化
-                t = re.sub(r"[^\d]", "", z2h_digits(h))
-                n = float(t) if t else float("nan")
-            if n != n or not (0 < n < 10_000_000):
+            if n == n and 0 < n < 10_000_000:
+                 v = int(n)
+            else:
+            vv = to_int_yen_fuzzy(h)
+            if vv is not None:
+                v = vv
+            if v is None:
                 continue
-            v = int(n)
+
 
             # HTTPコード等は、通貨/円の文脈が無ければ除外
             if v in (100,101,200,201,202,204,301,302,303,304,307,308,400,401,403,404,408,500,502,503,504) and not PRICE_KEY.search(ctx):
