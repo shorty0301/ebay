@@ -972,7 +972,14 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             blk = m.group(1)
             break
     if not blk:
-        return None
+        mpos = re.search(r'(id=["\']priceToPay["\']|class=["\'][^"\']*\bpriceToPay\b)', H, re.I)
+        if mpos:
+            i = mpos.start()
+            blk = H[max(0, i-8000): i+8000]
+        else:
+            # それも無ければ先頭〜4万字だけ（全文ではない）を安全に見る
+            blk = H[:40000]
+
 
     # (1) a-offscreen（￥/円 が無くてもOKにする）
     for m in re.finditer(
