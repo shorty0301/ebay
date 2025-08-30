@@ -843,9 +843,9 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
 
     # 価格箱ブロックを拾う（従来どおり）
     blk = ""
-    for bid, span in (("apex_desktop", 20000),
-                      ("corePriceDisplay_desktop_feature_div", 20000),
-                      ("corePrice_feature_div", 20000)):
+    for bid, span in (("apex_desktop", 40000),
+                      ("corePriceDisplay_desktop_feature_div", 40000),
+                      ("corePrice_feature_div", 40000)):
         m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
         if m:
             blk = m.group(1)
@@ -869,7 +869,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             globals()['__amz_trace__'] = trace
             return val
     m_fast_core = re.search(
-        r'id=["\']corePrice(?:Display_)?_(?:desktop|mobile)_feature_div["\'][\s\S]{0,1500}?'
+        r'id=["\']corePrice(?:Display_)?_(?:desktop|mobile)_feature_div["\'][\s\S]{0,2500}?'
         r'class=["\']a-offscreen["\'][^>]*>\s*[¥￥]?\s*([\d,，]{1,10})<',
         H, re.I
     )
@@ -904,12 +904,13 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             log_hit("offscreen", val, ctx, "dropped", "near_stop");     continue
 
         # しきい値/送料無料ガード（←ここ）
-        wide = blk[max(0, i-120): m.end()+120]
-        if re.search(r'(以上で?|送料無料|通常配送無料|配送料無料)', wide, re.I):
-            # ← この if を 1段深くすること！
+        wide = blk[max(0, i-160): m.end()+160]
+        # “○○円以上で送料無料” のような「しきい値」だけ落とす。
+        if re.search(r'(以上で?|以上のご注文で)', wide, re.I) and re.search(r'(送料無料|通常配送無料|配送料無料)', wide, re.I):
             if not re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', wide, re.I):
-                log_hit("offscreen", val, wide, "dropped", "threshold_free_shipping_split")
+                log_hit("offscreen", val, wide, "dropped", "threshold_free_shipping_threshold_only")
                 continue
+
 
         if is_unit_price(ctx, val):
             log_hit("offscreen", val, ctx, "dropped", "unit_price");    continue
@@ -949,6 +950,41 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         log_hit("whole", val, ctx, "kept", f"score={score}", {"dist": abs(i - p2p_pos)})
         cands.append((score, val, i, "whole", abs(i - p2p_pos) if p2p_pos>=0 else 10**9))
 
+    # a-price コンテナ（whole + fraction の合成も考慮）
+    for m in re.finditer(r'<span[^>]*class=["\'][^"\']*\ba-price\b[^"\']*["\'][\s\S]{0,400}?</span>', blk, re.I):
+        seg = m.group(0)
+        # 優先は whole、なければ offscreen を拾う
+        m_whole = re.search(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', seg, re.I)
+        m_frac  = re.search(r'class=["\']a-price-fraction["\'][^>]*>(\d{2})<', seg, re.I)
+        m_off   = re.search(r'class=["\']a-offscreen["\'][^>]*>\s*[¥￥]?\s*([\d,，]{1,10})<', seg, re.I)
+
+        cand_val = None
+        if m_off:
+            cand_val = to_v(m_off.group(1))
+        elif m_whole:
+            base = to_v(m_whole.group(1))
+            if base is not None and m_frac:
+                # 小数部は無視（円単位に正規化）
+                cand_val = base
+            else:
+                cand_val = base
+
+        if not cand_val:
+            continue
+
+        # 取り違い防止（取り消し線・リスト価格近傍回避）
+        if BAD_NEAR.search(seg) or STOP.search(seg):
+            log_hit("a-price", cand_val, seg, "dropped", "near_strike_or_stop"); 
+            continue
+
+        score = 2
+        if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', seg, re.I):
+            score += 2
+        # priceToPay に近いほどブースト
+        pos_here = m.start()
+        score += boost_by_distance(pos_here)
+        log_hit("a-price", cand_val, seg, "kept", f"score={score}", {"dist": abs(pos_here - p2p_pos) if p2p_pos>=0 else -1})
+        cands.append((score, cand_val, pos_here, "a-price", abs(pos_here - p2p_pos) if p2p_pos>=0 else 10**9))
 
     # 採用ルール（同点時は priceToPay に近い方を優先。そのうえで値が小さい方）
     if cands:
