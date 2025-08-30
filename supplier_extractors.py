@@ -878,8 +878,18 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             trace["picked"] = {"val": val, "how": "priceToPay_fastpath"}
             globals()['__amz_trace__'] = trace
             return val
-     
-
+    m_fast_core = re.search(
+        r'id=["\']corePrice(?:Display_)?_(?:desktop|mobile)_feature_div["\'][\s\S]{0,1500}?'
+        r'class=["\']a-offscreen["\'][^>]*>\s*[¥￥]?\s*([\d,，]{1,10})<',
+        H, re.I
+    )
+    if m_fast_core:
+        val = to_v(m_fast_core.group(1))
+        if val:
+            trace["picked"] = {"val": val, "how": "corePrice_fastpath"}
+            globals()['__amz_trace__'] = trace
+            return val
+            
     cands: list[tuple[int, int, int, str, int]] = []  # (score, val, pos, kind, dist)
 
     def boost_by_distance(pos: int) -> int:
@@ -1069,111 +1079,24 @@ def price_from_mercari(html: str, text: str) -> int | None:
             return v
     return None
 
-# ==== Mercari専用：Playwright 同期フォールバック（合体版） ====
-def mercari_price_via_playwright_sync(url: str, timeout_ms: int = 60000, headless: bool = False, retries: int = 1) -> int | None:
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    except Exception:
-        print("[PW] module not available")
-        return None
-
-    YEN_MARK = re.compile(r"(?:￥|¥)\s*([0-9０-９][0-9０-９,，]{2,})")
-    YEN_EN   = re.compile(r"([0-9０-９][0-9０-９,，]{2,})\s*円")
-
-    def _to_price_from_text(txt: str) -> int | None:
-        m = YEN_MARK.search(txt) or YEN_EN.search(txt)
-        return to_int_yen(m.group(1)) if m else None
-
-    UA_PC = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-    UA_MB = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
-
-    def _try(playwright, ua: str, is_mobile: bool) -> int | None:
-        print(f"[PW] try UA={'MB' if is_mobile else 'PC'} headless={headless}")
-        browser = playwright.chromium.launch(headless=headless)
-        ctx = browser.new_context(
-            user_agent=ua, locale="ja-JP",
-            extra_http_headers={"Accept-Language": "ja,en;q=0.8"},
-            viewport={"width": 390, "height": 844} if is_mobile else {"width": 1400, "height": 900},
-            device_scale_factor=3 if is_mobile else 1,
-            is_mobile=is_mobile, has_touch=is_mobile,
-        )
-        page = ctx.new_page()
-
-        captured_price: int | None = None
-
-        # ❶ ネットワークのJSONレスポンスから直接 price を拾う
-        def _on_response(resp):
-            nonlocal captured_price
-            if captured_price is not None:
-                return
-            try:
-                url_l = resp.url.lower()
-                ct = (resp.headers or {}).get("content-type", "")
-                if ("application/json" in ct or "text/plain" in ct) and ("item" in url_l or "items" in url_l):
-                    body = resp.text()
-                    m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', body)
-                    if m:
-                        v = to_int_yen(m.group(1))
-                        print(f"[PW] resp hit {resp.url} -> {v}")
-                        if v:
-                            captured_price = v
-            except Exception as e:
-                print("[PW] resp err", e)
-
-        page.on("response", _on_response)
-
-        try:
-            page.goto(url, wait_until="load", timeout=timeout_ms)
-        except PWTimeout:
-            print("[PW] timeout goto")
-            ctx.close(); browser.close(); return None
-
-        # ほんの少し待つ（API→描画のため）
-        page.wait_for_timeout(2500)
-
-        if captured_price:
-            ctx.close(); browser.close(); return captured_price
-
-        # ❷ 画面テキストから
-        try:
-            body_text = page.inner_text("body")
-        except Exception:
-            body_text = ""
-        v = _to_price_from_text(body_text)
-        if v:
-            print("[PW] text hit ->", v)
-            ctx.close(); browser.close(); return v
-
-        # ❸ DOM のHTMLから（埋め込みJSONの保険）
-        html = page.content()
-        m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', html)
-        if m:
-            v = to_int_yen(m.group(1))
-            if v:
-                print("[PW] html hit ->", v)
-                ctx.close(); browser.close(); return v
-
-        # デバッグ吐き
-        try:
-            with open("debug_pw_dom.html", "w", encoding="utf-8") as f: f.write(html)
-            with open("debug_pw_body.txt", "w", encoding="utf-8") as f: f.write(body_text)
-            page.screenshot(path="debug_pw.png", full_page=True)
-            print("[PW] wrote debug_pw_dom.html / debug_pw_body.txt / debug_pw.png")
-        except Exception as e:
-            print("[PW] debug write err", e)
-
-        ctx.close(); browser.close()
-        return None
-
+def mercari_price_simple(url: str, headless: bool = False) -> int | None:
     with sync_playwright() as p:
-        v = _try(p, UA_PC, is_mobile=False)
-        if v: return v
-        v = _try(p, UA_MB, is_mobile=True)
-        if v: return v
-    return None
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2000)  # JS描画待ち
 
+        # 価格要素のテキストを直接探す（円 or ¥）
+        txt = page.inner_text("body")
+        import re
+        m = re.search(r"(?:￥|¥)\s*([0-9,]+)\s*円?", txt)
+        if m:
+            price = int(m.group(1).replace(",", ""))
+            browser.close()
+            return price
+
+        browser.close()
+        return None
 
 # ======== Rakuten helpers (GAS移植) =========
 def _availability_from_meta_or_ld(html: str) -> str | None:
@@ -1681,14 +1604,6 @@ def fetch_and_extract(url: str) -> Dict[str, Any]:
     return extract_supplier_info(url, fetch_html(url))
 
 def _strong_get_html(url: str) -> str:
-    """
-    疑わしいHTMLのときにだけ呼ばれる“強化取得”。
-    ★ Amazon.co.jp 専用で挙動し、他サイトは一切変更しない ★
-    1) PCヘッダでもう一度
-    2) モバイルUAでもう一度
-    3) /dp/ASIN をURLから正規化して再取得（?以降は除去）
-    4) 最長のHTMLを返す（長い=本体を取れた可能性が高い）
-    """
     try:
         if "amazon.co.jp" not in url:
             return ""  # 他サイトは触らない
@@ -1742,9 +1657,15 @@ def _strong_get_html(url: str) -> str:
             sc4, h4 = _get(canon + "?psc=1", H_PC)
             if sc4 == 200 and h4:
                 htmls.append(h4)
-
+                
         # 3) 取れた中で最長のHTMLを返す（空なら空文字）
-        return max(htmls, key=len) if htmls else ""
+        def _is_robot(h: str) -> bool:
+            return bool(re.search(r"(Robot Check|captcha|自動アクセス|ロボットによる|enable cookies)", h, re.I))
+
+        candidates = [h for h in htmls if h]
+        non_robot = [h for h in candidates if not _is_robot(h)]
+        pool = non_robot or candidates
+        return max(pool, key=len) if pool else ""
     except Exception:
         return ""
 
@@ -1771,5 +1692,16 @@ def _amz_guess_dp_url(host: str, base_url: str, html: str) -> str | None:
         path = m.group(1)
         return path if path.startswith("http") else f"https://{host.rstrip('/')}/{path.lstrip('/')}"
 
+    # 3) og:url に dp/gp/product が入っているケース
+    m = re.search(r'property=["\']og:url["\'][^>]*content=["\']([^"\']+/(?:dp|gp/product)/[A-Z0-9]{10})', H, re.I)
+    if m:
+        u = m.group(1)
+        return u if u.startswith("http") else f"https://{host.rstrip('/')}/{u.lstrip('/')}"
+
+    # 4) 埋め込みASINから推定（data-asin や "ASIN":"XXXXXXXXXX"）
+    m = re.search(r'(["\']ASIN["\']\s*:\s*["\']|data-asin=["\'])([A-Z0-9]{10})', H, re.I)
+    if m:
+        asin = m.group(2)
+        return f"https://{host.rstrip('/')}/dp/{asin}"
     return None
 
