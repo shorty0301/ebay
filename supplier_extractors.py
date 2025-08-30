@@ -1132,10 +1132,20 @@ def mercari_via_playwright_sync(url: str, timeout_ms: int = 90000, headless: boo
         page.on("response", _on_response)
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            # 購入ボタンが出るのを少しだけ待つ（無くても続行）
+            try:
+                page.wait_for_selector(
+                    "text=購入手続きへ, text=購入に進む, text=カートに入れる",
+                    timeout=2000
+                )
+            except Exception:
+                pass
+            page.wait_for_timeout(500)  # 仕上げの短い待機
         except PWTimeout:
             ctx.close(); browser.close()
             return {"price": None, "stock": "UNKNOWN"}
+
 
         page.wait_for_timeout(1500)  # JS描画待ち（短め）
 
@@ -1588,23 +1598,22 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
     # Mercari（最初から Playwright）
     elif ("mercari" in host) or ("jp.mercari.com" in host):
         try:
-           res = mercari_via_playwright_sync(url, timeout_ms=90_000, headless=False)
+            res = mercari_via_playwright_sync(url, timeout_ms=90_000, headless=False)
         except Exception:
             res = None
 
         if isinstance(res, dict):
-            if res.get("stock"):
-                stock = res["stock"]
-            if isinstance(res.get("price"), int):
-                price = res["price"]
+            if res.get("stock"): stock = res["stock"]
+            if isinstance(res.get("price"), int): price = res["price"]
 
-        # それでも price が取れていない時だけ旧ロジックにフォールバック（任意）
+        # 取れなかったときだけ旧ロジックに保険
         if price is None:
             s = stock_from_mercari(html, text)
             if s: stock = s
             p2 = price_from_mercari(html, text)
             if p2 is not None:
                 price = p2
+
 
 
         
