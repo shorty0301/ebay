@@ -1774,9 +1774,9 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
             if n == n and 0 < n < 10_000_000:
                  v = int(n)
             else:
-            vv = to_int_yen_fuzzy(h)
-            if vv is not None:
-                v = vv
+                vv = to_int_yen_fuzzy(h)
+                if vv is not None:
+                    v = vv
             if v is None:
                 continue
 
