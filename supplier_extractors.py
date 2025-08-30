@@ -8,6 +8,7 @@ GAS版からPython移植
 import re, json, functools, requests
 from typing import Dict, Any
 from bs4 import BeautifulSoup
+from typing import Dict, Any
 
 # ======== 共通ユーティリティ ==========
 def strip_tags(s: str) -> str:
@@ -72,6 +73,264 @@ def to_int_yen(s: str) -> int | None:
         return v if 0 < v < 10_000_000 else None
     except:
         return None
+# ============================================================
+# Playwright版 価格抽出（任意利用・既存処理へは未接続：副作用なし）
+#  - 仕様に基づく実装
+#  - 既存関数とは独立。呼び出したいときだけ明示的に利用してください
+# ============================================================
+# 依存: playwright.async_api, bs4, lxml, re
+# 注意: ランタイムに未インストールでもモジュール読み込み時に失敗しないよう
+#       import は関数内で行います。
+
+import asyncio as _asyncio
+import json as _json
+import re as _re
+from collections import Counter as _Counter
+
+_YEN_RE = _re.compile(r"(?:￥|¥)\s*([0-9０-９][0-9０-９,，]{2,})")
+_DEFAULT_LABEL_WORDS: tuple[str, ...] = ("税込", "送料込", "送料込み")
+
+def _z2h_digits_play(s: str) -> str:
+    table = str.maketrans("０１２３４５６７８９，，", "0123456789,,")
+    return (s or "").translate(table)
+
+def _to_int_play(s: str, lo: int = 100, hi: int = 3_000_000) -> int | None:
+    t = _re.sub(r"[^\d]", "", _z2h_digits_play(s))
+    if not t:
+        return None
+    try:
+        v = int(t)
+        return v if lo <= v <= hi else None
+    except Exception:
+        return None
+
+def _pick_mode_min_play(nums: list[int]) -> int | None:
+    arr = [n for n in nums if isinstance(n, int)]
+    if not arr:
+        return None
+    freq = _Counter(arr).most_common()
+    top_vals = [v for v, c in freq if c == freq[0][1]]
+    return min(top_vals)
+
+async def fetch_price_playwright(
+    url: str,
+    *,
+    timeout_ms: int = 60_000,
+    headless: bool = True,
+    retries: int = 2,
+    buy_button_texts: tuple[str, ...] = ("購入手続き", "今すぐ購入", "カートに入れる"),
+    label_words: tuple[str, ...] = _DEFAULT_LABEL_WORDS,
+    return_extra: bool = False,
+) -> Dict[str, Any]:
+    """
+    EC商品ページから日本円価格を抽出（Playwright使用）。
+    戻り値:
+      成功: {"price": int, "source": str, ...(return_extra時に title/brand)}
+      失敗: {"status": "price_not_found"} / {"status": "timeout_goto"}
+    抽出優先度:
+      1) 購入ボタン直前近傍の ¥（'税込/送料込/送料込み' を含むなら最優先）
+      2) JSON-LD (Offer/AggregateOffer) の price/lowPrice
+      3) <meta name="product:price:amount" content="...">
+      4) 可視テキスト全体（ラベル近傍優先 → 最頻値 → 範囲フィルタ）
+    """
+    try:
+        from playwright.async_api import async_playwright, Error as PWError, TimeoutError as PWTimeout
+        from lxml import html as LH
+    except Exception:
+        # Playwright等が未導入の場合も、既存フローに影響しないよう失敗のみ返す
+        return {"status": "price_not_found"}
+
+    UA_WIN_CHROME = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    )
+
+    async def _once() -> Dict[str, Any]:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=headless)
+            ctx = await browser.new_context(
+                user_agent=UA_WIN_CHROME,
+                locale="ja-JP",
+                extra_http_headers={"Accept-Language": "ja,en;q=0.8"},
+                device_scale_factor=1.0,
+            )
+            page = await ctx.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except (PWTimeout, PWError):
+                await ctx.close(); await browser.close()
+                return {"status": "timeout_goto"}
+
+            await page.wait_for_timeout(700)
+            content = await page.content()
+            soup = BeautifulSoup(content, "lxml")
+            doc = LH.fromstring(content)
+
+            # 1) 購入ボタン近傍
+            btn_or = " or ".join([f"contains(., '{t}')" for t in buy_button_texts])
+            btn_pred = f"((self::button or self::a) and ({btn_or}))"
+            # 直近の ¥ 含有要素を後方優先で
+            def _scan_near(with_label: bool) -> int | None:
+                nodes = doc.xpath(f"//*[contains(., '¥') or contains(., '￥')][preceding::*[{btn_pred}]]")
+                for el in reversed(nodes):
+                    txt = " ".join(el.xpath(".//text()")).strip()
+                    if not txt:
+                        continue
+                    if with_label and not any(w in txt for w in label_words):
+                        continue
+                    m = _YEN_RE.search(txt)
+                    if not m:
+                        continue
+                    v = _to_int_play(m.group(1))
+                    if v is not None:
+                        return v
+                return None
+            v1a = _scan_near(True)
+            if v1a is not None:
+                out = {"price": v1a, "source": "dom:near_buy+label"}
+                if return_extra:
+                    out.update(_collect_extras_play(soup))
+                await ctx.close(); await browser.close()
+                return out
+            v1b = _scan_near(False)
+            if v1b is not None:
+                out = {"price": v1b, "source": "dom:near_buy"}
+                if return_extra:
+                    out.update(_collect_extras_play(soup))
+                await ctx.close(); await browser.close()
+                return out
+
+            # 2) JSON-LD Offer/AggregateOffer
+            try:
+                def _walk(o) -> int | None:
+                    if isinstance(o, dict):
+                        t = (o.get("@type") or o.get("type") or "").lower()
+                        if t in {"offer", "aggregateoffer"}:
+                            for k in ("price", "lowPrice", "lowprice"):
+                                if k in o:
+                                    v = _to_int_play(str(o[k]))
+                                    if v is not None:
+                                        return v
+                        for v in o.values():
+                            r = _walk(v)
+                            if r is not None:
+                                return r
+                    elif isinstance(o, list):
+                        for it in o:
+                            r = _walk(it)
+                            if r is not None:
+                                return r
+                    return None
+                for sc in soup.find_all("script", attrs={"type": _re.compile(r"ld\+json", _re.I)}):
+                    raw = (sc.string or sc.get_text() or "").strip()
+                    if not raw:
+                        continue
+                    raw = _re.sub(r"//.*?$|/\*.*?\*/", "", raw, flags=_re.S | _re.M)
+                    raw = _re.sub(r",\s*([}\]])", r"\1", raw)
+                    try:
+                        data = _json.loads(raw)
+                    except Exception:
+                        continue
+                    v2 = _walk(data)
+                    if v2 is not None:
+                        out = {"price": v2, "source": "jsonld:price"}
+                        if return_extra:
+                            out.update(_collect_extras_play(soup))
+                        await ctx.close(); await browser.close()
+                        return out
+            except Exception:
+                pass
+
+            # 3) <meta name="product:price:amount">
+            meta = soup.find("meta", attrs={"name": "product:price:amount"})
+            if meta and meta.get("content"):
+                v3 = _to_int_play(meta["content"])
+                if v3 is not None:
+                    out = {"price": v3, "source": "meta:product:price:amount"}
+                    if return_extra:
+                        out.update(_collect_extras_play(soup))
+                    await ctx.close(); await browser.close()
+                    return out
+
+            # 4) 可視テキスト全体
+            label_hits: list[int] = []
+            generic_hits: list[int] = []
+            for el in soup.find_all(text=_re.compile(r"[¥￥]")):
+                try:
+                    block = el.parent.get_text(" ", strip=True)
+                except Exception:
+                    continue
+                if not block:
+                    continue
+                m = _YEN_RE.search(block)
+                if not m:
+                    continue
+                v = _to_int_play(m.group(1))
+                if v is None:
+                    continue
+                if any(w in block for w in label_words):
+                    label_hits.append(v)
+                else:
+                    generic_hits.append(v)
+            if label_hits:
+                v4a = _pick_mode_min_play(label_hits)
+                if v4a is not None:
+                    out = {"price": v4a, "source": "text:labeled"}
+                    if return_extra:
+                        out.update(_collect_extras_play(soup))
+                    await ctx.close(); await browser.close()
+                    return out
+            full = soup.get_text(" ", strip=True)
+            all_nums = [_to_int_play(m.group(1)) for m in _YEN_RE.finditer(full)]
+            all_nums = [n for n in all_nums if isinstance(n, int)]
+            v4b = _pick_mode_min_play(all_nums or generic_hits)
+            if v4b is not None:
+                out = {"price": v4b, "source": "text:mode"}
+                if return_extra:
+                    out.update(_collect_extras_play(soup))
+                await ctx.close(); await browser.close()
+                return out
+
+            await ctx.close(); await browser.close()
+            return {"status": "price_not_found"}
+
+    def _collect_extras_play(soup: BeautifulSoup) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        ttl = None
+        if soup.title and soup.title.string:
+            ttl = soup.title.string.strip()
+        if not ttl:
+            ogt = soup.find("meta", property="og:title")
+            if ogt and ogt.get("content"):
+                ttl = ogt["content"].strip()
+        if ttl:
+            out["title"] = ttl[:200]
+        brand = None
+        for meta_key, attr in (("product:brand", "property"), ("brand", "name")):
+            tag = soup.find("meta", attrs={attr: meta_key})
+            if tag and tag.get("content"):
+                brand = tag["content"].strip()
+                break
+        if brand:
+            out["brand"] = brand[:100]
+        return out
+
+    last: Dict[str, Any] | None = None
+    for _ in range(max(1, retries)):
+        res = await _once()
+        if "price" in res:
+            return res
+        last = res
+        await _asyncio.sleep(0.3)
+    return last or {"status": "price_not_found"}
+
+# 任意：Mercari専用の薄いアダプタ（外部から明示的に呼ぶ想定。既存フローに未接続）
+async def mercari_price_via_playwright(url: str, **kw) -> int | None:
+    if not _re.search(r"https?://([^/]*\.)?mercari\.com", url):
+        return None
+    res = await fetch_price_playwright(url, **kw)
+    return res.get("price") if isinstance(res, dict) else None
 
 # ========== fetch_html ==========
 def fetch_html(url: str) -> str:
@@ -1194,6 +1453,8 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         s = stock_from_mercari(html, text)
         if s: stock = s
         price = price_from_mercari(html, text)
+        # ※ 既存挙動を壊さないため、Playwright呼び出しはここでは行いません。
+        #    必要時は呼び出し側で `await mercari_price_via_playwright(url)` を使用してください。
     elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp")) or ("rakuten.co.jp" in host):
         # 価格
         price = _price_from_rakuten(html, text)
