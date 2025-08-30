@@ -872,7 +872,7 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     import re
-    H_all = str(html or "")
+    H = str(html or "")  
 
     # --- 1) PC/MOBILE を個別に試す -------------------------
     parts = re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I) if "<!-- MOBILE MERGE -->" in H_all else [H_all]
@@ -960,10 +960,10 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     # --- regex フォールバック（価格箱ブロックだけ） ---
     blk = ""
     for bid, span in (("priceToPay", 3000),
-                  ("corePriceDisplay_desktop_feature_div", 6000),
-                  ("corePrice_feature_div", 6000),
-                  ("corePriceDisplay_mobile_feature_div", 6000),
-                  ("apex_desktop", 8000)):
+                      ("corePriceDisplay_desktop_feature_div", 6000),
+                      ("corePrice_feature_div", 6000),
+                      ("corePriceDisplay_mobile_feature_div", 6000),
+                      ("apex_desktop", 8000)):
         m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
         if m:
             blk = m.group(1)
@@ -979,7 +979,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
 
         STOP   = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|通常配送無料|配送料無料|送料無料|以上で)", re.I)
         LABELS = r"(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)"
-        YEN    = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})"
+        YEN    = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)"
 
         # ラベル → 金額
         pat_l2y = re.compile(rf"{LABELS}[^\d¥￥]{{0,20}}({YEN})", re.I)
@@ -1007,18 +1007,13 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         # 出現多数（モード）で拾う（同額が2回以上出たらそれ）
         from collections import Counter
         vals: list[int] = []
-        for m in re.finditer(rf"{YEN}", head, re.I):
-            tok = m.group(0)
-            v = _to(tok)
-            if v is None:
-                continue
-            if 1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok):
-                continue
-            vals.append(v)
-
+        for m in re.finditer(r"[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円", head):
+            v = _to(m.group(0))
+            if v:
+                vals.append(v)
         if vals:
             v, cnt = Counter(vals).most_common(1)[0]
-            if cnt >= 2:
+            if cnt >= 2 and not (1900 <= v <= 2100):
                 return v
 
         return None
