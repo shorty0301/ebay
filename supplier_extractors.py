@@ -1453,8 +1453,14 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         s = stock_from_mercari(html, text)
         if s: stock = s
         price = price_from_mercari(html, text)
-        # ※ 既存挙動を壊さないため、Playwright呼び出しはここでは行いません。
-        #    必要時は呼び出し側で `await mercari_price_via_playwright(url)` を使用してください。
+        if price is None:
+            try:
+                p2 = _pw_fetch_price_blocking(url, timeout_ms=60_000, headless=True, retries=2)
+                if isinstance(p2, int):
+                    price = p2
+            except Exception:
+                pass
+        
     elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp")) or ("rakuten.co.jp" in host):
         # 価格
         price = _price_from_rakuten(html, text)
