@@ -94,10 +94,9 @@ def _amz_stock_from_soup(soup: BeautifulSoup) -> str | None:
         return "IN_STOCK"
     return None
 
-def amazon_fetch_price_and_stock(url: str, timeout: int = HTTP_TIMEOUT) -> tuple[int | None, str | None]:
-    """requests + BS4 でURLから直接取得（外部依存は無し／fake_useragentは任意）"""
+def amazon_fetch_price_and_stock(url: str, timeout: int | None = None) -> tuple[int | None, str | None]:
     if timeout is None:
-        timeout = 20  # フォールバック（後段の呼び出し側では HTTP_TIMEOUT を渡す）
+        timeout = HTTP_TIMEOUT if "HTTP_TIMEOUT" in globals() else 20
     u = url if url.startswith("http") else ("https://" + url)
     sess = requests.Session()
     sess.headers.update({
