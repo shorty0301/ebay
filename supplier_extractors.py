@@ -872,89 +872,102 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """
-    Amazon.co.jp 支払価格の超シンプル抽出
-    - 「通常の注文」ブロックと既知の価格箱(priceToPay/corePrice*/apex_desktop)だけ読む
-    - 優先順: (1) 数値→税込  (2) a-offscreen  (3) a-price-whole  (4) ブロック内の￥/円
-    - 500円未満は単価(￥162/袋など)とみなして除外
-    """
+    """Amazon.co.jp 支払価格の超シンプル抽出（通常の注文/価格箱のみ）"""
     import re
+    from bs4 import BeautifulSoup
 
     H = str(html or "")
+    if not H:
+        return None
 
-    # 全角→半角
-    _z2h = str.maketrans("０１２３４５６７８９，", "0123456789,")
-    def _to_int(s: str) -> int | None:
-        t = re.sub(r"[^\d]", "", (s or "").translate(_z2h))
+    # 金額パターン（￥1,234 / 1,234円 など）
+    YEN_RE = re.compile(
+        r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[¥￥]\s*[0-9０-９]{3,7}|[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|[0-9０-９]{3,7}\s*円)'
+    )
+    Z2H = str.maketrans("０１２３４５６７８９，", "0123456789,")
+    def to_int(s: str) -> int | None:
+        t = re.sub(r"[^\d]", "", (s or "").translate(Z2H))
         if not t:
             return None
-        try:
-            v = int(t)
-            return v if 500 <= v <= 3_000_000 else None
-        except Exception:
+        v = int(t)
+        return v if 500 <= v <= 3_000_000 else None   # 500未満は単価(￥162/袋等)と判断して除外
+
+    def pick_from_text(txt: str) -> int | None:
+        if not txt:
             return None
-
-    # 価格表現
-    YEN = r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[¥￥]\s*[0-9０-９]{3,7}|[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|[0-9０-９]{3,7}\s*円)'
-
-    # 読む候補ブロックを作る
-    blocks: list[str] = []
-
-    # A) 「通常の注文」近傍（8,000文字）
-    m = re.search(r'(?:通常の注文|通常のご注文)[\s\S]{0,8000}', H)
-    if m:
-        blocks.append(m.group(0))
-
-    # B) 既知の価格箱（id/class）
-    for bid, span in (
-        ("priceToPay", 4000),
-        ("corePriceDisplay_desktop_feature_div", 6000),
-        ("corePrice_feature_div", 6000),
-        ("corePriceDisplay_mobile_feature_div", 6000),
-        ("apex_desktop", 8000),
-    ):
-        mm = re.search(rf'(?:id=["\']{bid}["\']|class=["\'][^"\']*\b{bid}\b[^"\']*["\'])'  # id または class
-                       rf'([\s\S]{{0,{span}}})', H, re.I)
-        if mm:
-            # id/class も含めて丸ごと使うと a-offscreen が拾いやすい
-            start = mm.start()
-            end   = mm.end()
-            blocks.append(H[start:end])
-
-    # C) 最後の保険：ページ冒頭
-    if not blocks:
-        blocks.append(H[:15000])
-
-    # ブロック毎に“安全な順”で抽出
-    for blk in blocks:
-        # (1) 「価格 → 税込」：価格の直後〜税込の間だけを見る（後ろの「￥162/袋」を無視）
-        m1 = re.search(rf'([0-9０-９][0-9０-９,，]{{2,}})\s*(?:円)?\s*税込', blk)
-        if m1:
-            v = _to_int(m1.group(1))
+        pos_tax = txt.find("税込")
+        cands = list(YEN_RE.finditer(txt))
+        # “税込” より左側で一番近い金額（=本体価格）を優先
+        if pos_tax != -1:
+            left = [m for m in cands if m.end() <= pos_tax + 2]
+            for m in reversed(left):
+                v = to_int(m.group(0))
+                if v is not None:
+                    return v
+        # 次にブロック内の最初の金額
+        for m in cands:
+            v = to_int(m.group(0))
             if v is not None:
                 return v
+        return None
 
-        # (2) a-offscreen
-        for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,60})<', blk, re.I):
-            v = _to_int(m.group(1))
+    # ---- HTML パース
+    try:
+        soup = BeautifulSoup(H, "lxml")
+    except Exception:
+        soup = BeautifulSoup(H, "html.parser")
+
+    # 探索候補ブロック（優先順）
+    blocks = []
+
+    # 1) 「通常の注文」付近のコンテナを最優先
+    lab = soup.find(string=re.compile(r"通常の注文|通常のご注文"))
+    if lab:
+        container = lab.find_parent()
+        # 近い親を少し広げる（最大5段）
+        for _ in range(4):
+            if container and container.parent:
+                container = container.parent
+        if container:
+            blocks.append(container)
+
+    # 2) 既知の価格箱
+    for sel in [
+        "#priceToPay", ".priceToPay",
+        "#corePriceDisplay_desktop_feature_div",
+        "#corePrice_feature_div",
+        "#corePriceDisplay_mobile_feature_div",
+        "#apex_desktop",
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            blocks.append(el)
+
+    # 3) 最後の保険としてページ上部テキスト
+    def try_block(el) -> int | None:
+        # a-offscreen があれば最優先
+        off = el.select_one(".a-offscreen")
+        if off:
+            v = to_int(off.get_text(" ", strip=True))
             if v is not None:
                 return v
-
-        # (3) a-price-whole（小数分割の whole）
-        for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>\s*([0-9０-９,，]{1,10})\s*<', blk, re.I):
-            v = _to_int(m.group(1))
+        # 小数分割の whole
+        whole = el.select_one(".a-price-whole")
+        if whole:
+            v = to_int(whole.get_text(" ", strip=True))
             if v is not None:
                 return v
+        # テキストから “税込の左側” を拾う
+        return pick_from_text(el.get_text(" ", strip=True))
 
-        # (4) ブロック内の最初の “￥/円付き”
-        m4 = re.search(YEN, blk, re.I)
-        if m4:
-            v = _to_int(m4.group(0))
-            if v is not None:
-                return v
+    for el in blocks:
+        v = try_block(el)
+        if v is not None:
+            return v
 
-    return None
-
+    # 最終保険：ページ上部のテキストから
+    head_txt = soup.get_text(" ", strip=True)[:20000]
+    return pick_from_text(head_txt)
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
