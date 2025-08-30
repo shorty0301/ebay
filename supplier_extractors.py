@@ -872,12 +872,7 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """
-    Amazon.co.jp: “税込” 直前の金額を最優先に取る簡潔版。
-    - まず priceToPay / corePrice* / apex_desktop ブロック内で「税込」左側の金額
-    - だめならそのブロック内の .a-offscreen / .a-price-whole
-    - さらにダメならページ上部テキストで「税込」左側の金額
-    """
+    """Amazon.co.jp: ‘税込’ 直前の価格を最優先。割引/定期/クーポン近傍は除外。"""
     import re
     from bs4 import BeautifulSoup
 
@@ -885,108 +880,137 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     if not H_all:
         return None
 
-    # PC/SPを分離（混在すると先頭側ノイズに引っ張られることがある）
     parts = (re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I)
              if "<!-- MOBILE MERGE -->" in H_all else [H_all])
 
-    YEN = re.compile(
-        r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'
-        r'[¥￥]\s*[0-9０-９]{3,7}|'
-        r'[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|'
-        r'[0-9０-９]{3,7}\s*円)'
-    )
-    TAX = re.compile(r"(税込|税込み|消費税込|消費税込み)")
-    Z2H = str.maketrans("０１２３４５６７８９，", "0123456789,")
+    YEN  = re.compile(r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[¥￥]\s*[0-9０-９]{3,7}|[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|[0-9０-９]{3,7}\s*円)')
+    TAX  = re.compile(r"(税込|税込み|消費税込|消費税込み)")
+    STOP = re.compile(r"(クーポン|適用|定期|おトク便|定期便|Subscribe|S&S|まとめ買い|OFF|％|%|割引|ポイント|還元|相当|実質|月額|初回|会員|限定)", re.I)
+    BADL = re.compile(r"(参考価格|定価|希望小売価格|過去価格|中古|レンタル)", re.I)
+    GOOD = re.compile(r"(税込|価格|販売価格|お支払い金額|支払金額|通常の注文|通常注文|今すぐ購入|今すぐ買う|カートに入れる)", re.I)
+    Z2H  = str.maketrans("０１２３４５６７８９，", "0123456789,")
 
-    def _to_int(tok: str) -> int | None:
-        t = re.sub(r"[^\d]", "", (tok or "").translate(Z2H))
+    def _to_int(s: str) -> int | None:
+        t = re.sub(r"[^\d]", "", (s or "").translate(Z2H))
         if not t:
             return None
         v = int(t)
-        return v if 500 <= v <= 3_000_000 else None  # 単価の小額を除外
+        return v if 500 <= v <= 3_000_000 else None  # 小額(単価)除外
+
+    def _score(ctx: str, val: int) -> tuple[int, int]:
+        sc = 0
+        if GOOD.search(ctx): sc += 3
+        if TAX.search(ctx):  sc += 2
+        if STOP.search(ctx): sc -= 5
+        if BADL.search(ctx): sc -= 3
+        # 同点は「大きい金額」を採用（割引側より本体側を優先）
+        return (sc, val)
 
     def _pick_tax_left(txt: str) -> int | None:
-        """テキストから“税込”の直前にある最後の金額を取る"""
         if not txt:
             return None
-        m_tax = TAX.search(txt)
-        if not m_tax:
-            return None
-        left = txt[:m_tax.start()]  # 税込より左側
-        cands = list(YEN.finditer(left))
-        for m in reversed(cands):
-            v = _to_int(m.group(0))
-            if v is not None:
-                return v
-        return None
+        best = None
+        for m in TAX.finditer(txt):
+            i = m.start()
+            left  = txt[max(0, i-80): i]
+            right = txt[i: i+80]
+            cand  = None
+            # 税込の“直前”を最優先
+            for n in reversed(list(YEN.finditer(left))):
+                cand = (n.group(0), txt[max(0, n.start()-60): m.end()+60]); break
+            # 無ければ“直後”
+            if not cand:
+                n = YEN.search(right)
+                if n:
+                    s = n.group(0)
+                    cand = (s, left[-60:] + right[:max(60, n.end()+10)])
+            if not cand:
+                continue
+            v = _to_int(cand[0])
+            if v is None:
+                continue
+            sc = _score(cand[1], v)
+            if (best is None) or (sc > best[0]) or (sc == best[0] and v > best[1]):
+                best = (sc, v)
+        return best[1] if best else None
 
     def _from_block_html(H: str) -> int | None:
-        # 1) ブロック内テキストで “税込の左側”
         try:
-            blk_txt = strip_tags(H)
+            soup = BeautifulSoup(H, "lxml")
         except Exception:
-            blk_txt = BeautifulSoup(H, "lxml").get_text(" ", strip=True)
-        v = _pick_tax_left(blk_txt)
-        if isinstance(v, int):
+            soup = BeautifulSoup(H, "html.parser")
+        txt = soup.get_text(" ", strip=True)
+        # 1) ブロック内 “税込の左/右” 優先
+        v = _pick_tax_left(txt)
+        if v is not None:
             return v
+        # 2) .a-offscreen / .a-price-whole（近傍にSTOPがあれば無効）
+        for sel in [".a-offscreen", ".a-price-whole"]:
+            el = soup.select_one(sel)
+            if not el:
+                continue
+            raw = el.get_text(" ", strip=True)
+            v = _to_int(raw)
+            if v is None:
+                continue
+            par = el.find_parent()
+            ctx = (par.get_text(" ", strip=True) if par else raw)[:220]
+            if not STOP.search(ctx) and not BADL.search(ctx):
+                return v
+        # 3) 文脈スコアで拾う
+        best = None
+        for m in YEN.finditer(txt):
+            v = _to_int(m.group(0))
+            if not v:
+                continue
+            ctx = txt[max(0, m.start()-80): m.end()+80]
+            if STOP.search(ctx) or BADL.search(ctx):
+                continue
+            sc = _score(ctx, v)
+            if (best is None) or (sc > best[0]) or (sc == best[0] and v > best[1]):
+                best = (sc, v)
+        return best[1] if best else None
 
-        # 2) DOMで .a-offscreen / .a-price-whole
+    for H in parts:
+        # まず既知の価格箱 / “通常の注文” コンテナを狙い撃ち
         try:
             soup = BeautifulSoup(H, "lxml")
         except Exception:
             soup = BeautifulSoup(H, "html.parser")
 
-        off = soup.select_one(".a-offscreen")
-        if off:
-            v = _to_int(off.get_text(" ", strip=True))
-            if v is not None:
-                return v
-        whole = soup.select_one(".a-price-whole")
-        if whole:
-            v = _to_int(whole.get_text(" ", strip=True))
-            if v is not None:
-                return v
-
-        # 3) 最後の保険：ブロック内の“￥/円付き”最初の出現
-        m = YEN.search(blk_txt)
-        if m:
-            v = _to_int(m.group(0))
-            if v is not None:
-                return v
-        return None
-
-    # パート（PC/モバイル）ごとに評価
-    for H in parts:
-        # 既知の価格箱を優先的に抽出
         blocks: list[str] = []
-        for pat, span in (
-            (r'id=["\']priceToPay["\']', 4000),
-            (r'class=["\'][^"\']*\bpriceToPay\b', 4000),
-            (r'id=["\']corePriceDisplay_desktop_feature_div["\']', 6000),
-            (r'id=["\']corePrice_feature_div["\']', 6000),
-            (r'id=["\']corePriceDisplay_mobile_feature_div["\']', 6000),
-            (r'id=["\']apex_desktop["\']', 8000),
-        ):
-            m = re.search(pat + r'([\s\S]{0,' + str(span) + r'})', H, re.I)
-            if m:
-                blocks.append(m.group(0))
+        for sel in [
+            "#priceToPay", ".priceToPay",
+            "#corePriceDisplay_desktop_feature_div",
+            "#corePrice_feature_div",
+            "#corePriceDisplay_mobile_feature_div",
+            "#apex_desktop",
+        ]:
+            el = soup.select_one(sel)
+            if el:
+                blocks.append(str(el))
 
-        # ブロック内で“税込左”→.a-offscreen→whole の順にチェック
+        for node in soup.find_all(string=re.compile(r"通常の注文|通常のご注文")):
+            par = getattr(node, "parent", None)
+            for _ in range(4):
+                if par and par.parent:
+                    par = par.parent
+            if par:
+                blocks.append(str(par))
+
         for blk in blocks:
             v = _from_block_html(blk)
-            if isinstance(v, int):
+            if v is not None:
                 return v
 
-        # ブロックが拾えないとき：ページ上部テキストで“税込左”
-        try:
-            head_txt = strip_tags(H)[:20000]
-        except Exception:
-            head_txt = BeautifulSoup(H, "html.parser").get_text(" ", strip=True)[:20000]
-        v = _pick_tax_left(head_txt)
-        if isinstance(v, int):
+        # ブロックが無いときは上部テキストで“税込の左”
+        page_txt = soup.get_text(" ", strip=True)[:20000]
+        v = _pick_tax_left(page_txt)
+        if v is not None:
             return v
 
     return None
+
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
