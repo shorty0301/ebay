@@ -985,7 +985,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             return v
 
     # (2) a-price-whole（小数分割のときは整数部だけ拾う）
-   for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
+    for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>([\d,，]{1,10})<', blk, re.I):
        token = m.group(1)
        ctx   = blk[max(0, m.start()-140): m.end()+140]
        if STOP.search(ctx) or _is_threshold_free_shipping(ctx):
