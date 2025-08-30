@@ -957,17 +957,19 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         except Exception:
             pass  # lxml なし or 失敗 → regex fallback
 
-        # --- regex フォールバック（価格箱ブロックだけ） ---
-        blk = ""
-        for bid, span in (("priceToPay", 3000),
-                          ("corePriceDisplay_desktop_feature_div", 6000),
-                          ("corePrice_feature_div", 6000),
-                          ("corePriceDisplay_mobile_feature_div", 6000),
-                          ("apex_desktop", 8000)):
-            m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
-            if m:
-                blk = m.group(1); break
-        if not blk:
+    # --- regex フォールバック（価格箱ブロックだけ） ---
+    blk = ""
+    for bid, span in (("priceToPay", 3000),
+                  ("corePriceDisplay_desktop_feature_div", 6000),
+                  ("corePrice_feature_div", 6000),
+                  ("corePriceDisplay_mobile_feature_div", 6000),
+                  ("apex_desktop", 8000)):
+    m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
+    if m:
+        blk = m.group(1)
+        break
+
+    if not blk:
         # ---- 最終保険：上部テキストのラベル近傍（フッター年号は見ない） ----
         try:
             T = strip_tags(H).replace("\u3000", " ").replace("\u00A0", " ")
@@ -975,40 +977,52 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             T = re.sub("<[^>]+>", " ", H)
         head = T[:15000]  # 上部だけ見る
 
-        STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|通常配送無料|配送料無料|送料無料|以上で)", re.I)
-        LABELS = r"(通常の注文|税込|価格|販売価格|お支払い金額|支払金額)"
+        STOP   = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|%|％|ギフト券|通常配送無料|配送料無料|送料無料|以上で)", re.I)
+        LABELS = r"(?:通常の注文|税込|価格|販売価格|お支払い金額|支払金額)"
         YEN    = r"(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]?\s*\d{3,7})"
 
         # ラベル → 金額
-        for m in re.finditer(LABELS + r"[^\d¥￥]{0,20}" + YEN, head, re.I):
-            ctx = head[max(0, m.start()-40): m.end()+40]
+        pat_l2y = re.compile(rf"{LABELS}[^\d¥￥]{{0,20}}({YEN})", re.I)
+        for m in pat_l2y.finditer(head):
+            tok = m.group(1)
+            ctx = head[max(0, m.start()-60): m.end()+60]
             if STOP.search(ctx):
                 continue
-            v = _to(m.group(0))
-            if v and not (1900 <= v <= 2100):
+            v = _to(tok)
+            # 年号っぽい裸数字は除外（通貨/円が無い 1900〜2100）
+            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
                 return v
 
         # 金額 → ラベル
-        for m in re.finditer(YEN + r"[^\d¥￥]{0,20}" + LABELS, head, re.I):
-            ctx = head[max(0, m.start()-40): m.end()+40]
+        pat_y2l = re.compile(rf"({YEN})[^\d¥￥]{{0,20}}{LABELS}", re.I)
+        for m in pat_y2l.finditer(head):
+            tok = m.group(1)
+            ctx = head[max(0, m.start()-60): m.end()+60]
             if STOP.search(ctx):
                 continue
-            v = _to(m.group(0))
-            if v and not (1900 <= v <= 2100):
+            v = _to(tok)
+            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
                 return v
 
         # 出現多数（モード）で拾う（同額が2回以上出たらそれ）
         from collections import Counter
-        vals = []
-        for m in re.finditer(r"[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}", head):
-            v = _to(m.group(0))
-            if v:
-                vals.append(v)
+        vals: list[int] = []
+        for m in re.finditer(rf"{YEN}", head, re.I):
+            tok = m.group(0)
+            v = _to(tok)
+            if v is None:
+                continue
+            if 1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok):
+                continue
+            vals.append(v)
+
         if vals:
             v, cnt = Counter(vals).most_common(1)[0]
-            if cnt >= 2 and not (1900 <= v <= 2100):
+            if cnt >= 2:
                 return v
+
         return None
+
 
         # offscreen（￥/円 なくてもOK）
         for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I):
