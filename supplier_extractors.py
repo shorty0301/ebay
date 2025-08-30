@@ -872,41 +872,28 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
+    """
+    Amazon.co.jp: 価格箱と「税込」近傍だけから支払価格を抽出。
+    - 価格箱(#priceToPay / #corePrice* / #apex_desktop)内の「税込」に最も近い金額を最優先
+    - 次に「通常の注文」ブロック
+    - 最後にページ全体の「税込」近傍
+    - 500円未満や「/袋」「/個」「ポイント」「％」「OFF」「送料」近傍は除外
+    """
     import re
+
     H = str(html or "")
     if not H:
         return None
 
-    # 価格のある“価格箱”ブロックを切り出す
-    BLOCKS = [
-        ("priceToPay", 4000),
-        ("corePriceDisplay_desktop_feature_div", 7000),
-        ("corePrice_feature_div", 7000),
-        ("corePriceDisplay_mobile_feature_div", 7000),
-        ("apex_desktop", 9000),
-    ]
-    blk = ""
-    for bid, span in BLOCKS:
-        m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
-        if m:
-            blk = m.group(0)  # ← 見出しも含めて読む
-            break
-    if not blk:
-        # 価格箱が見当たらないページ（簡易DPでない等）はテキスト保険だけに回す
-        blk = H[:20000]
-
-    # 役に立つパターン
+    # 金額（全角数字・全角カンマ対応）
     YEN = re.compile(
         r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'
         r'[¥￥]\s*[0-9０-９]{3,7}|'
         r'[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|'
-        r'[0-9０-９]{3,7}\s*円)', re.I
+        r'[0-9０-９]{3,7}\s*円)'
     )
-    BAD_NEAR = re.compile(
-        r"(ポイント|pt|還元|%|％|OFF|円OFF|クーポン|相当|円相当|"
-        r"以上|超|から|送料|配送料|手数料|/袋|/個|/枚|/本|/g|/kg|/ml|/l)",
-        re.I
-    )
+    BAD_NEAR = re.compile(r"(ポイント|pt|還元|%|％|OFF|円OFF|クーポン|相当|円相当|以上|超|から|送料|配送料|/袋|/個)", re.I)
+
     def _to_int(s: str) -> int | None:
         t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
         if not t:
@@ -914,53 +901,73 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         v = int(t)
         return v if 500 <= v <= 3_000_000 else None
 
-    # 1) a-offscreen（最優先：見た目の “￥1,620”）
-    for m in re.finditer(
-        r'class=["\'][^"\']*\ba-offscreen\b[^"\']*["\'][^>]*>\s*([¥￥]?\s*[0-9０-９][0-9０-９,，]{0,8})(?:\s*円)?\s*<',
-        blk, re.I
-    ):
-        tok = m.group(1)
-        win = blk[max(0, m.start()-80): m.end()+80]
-        if BAD_NEAR.search(win):  # /袋 などの単価は除外
-            continue
-        v = _to_int(tok)
-        if v is not None:
-            return v
-
-    # 2) a-price-whole（小数分割の whole 部分）
-    for m in re.finditer(
-        r'class=["\'][^"\']*\ba-price-whole\b[^"\']*["\'][^>]*>\s*([0-9０-９,，]{1,10})\s*<',
-        blk, re.I
-    ):
-        v = _to_int(m.group(1))
-        if v is not None:
-            return v
-
-    # 3) 「税込」の近傍（±80 文字）にある金額を優先
-    cands: list[int] = []
-    for m in re.finditer(r"税込", blk, re.I):
-        seg = blk[max(0, m.start()-80): m.end()+80]
-        for n in YEN.finditer(seg):
-            win = seg[max(0, n.start()-40): n.end()+40]
-            if BAD_NEAR.search(win):
+    def _pick_in_block(block: str) -> int | None:
+        if not block:
+            return None
+        # まず「税込」位置
+        tax_pos = block.find("税込")
+        # 候補収集（NGワード近傍/小額は除外）
+        candidates: list[tuple[int, int, int, int]] = []  # (score, start, end, value)
+        for m in YEN.finditer(block):
+            s, e = m.start(), m.end()
+            ctx = block[max(0, s-60): e+60]
+            if BAD_NEAR.search(ctx):
                 continue
-            v = _to_int(n.group(0))
-            if v is not None:
-                cands.append(v)
-    if cands:
-        # 単価や割引の小さい数字を避けるため税込近傍は最大値を採る
-        return max(cands)
+            v = _to_int(m.group(0))
+            if v is None:
+                continue
+            # スコア: 「税込」に近いほど高評価、タグ内先頭ほど少し加点
+            score = 0
+            if tax_pos != -1:
+                # 税込より左側（本体価格）を優先
+                if e <= tax_pos + 2:
+                    score += 20
+                # 税込までの距離の逆数
+                score += max(0, 12 - abs((tax_pos - e)//10))
+            # “円/¥” 表記は微加点（裸数字より確度高）
+            if re.search(r"[¥￥]|円", m.group(0)):
+                score += 2
+            candidates.append((score, s, e, v))
 
-    # 4) 最終保険：ブロック内の最初の “まともな金額”
-    for m in YEN.finditer(blk):
-        win = blk[max(0, m.start()-40): m.end()+40]
-        if BAD_NEAR.search(win):
-            continue
-        v = _to_int(m.group(0))
-        if v is not None:
+        if not candidates:
+            return None
+        # 最高スコアの中から最小値（通常価格）を返す
+        best = max(c[0] for c in candidates)
+        return min(c[3] for c in candidates if c[0] == best)
+
+    # 1) 価格箱
+    for bid, span in (
+        ("priceToPay", 3000),
+        ("corePriceDisplay_desktop_feature_div", 6000),
+        ("corePrice_feature_div", 6000),
+        ("corePriceDisplay_mobile_feature_div", 6000),
+        ("apex_desktop", 8000),
+    ):
+        m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
+        if m:
+            v = _pick_in_block(m.group(1))
+            if isinstance(v, int):
+                return v
+
+    # 2) 「通常の注文」ブロック
+    m = re.search(r"(通常の(?:ご)?注文[\s\S]{0,1200})", H)
+    if m:
+        v = _pick_in_block(m.group(1))
+        if isinstance(v, int):
             return v
+
+    # 3) ページ全体：『税込』周辺だけを走査
+    vals: list[int] = []
+    for t in re.finditer(r"税込", H[:200000]):
+        seg = H[max(0, t.start()-400): t.end()+400]
+        v = _pick_in_block(seg)
+        if isinstance(v, int):
+            vals.append(v)
+    if vals:
+        return min(vals)
 
     return None
+
 
 
 
