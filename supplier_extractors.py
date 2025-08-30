@@ -1043,73 +1043,114 @@ def price_from_mercari(html: str, text: str) -> int | None:
 
 # ==== Mercari専用：Playwright 同期フォールバック（合体版） ====
 def mercari_price_via_playwright_sync(url: str, timeout_ms: int = 60000, headless: bool = True, retries: int = 2) -> int | None:
-    """
-    requestsで価格が取れない場合だけ呼ぶ保険。
-    - Playwright未インストール or 失敗時は None を返す
-    - 他サイトの挙動には一切影響なし
-    """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     except Exception:
-        return None  # Playwrightが無ければ何もしない
+        return None
 
-    YEN_MARK = re.compile(r"(?:￥|¥)\s*([0-9０-９][0-9０-９,，]{2,})")  # 例: ¥12,345
-    YEN_EN   = re.compile(r"([0-9０-９][0-9０-９,，]{2,})\s*円")          # 例: 12,345円
-
-    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    YEN_MARK = re.compile(r"(?:￥|¥)\s*([0-9０-９][0-9０-９,，]{2,})")
+    YEN_EN   = re.compile(r"([0-9０-９][0-9０-９,，]{2,})\s*円")
 
     def _pick_from_text(txt: str) -> int | None:
         m = YEN_MARK.search(txt) or YEN_EN.search(txt)
-        if not m:
-            return None
-        return to_int_yen(m.group(1))  # 既存ユーティリティを利用
+        return to_int_yen(m.group(1)) if m else None
 
-    for _ in range(max(1, retries)):
+    UA_PC = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    UA_MB = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
+
+    def _try_once(playwright, ua: str, is_mobile: bool) -> int | None:
+        browser = playwright.chromium.launch(headless=headless)
+        ctx = browser.new_context(
+            user_agent=ua,
+            locale="ja-JP",
+            extra_http_headers={"Accept-Language": "ja,en;q=0.8"},
+            viewport={"width": 390, "height": 844} if is_mobile else {"width": 1400, "height": 900},
+            device_scale_factor=3 if is_mobile else 1,
+            is_mobile=is_mobile,
+            has_touch=is_mobile,
+        )
+        page = ctx.new_page()
+
+        # --- ネットワークのJSONから "price" を横取り ---
+        captured_price: int | None = None
+
+        def _on_response(resp):
+            nonlocal captured_price
+            if captured_price is not None:
+                return
+            try:
+                ct = (resp.headers or {}).get("content-type", "")
+                if "application/json" in ct or "text/plain" in ct:
+                    body = resp.text()
+                    m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', body)
+                    if m:
+                        v = to_int_yen(m.group(1))
+                        if v:
+                            captured_price = v
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
+
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=headless)
-                ctx = browser.new_context(
-                    user_agent=UA,
-                    locale="ja-JP",
-                    extra_http_headers={"Accept-Language": "ja,en;q=0.8"},
-                    viewport={"width": 1400, "height": 900},
-                )
-                page = ctx.new_page()
-                try:
-                    page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-                except PWTimeout:
-                    ctx.close(); browser.close()
-                    return None
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except PWTimeout:
+            ctx.close(); browser.close()
+            return None
 
-                # ボタン出現を待ってから少し待機（SPA対策／非表示でも続行）
-                try:
-                    page.wait_for_selector("text=購入手続きへ, text=購入に進む", timeout=20000)
-                except PWTimeout:
-                    pass
-                page.wait_for_timeout(1000)
+        # 多少描画を待つ（API呼び出しも走らせる）
+        page.wait_for_timeout(1200)
 
-                # 1) 可視テキストから最短で拾う（¥ / 円 の両方）
-                body_text = page.inner_text("body")
-                v = _pick_from_text(body_text)
-                if v:
-                    ctx.close(); browser.close()
-                    return v
+        # 1) ネットワーク捕捉で取れていたら即返す
+        if captured_price:
+            ctx.close(); browser.close()
+            return captured_price
 
-                # 2) JSON保険（例: __NEXT_DATA__ 等に "price": 12345 があるケース）
-                html = page.content()
-                m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', html)
-                if m:
-                    v = to_int_yen(m.group(1))
-                    if v:
-                        ctx.close(); browser.close()
-                        return v
-
-                ctx.close(); browser.close()
+        # 2) 画面テキストから拾う（売切れでも見出しに残る場合あり）
+        try:
+            body_text = page.inner_text("body")
         except Exception:
-            # リトライ継続
-            continue
+            body_text = ""
+        v = _pick_from_text(body_text)
+        if v:
+            ctx.close(); browser.close()
+            return v
+
+        # 3) DOMソース(JSON埋め込み)の保険
+        html = page.content()
+        m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', html)
+        if m:
+            v = to_int_yen(m.group(1))
+            if v:
+                ctx.close(); browser.close()
+                return v
+
+        # --- デバッグ吐き（必要に応じてコメントアウト可） ---
+        try:
+            with open("debug_pw_dom.html", "w", encoding="utf-8") as f:
+                f.write(html)
+            with open("debug_pw_body.txt", "w", encoding="utf-8") as f:
+                f.write(body_text)
+            page.screenshot(path="debug_pw.png", full_page=True)
+        except Exception:
+            pass
+
+        ctx.close(); browser.close()
+        return None
+
+    # PC UA → 取れなければ Mobile UA の順で試す
+    for _ in range(max(1, retries)):
+        with sync_playwright() as p:
+            v = _try_once(p, UA_PC, is_mobile=False)
+            if v:
+                return v
+            v = _try_once(p, UA_MB, is_mobile=True)
+            if v:
+                return v
     return None
+
 
 # ======== Rakuten helpers (GAS移植) =========
 def _availability_from_meta_or_ld(html: str) -> str | None:
