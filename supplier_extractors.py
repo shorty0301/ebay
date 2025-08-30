@@ -872,6 +872,20 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
+    """
+    まず超速スニッファで即決 → 取れない場合のみ従来(BeautifulSoup)へ。
+    他サイトには一切影響しない。
+    """
+    # 0) ロボット/ブロックページは無視
+    if re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", str(html or ""), re.I):
+        return None
+
+    # 1) 高速スニッファで最短抽出
+    v = _amz_price_fast_sniff(html)
+    if isinstance(v, int):
+        return v
+
+    # 2) 従来の安全なフォールバック（元のコードのノウハウ維持）
     import re
     from bs4 import BeautifulSoup
 
@@ -879,7 +893,6 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     if not H:
         return None
 
-    # 金額パターン（薄い空白も吸収）
     YEN = re.compile(
         r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'
         r'[¥￥]\s*[0-9０-９]{3,7}|'
@@ -889,7 +902,6 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
 
     def _to_int(tok: str, ctx: str = "") -> int | None:
         s = tok or ""
-        # 通貨有無を先に判定
         has_currency = bool(re.search(r"[¥￥]|円", s))
         t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
         if not t:
@@ -897,10 +909,8 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         v = int(t)
         if v < 500 or v > 3_000_000:
             return None
-        # ★年号ガードの緩和：通貨なし かつ “ぴったり4桁数字のみ” の時だけ弾く
-        if 1900 <= v <= 2100:
-            if (not has_currency) and re.fullmatch(r"\D*([12]\d{3})\D*", tok) and re.fullmatch(r"\d{4}", t):
-                return None
+        if 1900 <= v <= 2100 and (not has_currency) and re.fullmatch(r"\d{4}", t):
+            return None
         return v
 
     try:
@@ -908,7 +918,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     except Exception:
         soup = BeautifulSoup(H, "html.parser")
 
-    # ★(A) グローバル価格箱をまず見る（ブロック検出に失敗しても拾えるように）
+    # (A) 代表的な価格箱
     for sel in (
         "#priceToPay .a-offscreen",
         "#corePriceDisplay_desktop_feature_div .a-offscreen",
@@ -923,7 +933,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             if v is not None:
                 return v
 
-    # --- (B) 「通常の注文」≒「一回限りの購入」ブロック検出を広げる ---
+    # (B) 「通常の注文」ブロック
     label_nodes = soup.find_all(string=re.compile(r"(通常の注文|通常のご注文|一回限りの購入|一度のみの購入)"))
     blocks = []
 
@@ -943,11 +953,9 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if not row:
             continue
         txt = row.get_text(" ", strip=True)
-        # 定期/おトク便は禁止
         if re.search(r"(定期|おトク便|サブスク)", txt):
             continue
         blocks.append(row)
-        # 近傍の兄弟も少しだけ追加（が、定期ワードが出たら打ち切り）
         sib = row.next_sibling; hop = 0
         while sib and hop < 5:
             st = getattr(sib, "get_text", lambda *a, **k: "")(" ", strip=True)
@@ -957,10 +965,8 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 blocks.append(sib)
             sib = sib.next_sibling; hop += 1
 
-    # --- (C) ブロック内で「税込 / 税込み」優先 → a-offscreen → whole ---
     def _price_in_block(node) -> int | None:
         txt = node.get_text(" ", strip=True)
-        # ★「税込み」も含める
         for m in re.finditer(r"税込(?:み)?", txt):
             seg = txt[max(0, m.start()-120): m.end()+120]
             n = YEN.search(seg)
@@ -988,7 +994,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if isinstance(v, int):
             return v
 
-    # --- (D) 最後の保険：購入ボタン近傍（定期ワードは排除） ---
+    # (C) ボタン近傍の保険（定期は排除）
     body_txt = soup.get_text(" ", strip=True)
     for m in re.finditer(r"(カートに入れる|今すぐ購入|今すぐ買う)", body_txt):
         seg = body_txt[max(0, m.start()-1200): m.end()+1200]
@@ -1001,6 +1007,7 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                 return v
 
     return None
+
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
@@ -1016,8 +1023,7 @@ def stock_from_amazon_jp(html: str, text: str) -> str | None:
     if re.search(r"(売り切れ|在庫切れ|SOLD\s*OUT)", t, re.I):
         return "OUT_OF_STOCK"
     return None
-
-
+    
 def amazon_price_via_playwright_sync(url: str, timeout_ms: int = 45000, headless: bool = True) -> int | None:
     """
     任意の最終保険。Playwrightがない環境ではNoneを返すだけ（他サイト無影響）。
@@ -1070,6 +1076,109 @@ def amazon_price_via_playwright_sync(url: str, timeout_ms: int = 45000, headless
                 continue
 
         ctx.close(); br.close()
+    return None
+
+
+
+def _amz_price_fast_sniff(html: str) -> int | None:
+    """
+    Amazon.co.jp の価格を最短で抜く高速スニッファ（正規表現中心・HTML長でも高速）
+    - a-offscreen / priceToPay / priceblock_* / JSON-LD / meta を広くカバー
+    - 年号(XXXX)の誤検出は「通貨記号なしの4桁のみ」の場合に限り除外
+    - 500〜3,000,000 のみ有効
+    """
+    import re, json as _json
+
+    H = str(html or "")
+    if not H:
+        return None
+
+    # 1) 代表的な“画面上の価格”要素（最優先）
+    #    - .a-offscreen は現在のAmazon価格表示の本命
+    sel_like = [
+        r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',    # 例: <span class="a-offscreen">¥12,345</span>
+        r'id=["\']priceblock_ourprice["\'][^>]*>\s*([^<]{1,40})<',
+        r'id=["\']priceblock_dealprice["\'][^>]*>\s*([^<]{1,40})<',
+        r'id=["\']sns-base-price["\'][^>]*>\s*([^<]{1,40})<',
+        r'id=["\']corePriceDisplay_desktop_feature_div["\'][\s\S]{0,400}?class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',
+        r'id=["\']corePrice_feature_div["\'][\s\S]{0,400}?class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',
+        r'id=["\']apex_desktop["\'][\s\S]{0,800}?class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',
+        r'id=["\']corePriceDisplay_mobile_feature_div["\'][\s\S]{0,400}?class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})<',
+    ]
+    money_token = r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[¥￥]\s*[0-9０-９]{3,7}|[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|[0-9０-９]{3,7}\s*円)'
+    yen_num = re.compile(money_token)
+
+    def _to_int(tok: str) -> int | None:
+        s = tok or ""
+        has_currency = bool(re.search(r"[¥￥]|円", s))
+        t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
+        if not t:
+            return None
+        v = int(t)
+        # 年号っぽさの誤検出は「通貨記号なし & 4桁ピッタリ」の時のみ排除
+        if 1900 <= v <= 2100 and (not has_currency) and re.fullmatch(r"\d{4}", t):
+            return None
+        return v if 500 <= v <= 3_000_000 else None
+
+    for rx in sel_like:
+        m = re.search(rx, H, re.I)
+        if m:
+            t = m.group(1)
+            n = yen_num.search(t) or re.search(r'[¥￥]?\s*\d[\d,，]{2,}', t)
+            if n:
+                v = _to_int(n.group(0))
+                if v is not None:
+                    return v
+
+    # 2) JSON-LD / メタ（ページ種別によりここにだけ出る事がある）
+    #   JSON-LD中の "price": ..., "lowPrice": ...
+    for script in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', H, re.I):
+        raw = re.sub(r"//.*?$|/\*.*?\*/", "", script, flags=re.S | re.M)
+        raw = re.sub(r",\s*([}\]])", r"\1", raw)
+        try:
+            data = _json.loads(raw)
+        except Exception:
+            continue
+
+        def walk(o):
+            if isinstance(o, dict):
+                for k in ("price", "lowPrice", "lowprice"):
+                    if k in o:
+                        v = _to_int(str(o[k]))
+                        if v is not None:
+                            return v
+                for vv in o.values():
+                    r = walk(vv)
+                    if r is not None:
+                        return r
+            elif isinstance(o, list):
+                for it in o:
+                    r = walk(it)
+                    if r is not None:
+                        return r
+            return None
+        v = walk(data)
+        if v is not None:
+            return v
+
+    # 3) meta: product/og price
+    for rx in [
+        r'(?:name|property)=["\'](?:product:price:amount|og:price:amount)["\'][^>]*content=["\']([^"\']+)',
+        r'itemprop=["\']price["\'][^>]*content=["\']([^"\']+)',
+    ]:
+        for m in re.finditer(rx, H, re.I):
+            v = _to_int(m.group(1))
+            if v is not None:
+                return v
+
+    # 4) 最後の保険：本文中の通貨付きトークン（先頭域優先）
+    head = H[:100000]  # 充分広いが線形
+    mm = yen_num.findall(head)
+    for tok in mm:
+        v = _to_int(tok)
+        if v is not None:
+            return v
+
     return None
 
 
@@ -1597,8 +1706,9 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         if s: stock = s
         price = price_from_surugaya(html, text)
     # ========== Amazon.co.jp ==========
+        # ========== Amazon.co.jp ==========
     elif ("amazon.co.jp" in host) or host.endswith(".amazon.co.jp"):
-        dp_url = None  # 先に用意しておく（未定義参照を防止）
+        dp_url = None
 
         if debug:
             H = html or ""
@@ -1611,29 +1721,29 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
                 "priceToPay_id":    bool(re.search(r'id=["\']priceToPay["\']', H, re.I)),
                 "priceToPay_class": bool(re.search(r'class=["\'][^"\']*\bpriceToPay\b', H, re.I)),
                 "aOffscreen": bool(re.search(r'class=["\']a-offscreen["\']', H, re.I)),
-                "buyNow":     bool(re.search(r"(今すぐ買う|Buy Now)", T)),
+                "buyNow":     bool(re.search(r"(今すぐ買う|今すぐ購入|Buy Now)", T)),
                 "addCart":    bool(re.search(r"(カートに入れる|Add to Cart)", T)),
                 "unavail":    bool(re.search(r"(現在お取り扱いできません|Currently unavailable)", T, re.I)),
                 "robot":      bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", H, re.I)),
             })
 
-        # まずは手元のHTMLから判定
+        # 在庫・価格（まず手元HTML）
         s = stock_from_amazon_jp(html, text)
         if s:
             stock = s
         price = price_from_amazon_jp(html, text)
 
-        # /dp/ への追撃が必要か
+        # /dp/ 追撃は「価格が未取得」または「Robot/短HTML/非dpURL」などのときのみ
         need_follow = (
-            (price is None and stock in ("UNKNOWN", "", None)) or
-            (not re.search(r"/(dp|gp/product)/", url)) or
-            (len(html or "") < 3000) or
-            bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", html or "", re.I))
+            (price is None) and (
+                (not re.search(r"/(dp|gp/product)/", url)) or
+                (len(html or "") < 3000) or
+                bool(re.search(r"(Robot Check|captcha|ロボットによる|自動アクセス|enable cookies)", html or "", re.I))
+            )
         )
         if CI_MODE:
             need_follow = False
 
-        # /dp/ を推定して再取得（1回だけ）
         if need_follow:
             try:
                 dp_url = _amz_guess_dp_url(host, url, html)
@@ -1651,11 +1761,11 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
                     if p2 is not None:
                         price = p2
                     if debug:
-                         print("[AMZ] has_offscreen=", bool(re.search(r'class=["\']a-offscreen["\']', html or "", re.I)))
+                        print("[AMZ] follow_dp=", dp_url, " price=", p2)
                 except Exception:
                     pass
 
-        # 最終保険：Playwright（dp_url が取れていればそちらを優先）
+        # 最終保険：Playwright（他サイト影響なし）
         if price is None and PLAYWRIGHT_ENABLED:
             try:
                 p3 = amazon_price_via_playwright_sync(dp_url or url, headless=True)
