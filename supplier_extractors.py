@@ -1042,16 +1042,17 @@ def price_from_mercari(html: str, text: str) -> int | None:
     return None
 
 # ==== Mercari専用：Playwright 同期フォールバック（合体版） ====
-def mercari_price_via_playwright_sync(url: str, timeout_ms: int = 60000, headless: bool = True, retries: int = 2) -> int | None:
+def mercari_price_via_playwright_sync(url: str, timeout_ms: int = 60000, headless: bool = False, retries: int = 1) -> int | None:
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     except Exception:
+        print("[PW] module not available")
         return None
 
     YEN_MARK = re.compile(r"(?:￥|¥)\s*([0-9０-９][0-9０-９,，]{2,})")
     YEN_EN   = re.compile(r"([0-9０-９][0-9０-９,，]{2,})\s*円")
 
-    def _pick_from_text(txt: str) -> int | None:
+    def _to_price_from_text(txt: str) -> int | None:
         m = YEN_MARK.search(txt) or YEN_EN.search(txt)
         return to_int_yen(m.group(1)) if m else None
 
@@ -1060,95 +1061,89 @@ def mercari_price_via_playwright_sync(url: str, timeout_ms: int = 60000, headles
     UA_MB = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
 
-    def _try_once(playwright, ua: str, is_mobile: bool) -> int | None:
+    def _try(playwright, ua: str, is_mobile: bool) -> int | None:
+        print(f"[PW] try UA={'MB' if is_mobile else 'PC'} headless={headless}")
         browser = playwright.chromium.launch(headless=headless)
         ctx = browser.new_context(
-            user_agent=ua,
-            locale="ja-JP",
+            user_agent=ua, locale="ja-JP",
             extra_http_headers={"Accept-Language": "ja,en;q=0.8"},
             viewport={"width": 390, "height": 844} if is_mobile else {"width": 1400, "height": 900},
             device_scale_factor=3 if is_mobile else 1,
-            is_mobile=is_mobile,
-            has_touch=is_mobile,
+            is_mobile=is_mobile, has_touch=is_mobile,
         )
         page = ctx.new_page()
 
-        # --- ネットワークのJSONから "price" を横取り ---
         captured_price: int | None = None
 
+        # ❶ ネットワークのJSONレスポンスから直接 price を拾う
         def _on_response(resp):
             nonlocal captured_price
             if captured_price is not None:
                 return
             try:
+                url_l = resp.url.lower()
                 ct = (resp.headers or {}).get("content-type", "")
-                if "application/json" in ct or "text/plain" in ct:
+                if ("application/json" in ct or "text/plain" in ct) and ("item" in url_l or "items" in url_l):
                     body = resp.text()
                     m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', body)
                     if m:
                         v = to_int_yen(m.group(1))
+                        print(f"[PW] resp hit {resp.url} -> {v}")
                         if v:
                             captured_price = v
-            except Exception:
-                pass
+            except Exception as e:
+                print("[PW] resp err", e)
 
         page.on("response", _on_response)
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.goto(url, wait_until="load", timeout=timeout_ms)
         except PWTimeout:
-            ctx.close(); browser.close()
-            return None
+            print("[PW] timeout goto")
+            ctx.close(); browser.close(); return None
 
-        # 多少描画を待つ（API呼び出しも走らせる）
-        page.wait_for_timeout(1200)
+        # ほんの少し待つ（API→描画のため）
+        page.wait_for_timeout(2500)
 
-        # 1) ネットワーク捕捉で取れていたら即返す
         if captured_price:
-            ctx.close(); browser.close()
-            return captured_price
+            ctx.close(); browser.close(); return captured_price
 
-        # 2) 画面テキストから拾う（売切れでも見出しに残る場合あり）
+        # ❷ 画面テキストから
         try:
             body_text = page.inner_text("body")
         except Exception:
             body_text = ""
-        v = _pick_from_text(body_text)
+        v = _to_price_from_text(body_text)
         if v:
-            ctx.close(); browser.close()
-            return v
+            print("[PW] text hit ->", v)
+            ctx.close(); browser.close(); return v
 
-        # 3) DOMソース(JSON埋め込み)の保険
+        # ❸ DOM のHTMLから（埋め込みJSONの保険）
         html = page.content()
         m = re.search(r'"price"\s*:\s*"?(\d{3,7})"?', html)
         if m:
             v = to_int_yen(m.group(1))
             if v:
-                ctx.close(); browser.close()
-                return v
+                print("[PW] html hit ->", v)
+                ctx.close(); browser.close(); return v
 
-        # --- デバッグ吐き（必要に応じてコメントアウト可） ---
+        # デバッグ吐き
         try:
-            with open("debug_pw_dom.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            with open("debug_pw_body.txt", "w", encoding="utf-8") as f:
-                f.write(body_text)
+            with open("debug_pw_dom.html", "w", encoding="utf-8") as f: f.write(html)
+            with open("debug_pw_body.txt", "w", encoding="utf-8") as f: f.write(body_text)
             page.screenshot(path="debug_pw.png", full_page=True)
-        except Exception:
-            pass
+            print("[PW] wrote debug_pw_dom.html / debug_pw_body.txt / debug_pw.png")
+        except Exception as e:
+            print("[PW] debug write err", e)
 
         ctx.close(); browser.close()
         return None
 
-    # PC UA → 取れなければ Mobile UA の順で試す
-    for _ in range(max(1, retries)):
-        with sync_playwright() as p:
-            v = _try_once(p, UA_PC, is_mobile=False)
-            if v:
-                return v
-            v = _try_once(p, UA_MB, is_mobile=True)
-            if v:
-                return v
+    with sync_playwright() as p:
+        v = _try(p, UA_PC, is_mobile=False)
+        if v: return v
+        v = _try(p, UA_MB, is_mobile=True)
+        if v: return v
     return None
 
 
@@ -1563,10 +1558,11 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
         if price is None:
             try:
                 v = mercari_price_via_playwright_sync(url, timeout_ms=90_000, headless=false, retries=1)
+                print("[PW fallback]", v)
                 if isinstance(v, int):
                     price = v
-            except Exception:
-                pass
+            except Exception as e:
+                print("[PW fallback err]", e)
         
     elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp")) or ("rakuten.co.jp" in host):
         # 価格
