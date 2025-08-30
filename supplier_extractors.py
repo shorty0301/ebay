@@ -928,6 +928,24 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
                     if v:
                         return v
 
+            # (b-1) a-offscreen（￥/円 無しでも許容 だが小額は厳しめ）
+            STOP = re.compile(r"(ポイント|pt|還元|クーポン|OFF|円OFF|割引|ギフト券|%|％)", re.I)
+
+            for m in re.finditer(
+                r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I
+            ):
+                tok = m.group(1)
+                win = blk[max(0, m.start()-60): m.end()+60]
+                if STOP.search(win):
+                    continue
+
+                v = _to(tok)
+                if v:
+                    if 1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok):
+                        continue
+                    return v
+
+
             # (a-2) a-price-whole（小数分割）
             for r in roots:
                 wholes = r.xpath('.//span[contains(@class,"a-price-whole")]/text()')
