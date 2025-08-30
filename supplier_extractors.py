@@ -872,164 +872,124 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp 価格抽出（価格箱だけを見る安全版）
-    - PC/SPを分割（fetch_htmlが <!-- MOBILE MERGE --> を挿入）
-    - priceToPay / corePriceDisplay_* / corePrice_* / apex_desktop の直下だけを読む
-    - .a-offscreen → a-price-whole(+fraction) → 旧ID → JSON-LDの順
-    - 本文の広域スキャンは一切しない（年号/クーポン数字の誤爆を防止）
+    Amazon.co.jp の価格を “価格箱” だけから取る最小実装。
+    - 最優先: priceToPay（id でも class でも可）内の .a-offscreen
+    - 次点: corePriceDisplay_* / corePrice_* / apex_desktop 内の .a-offscreen
+    - 旧IDの priceblock_* も保険
+    - 本文スキャンはしない（1540/年号/しきい値などを避ける）
     """
     import re
+
     H_all = str(html or "")
 
-    # PC/SP を分割
-    parts = (
-        re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I)
-        if "<!-- MOBILE MERGE -->" in H_all
-        else [H_all]
-    )
+    # fetch_html が PC/モバイルを結合している場合に備えて分割
+    parts = (re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I)
+             if "<!-- MOBILE MERGE -->" in H_all else [H_all])
 
     def _to_int(token: str) -> int | None:
-        # 通貨ありは通常パース、無ければ数字だけ（a-price-whole対策）
+        # “¥162/袋” の 162 を誤採用しないよう 500円未満は棄却
         v = to_int_yen(token)
-        if isinstance(v, int) and 100 <= v <= 3_000_000:
-            return v
-        t = re.sub(r"[^\d]", "", token or "")
-        if not t:
-            return None
-        try:
-            v = int(t)
-            return v if 100 <= v <= 3_000_000 else None
-        except Exception:
-            return None
+        if v is None:
+            t = re.sub(r"[^\d]", "", token or "")
+            v = int(t) if t else None
+        return v if (v is not None and 500 <= v <= 3_000_000) else None
 
-    # 価格箱ID群
-    BOX_XPATH = (
-        '//*[@id="priceToPay" or '
-        'contains(@id,"corePriceDisplay_") or '
-        '@id="corePrice_feature_div" or '
-        '@id="corePriceDisplay_mobile_feature_div" or '
-        '@id="apex_desktop"]'
-    )
-
-    # 価格候補抽出（lxml優先）
-    def _from_dom(H: str) -> int | None:
+    # 1) lxml があれば DOM で素直に読む（最優先: priceToPay）
+    def _dom_pick(H: str) -> int | None:
         try:
             from lxml import html as LH
-            doc = LH.fromstring(H)
-            boxes = doc.xpath(BOX_XPATH)
-            if not boxes:
-                return None
-
-            # 1) .a-offscreen に通貨付きが多い
-            for b in boxes:
-                texts = b.xpath('.//span[contains(@class,"a-offscreen")]/text()')
-                for t in texts:
-                    v = _to_int(t)
-                    if v:
-                        # 1900〜2100の裸年号は理屈上ここには来ないが一応ガード
-                        if 1900 <= v <= 2100 and not re.search(r"[¥￥]|円", t):
-                            continue
-                        return v
-
-            # 2) a-price-whole (+ a-price-fraction)
-            for b in boxes:
-                whole = "".join(b.xpath('.//span[contains(@class,"a-price-whole")]/text()')[:1])
-                if whole:
-                    frac = "".join(b.xpath('.//span[contains(@class,"a-price-fraction")]/text()')[:1])  # 使わず無視でもOK
-                    v = _to_int(whole)
-                    if v:
-                        return v
-
-            # 3) 旧ID（保険）
-            legacy = doc.xpath('//*[@id="priceblock_ourprice" or @id="priceblock_dealprice" or @id="sns-base-price"]/text()')
-            for t in legacy:
-                v = _to_int(t)
-                if v:
-                    return v
-
-            return None
         except Exception:
             return None
 
-    # lxmlが無い/取れない時の限定regex（価格箱の中だけ）
-    def _from_regex(H: str) -> int | None:
-        blk = ""
-        for bid, span in (
-            ("priceToPay", 3000),
-            ("corePriceDisplay_desktop_feature_div", 6000),
-            ("corePrice_feature_div", 6000),
-            ("corePriceDisplay_mobile_feature_div", 6000),
-            ("apex_desktop", 8000),
-        ):
-            m = re.search(r'id=["\']%s["\']([\s\S]{0,%d})' % (bid, span), H, re.I)
-            if m:
-                blk = m.group(1); break
-        if not blk:
-            return None
+        try:
+            doc = LH.fromstring(H)
 
-        # a-offscreen（￥/円あり/なし両対応）
-        for m in re.finditer(
-            r'class=["\']a-offscreen["\'][^>]*>\s*([¥￥]?\s*[\d,，]{1,10})(?:\s*円)?\s*<', blk, re.I
-        ):
-            tok = m.group(1)
-            v = _to_int(tok)
-            if v and not (1900 <= v <= 2100 and not re.search(r"[¥￥]|円", tok)):
-                return v
+            # priceToPay（id or class）を最優先で検索
+            xp_price_to_pay = [
+                '//*[@id="priceToPay"]//span[contains(@class,"a-offscreen")]/text()',
+                '//*[contains(concat(" ", normalize-space(@class), " "), " priceToPay ")]//span[contains(@class,"a-offscreen")]/text()',
+            ]
+            for xp in xp_price_to_pay:
+                for txt in doc.xpath(xp):
+                    v = _to_int(txt)
+                    if v is not None:
+                        return v
 
-        # a-price-whole（小数分割時）
-        m = re.search(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]{1,10})\s*<', blk, re.I)
-        if m:
-            v = _to_int(m.group(1))
-            if v:
-                return v
+            # 次点: 既知の価格箱ID群
+            xp_blocks = [
+                '//*[@id="corePriceDisplay_desktop_feature_div"]//span[contains(@class,"a-offscreen")]/text()',
+                '//*[@id="corePrice_feature_div"]//span[contains(@class,"a-offscreen")]/text()',
+                '//*[@id="corePriceDisplay_mobile_feature_div"]//span[contains(@class,"a-offscreen")]/text()',
+                '//*[@id="apex_desktop"]//span[contains(@class,"a-offscreen")]/text()',
+            ]
+            for xp in xp_blocks:
+                vals = [ _to_int(t) for t in doc.xpath(xp) ]
+                vals = [ v for v in vals if v is not None ]
+                if vals:
+                    # 旧価格が混ざることがあるので、もっとも “小さい 4桁以上” を採用
+                    return min(vals)
 
-        # 旧ID（保険）
-        for m in re.finditer(
-            r'id=["\'](?:priceblock_ourprice|priceblock_dealprice|sns-base-price)["\'][^>]*>\s*([^<]{1,40})<',
-            H, re.I
-        ):
-            v = _to_int(m.group(1))
-            if v:
-                return v
-
-        # JSON-LDの Offer price（さらに保険）
-        for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', H, re.I):
-            raw = m.group(1)
-            try:
-                import json
-                data = json.loads(re.sub(r",\s*([}\]])", r"\1", raw))
-            except Exception:
-                continue
-            def walk(o):
-                if isinstance(o, dict):
-                    typ = (o.get("@type") or "").lower()
-                    if typ in ("offer", "aggregateoffer"):
-                        for k in ("price", "lowPrice", "lowprice"):
-                            if k in o:
-                                vv = _to_int(str(o[k]))
-                                if vv:
-                                    return vv
-                    for v in o.values():
-                        r = walk(v)
-                        if r: return r
-                elif isinstance(o, list):
-                    for it in o:
-                        r = walk(it)
-                        if r: return r
-                return None
-            vv = walk(data)
-            if vv:
-                return vv
-
+            # 旧ID保険
+            old_ids = ['//*[@id="priceblock_ourprice"]/text()',
+                       '//*[@id="priceblock_dealprice"]/text()',
+                       '//*[@id="sns-base-price"]/text()']
+            for xp in old_ids:
+                for txt in doc.xpath(xp):
+                    v = _to_int(txt)
+                    if v is not None:
+                        return v
+        except Exception:
+            pass
         return None
 
-    # PC/SP どちらかで取れればOK
+    # 2) 正規表現フォールバック：価格箱ブロックの中だけを見る
+    def _regex_pick(H: str) -> int | None:
+        # priceToPay（id/class）を最優先で切り出し
+        for pat in [
+            r'id=["\']priceToPay["\']([\s\S]{0,3000})',
+            r'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\']([\s\S]{0,3000})',
+            r'id=["\']corePriceDisplay_desktop_feature_div["\']([\s\S]{0,6000})',
+            r'id=["\']corePrice_feature_div["\']([\s\S]{0,6000})',
+            r'id=["\']corePriceDisplay_mobile_feature_div["\']([\s\S]{0,6000})',
+            r'id=["\']apex_desktop["\']([\s\S]{0,8000})',
+        ]:
+            m = re.search(pat, H, re.I)
+            if not m:
+                continue
+            blk = m.group(1)
+
+            # .a-offscreen のテキストだけを見る
+            vals = []
+            for sm in re.finditer(
+                r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,40})\s*<', blk, re.I
+            ):
+                v = _to_int(sm.group(1))
+                if v is not None:
+                    vals.append(v)
+            if vals:
+                # 単位価格(162)などの小さい値を避けるため “最小の4桁以上” を採用
+                return min(vals)
+
+        # 旧ID保険（狭い範囲）
+        for pat in [
+            r'id=["\']priceblock_ourprice["\']([^<]{0,200})</',
+            r'id=["\']priceblock_dealprice["\']([^<]{0,200})</',
+            r'id=["\']sns-base-price["\']([^<]{0,200})</',
+        ]:
+            m = re.search(pat, H, re.I)
+            if m:
+                v = _to_int(m.group(1))
+                if v is not None:
+                    return v
+        return None
+
+    # パート（PC/モバイル）それぞれで試す
     for H in parts:
-        v = _from_dom(H)
-        if isinstance(v, int):
+        v = _dom_pick(H)
+        if v is not None:
             return v
-        v = _from_regex(H)
-        if isinstance(v, int):
+        v = _regex_pick(H)
+        if v is not None:
             return v
 
     return None
