@@ -1039,9 +1039,9 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', seg, re.I): score += 2
         log_hit("a-price", cand_val, seg, "kept", f"score={score}", {"dist": abs(pos_here - p2p_pos) if p2p_pos>=0 else -1})
         cands.append((score, cand_val, pos_here, "a-price", abs(pos_here - p2p_pos) if p2p_pos>=0 else 10**9))
-
-　　# 採用直前
-　　if p2p_pos >= 0 and any(d <= 2000 for (_,_,_,_,d) in cands):
+    
+    # 採用直前
+    if p2p_pos >= 0 and any(d <= 2000 for (_,_,_,_,d) in cands):
         cands = [(s,v,pos,kind,d) for (s,v,pos,kind,d) in cands if d <= 2000]
 
     # --- 採用 ---
