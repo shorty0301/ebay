@@ -873,22 +873,19 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
     """
-    Amazon.co.jp 支払価格取得（「税込」最優先・軽量）
-    優先:
-      1) テキストで『価格 ↔ 税込』の近接（±16、ページ冒頭＆「通常の注文」近傍）
-      2) 価格箱(priceToPay/corePrice*/apex_desktop) 内の a-offscreen / a-price-whole
-      3) 旧IDの保険
-    ※ 500円未満（例: ￥162/袋）は除外
+    Amazon.co.jp 支払価格の超シンプル抽出
+    - 「通常の注文」ブロックと既知の価格箱(priceToPay/corePrice*/apex_desktop)だけ読む
+    - 優先順: (1) 数値→税込  (2) a-offscreen  (3) a-price-whole  (4) ブロック内の￥/円
+    - 500円未満は単価(￥162/袋など)とみなして除外
     """
     import re
 
     H = str(html or "")
-    T = (text or "").replace("\u00A0", " ").replace("\u3000", " ")
 
-    YEN = r'(?:[¥￥]\s*\d{1,3}(?:[,，]\d{3})+|[¥￥]\s*\d{3,7}|\d{1,3}(?:[,，]\d{3})\s*円|\d{3,7}\s*円)'
-
-    def _to_price(token: str) -> int | None:
-        t = re.sub(r"[^\d]", "", token or "")
+    # 全角→半角
+    _z2h = str.maketrans("０１２３４５６７８９，", "0123456789,")
+    def _to_int(s: str) -> int | None:
+        t = re.sub(r"[^\d]", "", (s or "").translate(_z2h))
         if not t:
             return None
         try:
@@ -897,88 +894,62 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         except Exception:
             return None
 
-    # ---- 1) 『税込』近傍（最優先） ----
-    segs = []
-    m_norm = re.search(r'(通常の注文|通常のご注文)', T)
-    if m_norm:
-        segs.append(T[m_norm.start(): m_norm.start() + 1600])
-    segs.append(T[:12000])
+    # 価格表現
+    YEN = r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[¥￥]\s*[0-9０-９]{3,7}|[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|[0-9０-９]{3,7}\s*円)'
 
-    for seg in segs:
-        # 価格 → 税込（“価格の直後〜税込までの隙間”だけを見る）
-        for m in re.finditer(rf'({YEN})[^\d]{{0,16}}税込', seg, re.I):
-            gap = seg[m.end(1): m.end(0)]  # 価格～税込 の間だけ
-            # 直後の単価（/袋/個…）が価格にぶら下がっている場合のみ除外
-            if re.search(r'[/／]\s*(袋|個|枚|本|台|回|か月|ヶ月|月|年|GB|TB|MB|cm|mm|g|kg|ml|L|セット)', gap):
-                continue
-            v = _to_price(m.group(1))
+    # 読む候補ブロックを作る
+    blocks: list[str] = []
+
+    # A) 「通常の注文」近傍（8,000文字）
+    m = re.search(r'(?:通常の注文|通常のご注文)[\s\S]{0,8000}', H)
+    if m:
+        blocks.append(m.group(0))
+
+    # B) 既知の価格箱（id/class）
+    for bid, span in (
+        ("priceToPay", 4000),
+        ("corePriceDisplay_desktop_feature_div", 6000),
+        ("corePrice_feature_div", 6000),
+        ("corePriceDisplay_mobile_feature_div", 6000),
+        ("apex_desktop", 8000),
+    ):
+        mm = re.search(rf'(?:id=["\']{bid}["\']|class=["\'][^"\']*\b{bid}\b[^"\']*["\'])'  # id または class
+                       rf'([\s\S]{{0,{span}}})', H, re.I)
+        if mm:
+            # id/class も含めて丸ごと使うと a-offscreen が拾いやすい
+            start = mm.start()
+            end   = mm.end()
+            blocks.append(H[start:end])
+
+    # C) 最後の保険：ページ冒頭
+    if not blocks:
+        blocks.append(H[:15000])
+
+    # ブロック毎に“安全な順”で抽出
+    for blk in blocks:
+        # (1) 「価格 → 税込」：価格の直後〜税込の間だけを見る（後ろの「￥162/袋」を無視）
+        m1 = re.search(rf'([0-9０-９][0-9０-９,，]{{2,}})\s*(?:円)?\s*税込', blk)
+        if m1:
+            v = _to_int(m1.group(1))
             if v is not None:
                 return v
 
-        # 税込 → 価格（こちらは “￥162/袋” を拾いがちなので広めに弾く）
-        for m in re.finditer(rf'税込[^\d]{{0,16}}({YEN})', seg, re.I):
-            tok = m.group(1)
-            # 直後に単価の単位が来るなら除外
-            after = seg[m.end(1): m.end(1) + 10]
-            if re.search(r'[/／]\s*(袋|個|枚|本|台|回|か月|ヶ月|月|年|GB|TB|MB|cm|mm|g|kg|ml|L|セット)', after):
-                continue
-            v = _to_price(tok)
-            if v is not None:
-                return v
-
-    # ---- 2) 価格箱だけ読む ----
-    def _scan_price_block(blk: str) -> int | None:
-        # 税込 近傍（保険）
-        for m in re.finditer(rf'({YEN})[^\d]{{0,16}}税込', blk, re.I):
-            v = _to_price(m.group(1))
-            if v is not None:
-                return v
-        for m in re.finditer(rf'税込[^\d]{{0,16}}({YEN})', blk, re.I):
-            v = _to_price(m.group(1))
-            if v is not None:
-                return v
-        # a-offscreen
+        # (2) a-offscreen
         for m in re.finditer(r'class=["\']a-offscreen["\'][^>]*>\s*([^<]{1,60})<', blk, re.I):
-            v = _to_price(m.group(1))
+            v = _to_int(m.group(1))
             if v is not None:
                 return v
-        # a-price-whole
-        for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>\s*([\d,，]{1,10})\s*<', blk, re.I):
-            v = _to_price(m.group(1))
-            if v is not None:
-                return v
-        # ブロック内の最初の “￥/円付き”
-        m = re.search(YEN, blk, re.I)
-        if m:
-            v = _to_price(m.group(0))
-            if v is not None:
-                return v
-        return None
 
-    for pat in [
-        r'id=["\']priceToPay["\']([\s\S]{0,4000})',
-        r'class=["\'][^"\']*\bpriceToPay\b[^"\']*["\']([\s\S]{0,4000})',
-        r'id=["\']corePriceDisplay_desktop_feature_div["\']([\s\S]{0,6000})',
-        r'id=["\']corePrice_feature_div["\']([\s\S]{0,6000})',
-        r'id=["\']corePriceDisplay_mobile_feature_div["\']([\s\S]{0,6000})',
-        r'id=["\']apex_desktop["\']([\s\S]{0,8000})',
-    ]:
-        m = re.search(pat, H, re.I)
-        if not m:
-            continue
-        v = _scan_price_block(m.group(1))
-        if v is not None:
-            return v
+        # (3) a-price-whole（小数分割の whole）
+        for m in re.finditer(r'class=["\']a-price-whole["\'][^>]*>\s*([0-9０-９,，]{1,10})\s*<', blk, re.I):
+            v = _to_int(m.group(1))
+            if v is not None:
+                return v
 
-    # ---- 3) 旧ID保険 ----
-    for pat in [
-        r'id=["\']priceblock_ourprice["\'][^>]*>\s*([^<]+)<',
-        r'id=["\']priceblock_dealprice["\'][^>]*>\s*([^<]+)<',
-        r'id=["\']sns-base-price["\'][^>]*>\s*([^<]+)<',
-    ]:
-        m = re.search(pat, H, re.I)
-        if m:
-            v = _to_price(m.group(1))
+        # (4) ブロック内の最初の “￥/円付き”
+        m4 = re.search(YEN, blk, re.I)
+        if m4:
+            v = _to_int(m4.group(0))
             if v is not None:
                 return v
 
