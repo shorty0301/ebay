@@ -869,6 +869,17 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
     m_p2p = re.search(r'(id=["\']priceToPay["\']|class=["\'][^"\']*\bpriceToPay\b)', H, re.I)
     if m_p2p:
         p2p_pos = m_p2p.start()
+    m_fast = re.search(
+        r'id=["\']priceToPay["\'][\s\S]{0,800}?class=["\']a-offscreen["\'][^>]*>\s*[¥￥]?\s*([\d,，]{1,10})<',
+        H, re.I
+    )
+    if m_fast:
+        val = to_v(m_fast.group(1))
+        if val:
+            trace["picked"] = {"val": val, "how": "priceToPay_fastpath"}
+            globals()['__amz_trace__'] = trace
+            return val
+     
 
     cands: list[tuple[int, int, int, str, int]] = []  # (score, val, pos, kind, dist)
 
@@ -892,6 +903,12 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
             log_hit("offscreen", val, ctx, "dropped", "near_strike");   continue
         if STOP.search(ctx):
             log_hit("offscreen", val, ctx, "dropped", "near_stop");     continue
+        wide = blk[max(0, i-80): m.end()+80]
+        if re.search(r'(以上で?|送料無料|通常配送無料|配送料無料)', wide, re.I):
+        if not re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', wide, re.I):
+            log_hit("offscreen", val, wide, "dropped", "threshold_free_shipping_split")
+            continue
+
         if is_unit_price(ctx, val):
             log_hit("offscreen", val, ctx, "dropped", "unit_price");    continue
 
@@ -911,6 +928,12 @@ def price_from_amazon_jp(html: str, text: str) -> int | None:
         if BAD_NEAR.search(ctx):
             log_hit("whole", val, ctx, "dropped", "near_strike");   continue
         if STOP.search(ctx):
+        wide = blk[max(0, i-80): m.end()+80]
+        if re.search(r'(以上で?|送料無料|通常配送無料|配送料無料)', wide, re.I):
+        if not re.search(r'(priceToPay|data-a-color\s*=\s*["\']price["\'])', wide, re.I):
+            log_hit("offscreen", val, wide, "dropped", "threshold_free_shipping_split")
+            continue
+
             log_hit("whole", val, ctx, "dropped", "near_stop");     continue
         if is_unit_price(ctx, val):
             log_hit("whole", val, ctx, "dropped", "unit_price");    continue
@@ -1550,19 +1573,24 @@ def extract_supplier_info(url: str, html: str, debug: bool = False) -> Dict[str,
                     pass
 
 
-    # Mercari 
     elif ("mercari" in host) or ("jp.mercari.com" in host):
-        s = stock_from_mercari(html, text)
-        if s: stock = s
-        price = price_from_mercari(html, text)
-        if price is None:
-            try:
-                v = mercari_price_via_playwright_sync(url, timeout_ms=90_000, headless=false, retries=1)
-                print("[PW fallback]", v)
-                if isinstance(v, int):
-                    price = v
-            except Exception as e:
-                print("[PW fallback err]", e)
+    s = stock_from_mercari(html, text)
+    if s: stock = s
+
+    price = price_from_mercari(html, text)
+
+    # --- 一時的な強制呼び出し＆ログ ---
+    try:
+        print("[DBG] calling PW fallback…")
+        v = mercari_price_via_playwright_sync(
+            url, timeout_ms=90_000, headless=False, retries=1
+        )
+        print("[DBG] PW returned:", v)
+        if isinstance(v, int):
+            price = v
+    except Exception as e:
+        print("[DBG] PW error:", e)
+
         
     elif ("item.rakuten.co.jp" in host) or (host.endswith(".rakuten.co.jp")) or ("rakuten.co.jp" in host):
         # 価格
