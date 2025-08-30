@@ -872,83 +872,135 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """
-    Amazon.co.jp 価格抽出（“税込” 近傍のみ、年号ガード付き）
-    - 金額は「¥…」または「…円」だけを許可（裸の数字は不許可）
-    - “税込” の近傍(±80文字)にある金額のみ採用
-    - 500円未満は除外（単価/袋・枚など対策）
-    - 1900〜2100の数字は、通貨記号/円が無い or “年” 近傍なら除外
-    """
     import re
-    t = (text or "")
-    if not t:
+    from bs4 import BeautifulSoup
+
+    H = str(html or "")
+    if not H:
         return None
-    t = t.replace("\u3000", " ").replace("\u00A0", " ")
-    t = re.sub(r"\s+", " ", t)
 
-    # 金額（“¥1,234” / “1,234円” / “¥1234” / “1234円”）
-    MONEY = re.compile(
-        r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'      # ¥1,234
-        r'[¥￥]\s*[0-9０-９]{3,7}|'                               # ¥1234
-        r'[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|'            # 1,234円
-        r'[0-9０-９]{3,7}\s*円)'                                  # 1234円
+    # 金額パターン（薄い空白も吸収）
+    YEN = re.compile(
+        r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'
+        r'[¥￥]\s*[0-9０-９]{3,7}|'
+        r'[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|'
+        r'[0-9０-９]{3,7}\s*円)'
     )
-    STOP = re.compile(r"(ポイント|pt|還元|%|％|OFF|円OFF|クーポン|相当|円相当|以上|超|から|最大|上限|送料|配送料)", re.I)
-    UNIT = re.compile(r"(/|あたり|当たり|/袋|/個|/枚|/本|/台|/kg|/g|/ml|/mL)", re.I)
-    YEAR_NEAR = re.compile(r"(?:19|20)\d{2}\s*年")
-
-    Z2H = str.maketrans("０１２３４５６７８９，", "0123456789,")
 
     def _to_int(tok: str, ctx: str = "") -> int | None:
-        s = re.sub(r"[^\d]", "", (tok or "").translate(Z2H))
-        if not s:
+        s = tok or ""
+        # 通貨有無を先に判定
+        has_currency = bool(re.search(r"[¥￥]|円", s))
+        t = re.sub(r"[^\d]", "", s.translate(str.maketrans("０１２３４５６７８９，", "0123456789,")))
+        if not t:
             return None
-        v = int(s)
-        # 単価つぶし
+        v = int(t)
         if v < 500 or v > 3_000_000:
             return None
-        # 年号つぶし（通貨/円が無い or “年” 近傍なら拒否）
+        # ★年号ガードの緩和：通貨なし かつ “ぴったり4桁数字のみ” の時だけ弾く
         if 1900 <= v <= 2100:
-            if not re.search(r"[¥￥]|円", tok) or YEAR_NEAR.search(ctx):
+            if (not has_currency) and re.fullmatch(r"\D*([12]\d{3})\D*", tok) and re.fullmatch(r"\d{4}", t):
                 return None
         return v
 
-    def _pick_around_tax(body: str) -> int | None:
-        cands: list[int] = []
-        for m in re.finditer(r"税込", body):
-            seg = body[max(0, m.start()-80): m.end()+80]
-            for n in MONEY.finditer(seg):
-                win = seg[max(0, n.start()-60): n.end()+60]
-                if STOP.search(win) or UNIT.search(win):
-                    continue
-                v = _to_int(n.group(0), win)
+    try:
+        soup = BeautifulSoup(H, "lxml")
+    except Exception:
+        soup = BeautifulSoup(H, "html.parser")
+
+    # ★(A) グローバル価格箱をまず見る（ブロック検出に失敗しても拾えるように）
+    for sel in (
+        "#priceToPay .a-offscreen",
+        "#corePriceDisplay_desktop_feature_div .a-offscreen",
+        "#corePrice_feature_div .a-offscreen",
+        "#corePriceDisplay_mobile_feature_div .a-offscreen",
+        "#apex_desktop .a-offscreen",
+        ".priceToPay .a-offscreen",
+    ):
+        el = soup.select_one(sel)
+        if el:
+            v = _to_int(el.get_text(" ", strip=True))
+            if v is not None:
+                return v
+
+    # --- (B) 「通常の注文」≒「一回限りの購入」ブロック検出を広げる ---
+    label_nodes = soup.find_all(string=re.compile(r"(通常の注文|通常のご注文|一回限りの購入|一度のみの購入)"))
+    blocks = []
+
+    def _nearest_row(el):
+        p = el.parent if hasattr(el, "parent") else None
+        for _ in range(10):
+            if not p:
+                break
+            cls = " ".join(p.get("class", []))
+            if "a-row" in cls or "a-section" in cls or p.name in ("div", "li", "tr"):
+                return p
+            p = p.parent
+        return el.parent if hasattr(el, "parent") else None
+
+    for lab in label_nodes:
+        row = _nearest_row(lab)
+        if not row:
+            continue
+        txt = row.get_text(" ", strip=True)
+        # 定期/おトク便は禁止
+        if re.search(r"(定期|おトク便|サブスク)", txt):
+            continue
+        blocks.append(row)
+        # 近傍の兄弟も少しだけ追加（が、定期ワードが出たら打ち切り）
+        sib = row.next_sibling; hop = 0
+        while sib and hop < 5:
+            st = getattr(sib, "get_text", lambda *a, **k: "")(" ", strip=True)
+            if re.search(r"(定期|おトク便|サブスク)", st):
+                break
+            if st:
+                blocks.append(sib)
+            sib = sib.next_sibling; hop += 1
+
+    # --- (C) ブロック内で「税込 / 税込み」優先 → a-offscreen → whole ---
+    def _price_in_block(node) -> int | None:
+        txt = node.get_text(" ", strip=True)
+        # ★「税込み」も含める
+        for m in re.finditer(r"税込(?:み)?", txt):
+            seg = txt[max(0, m.start()-120): m.end()+120]
+            n = YEN.search(seg)
+            if n:
+                v = _to_int(n.group(0), seg)
                 if v is not None:
-                    cands.append(v)
-        if not cands:
-            return None
-        from collections import Counter
-        freq = Counter(cands).most_common(1)[0]
-        return freq[0] if freq[1] >= 2 else min(cands)
+                    return v
+        for sp in node.select(".a-offscreen"):
+            v = _to_int(sp.get_text(" ", strip=True))
+            if v is not None:
+                return v
+        for sp in node.select(".a-price-whole"):
+            v = _to_int(sp.get_text(" ", strip=True))
+            if v is not None:
+                return v
+        m2 = YEN.search(txt)
+        if m2:
+            v = _to_int(m2.group(0), txt)
+            if v is not None:
+                return v
+        return None
 
-    # 1) “税込” 近傍（全体）
-    v = _pick_around_tax(t)
-    if isinstance(v, int):
-        return v
-
-    # 2) “通常の注文” 周辺だけで再トライ
-    i = t.find("通常の注文")
-    if i != -1:
-        seg = t[max(0, i-300): i+1500]
-        v = _pick_around_tax(seg)
+    for b in blocks:
+        v = _price_in_block(b)
         if isinstance(v, int):
             return v
 
+    # --- (D) 最後の保険：購入ボタン近傍（定期ワードは排除） ---
+    body_txt = soup.get_text(" ", strip=True)
+    for m in re.finditer(r"(カートに入れる|今すぐ購入|今すぐ買う)", body_txt):
+        seg = body_txt[max(0, m.start()-1200): m.end()+1200]
+        if re.search(r"(定期|おトク便|サブスク)", seg):
+            continue
+        n = YEN.search(seg)
+        if n:
+            v = _to_int(n.group(0), seg)
+            if v is not None:
+                return v
+
     return None
-
-
-
-
-
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
