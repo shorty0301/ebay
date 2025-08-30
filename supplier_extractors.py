@@ -872,102 +872,121 @@ def stock_from_yshopping(html: str, text: str) -> str | None:
 
 # ========== 追加：Amazon.co.jp / Mercari / Rakuten Ichiba ==========
 def price_from_amazon_jp(html: str, text: str) -> int | None:
-    """Amazon.co.jp 支払価格の超シンプル抽出（通常の注文/価格箱のみ）"""
+    """
+    Amazon.co.jp: “税込” 直前の金額を最優先に取る簡潔版。
+    - まず priceToPay / corePrice* / apex_desktop ブロック内で「税込」左側の金額
+    - だめならそのブロック内の .a-offscreen / .a-price-whole
+    - さらにダメならページ上部テキストで「税込」左側の金額
+    """
     import re
     from bs4 import BeautifulSoup
 
-    H = str(html or "")
-    if not H:
+    H_all = str(html or "")
+    if not H_all:
         return None
 
-    # 金額パターン（￥1,234 / 1,234円 など）
-    YEN_RE = re.compile(
-        r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[¥￥]\s*[0-9０-９]{3,7}|[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|[0-9０-９]{3,7}\s*円)'
+    # PC/SPを分離（混在すると先頭側ノイズに引っ張られることがある）
+    parts = (re.split(r'<!--\s*MOBILE MERGE\s*-->', H_all, flags=re.I)
+             if "<!-- MOBILE MERGE -->" in H_all else [H_all])
+
+    YEN = re.compile(
+        r'(?:[¥￥]\s*[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|'
+        r'[¥￥]\s*[0-9０-９]{3,7}|'
+        r'[0-9０-９]{1,3}(?:[,，][0-9０-９]{3})\s*円|'
+        r'[0-9０-９]{3,7}\s*円)'
     )
+    TAX = re.compile(r"(税込|税込み|消費税込|消費税込み)")
     Z2H = str.maketrans("０１２３４５６７８９，", "0123456789,")
-    def to_int(s: str) -> int | None:
-        t = re.sub(r"[^\d]", "", (s or "").translate(Z2H))
+
+    def _to_int(tok: str) -> int | None:
+        t = re.sub(r"[^\d]", "", (tok or "").translate(Z2H))
         if not t:
             return None
         v = int(t)
-        return v if 500 <= v <= 3_000_000 else None   # 500未満は単価(￥162/袋等)と判断して除外
+        return v if 500 <= v <= 3_000_000 else None  # 単価の小額を除外
 
-    def pick_from_text(txt: str) -> int | None:
+    def _pick_tax_left(txt: str) -> int | None:
+        """テキストから“税込”の直前にある最後の金額を取る"""
         if not txt:
             return None
-        pos_tax = txt.find("税込")
-        cands = list(YEN_RE.finditer(txt))
-        # “税込” より左側で一番近い金額（=本体価格）を優先
-        if pos_tax != -1:
-            left = [m for m in cands if m.end() <= pos_tax + 2]
-            for m in reversed(left):
-                v = to_int(m.group(0))
-                if v is not None:
-                    return v
-        # 次にブロック内の最初の金額
-        for m in cands:
-            v = to_int(m.group(0))
+        m_tax = TAX.search(txt)
+        if not m_tax:
+            return None
+        left = txt[:m_tax.start()]  # 税込より左側
+        cands = list(YEN.finditer(left))
+        for m in reversed(cands):
+            v = _to_int(m.group(0))
             if v is not None:
                 return v
         return None
 
-    # ---- HTML パース
-    try:
-        soup = BeautifulSoup(H, "lxml")
-    except Exception:
-        soup = BeautifulSoup(H, "html.parser")
-
-    # 探索候補ブロック（優先順）
-    blocks = []
-
-    # 1) 「通常の注文」付近のコンテナを最優先
-    lab = soup.find(string=re.compile(r"通常の注文|通常のご注文"))
-    if lab:
-        container = lab.find_parent()
-        # 近い親を少し広げる（最大5段）
-        for _ in range(4):
-            if container and container.parent:
-                container = container.parent
-        if container:
-            blocks.append(container)
-
-    # 2) 既知の価格箱
-    for sel in [
-        "#priceToPay", ".priceToPay",
-        "#corePriceDisplay_desktop_feature_div",
-        "#corePrice_feature_div",
-        "#corePriceDisplay_mobile_feature_div",
-        "#apex_desktop",
-    ]:
-        el = soup.select_one(sel)
-        if el:
-            blocks.append(el)
-
-    # 3) 最後の保険としてページ上部テキスト
-    def try_block(el) -> int | None:
-        # a-offscreen があれば最優先
-        off = el.select_one(".a-offscreen")
-        if off:
-            v = to_int(off.get_text(" ", strip=True))
-            if v is not None:
-                return v
-        # 小数分割の whole
-        whole = el.select_one(".a-price-whole")
-        if whole:
-            v = to_int(whole.get_text(" ", strip=True))
-            if v is not None:
-                return v
-        # テキストから “税込の左側” を拾う
-        return pick_from_text(el.get_text(" ", strip=True))
-
-    for el in blocks:
-        v = try_block(el)
-        if v is not None:
+    def _from_block_html(H: str) -> int | None:
+        # 1) ブロック内テキストで “税込の左側”
+        try:
+            blk_txt = strip_tags(H)
+        except Exception:
+            blk_txt = BeautifulSoup(H, "lxml").get_text(" ", strip=True)
+        v = _pick_tax_left(blk_txt)
+        if isinstance(v, int):
             return v
 
-    # 最終保険：ページ上部のテキストから
-    head_txt = soup.get_text(" ", strip=True)[:20000]
-    return pick_from_text(head_txt)
+        # 2) DOMで .a-offscreen / .a-price-whole
+        try:
+            soup = BeautifulSoup(H, "lxml")
+        except Exception:
+            soup = BeautifulSoup(H, "html.parser")
+
+        off = soup.select_one(".a-offscreen")
+        if off:
+            v = _to_int(off.get_text(" ", strip=True))
+            if v is not None:
+                return v
+        whole = soup.select_one(".a-price-whole")
+        if whole:
+            v = _to_int(whole.get_text(" ", strip=True))
+            if v is not None:
+                return v
+
+        # 3) 最後の保険：ブロック内の“￥/円付き”最初の出現
+        m = YEN.search(blk_txt)
+        if m:
+            v = _to_int(m.group(0))
+            if v is not None:
+                return v
+        return None
+
+    # パート（PC/モバイル）ごとに評価
+    for H in parts:
+        # 既知の価格箱を優先的に抽出
+        blocks: list[str] = []
+        for pat, span in (
+            (r'id=["\']priceToPay["\']', 4000),
+            (r'class=["\'][^"\']*\bpriceToPay\b', 4000),
+            (r'id=["\']corePriceDisplay_desktop_feature_div["\']', 6000),
+            (r'id=["\']corePrice_feature_div["\']', 6000),
+            (r'id=["\']corePriceDisplay_mobile_feature_div["\']', 6000),
+            (r'id=["\']apex_desktop["\']', 8000),
+        ):
+            m = re.search(pat + r'([\s\S]{0,' + str(span) + r'})', H, re.I)
+            if m:
+                blocks.append(m.group(0))
+
+        # ブロック内で“税込左”→.a-offscreen→whole の順にチェック
+        for blk in blocks:
+            v = _from_block_html(blk)
+            if isinstance(v, int):
+                return v
+
+        # ブロックが拾えないとき：ページ上部テキストで“税込左”
+        try:
+            head_txt = strip_tags(H)[:20000]
+        except Exception:
+            head_txt = BeautifulSoup(H, "html.parser").get_text(" ", strip=True)[:20000]
+        v = _pick_tax_left(head_txt)
+        if isinstance(v, int):
+            return v
+
+    return None
 
 
 def stock_from_amazon_jp(html: str, text: str) -> str | None:
